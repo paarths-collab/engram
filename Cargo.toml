@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/domain",
+    "crates/repo-map",
+    "crates/retrieval",
+    "crates/mcp-server",
+]
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+rusqlite = { version = "0.30", features = ["bundled"] }
+walkdir = "2"

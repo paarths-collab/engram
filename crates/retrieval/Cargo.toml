@@ -1,0 +1,16 @@
+[package]
+name = "engram-retrieval"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+engram-domain = { path = "../domain" }
+engram-repo-map = { path = "../repo-map" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tantivy = "0.24"
+
+[lib]
+path = "src/lib.rs"
+

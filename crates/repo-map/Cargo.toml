@@ -1,0 +1,20 @@
+[package]
+name = "engram-repo-map"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+engram-domain = { path = "../domain" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+walkdir = { workspace = true }
+rusqlite = { workspace = true }
+tree-sitter = "0.20"
+tree-sitter-rust = "0.20"
+tree-sitter-python = "0.20"
+tree-sitter-typescript = "0.20"
+tree-sitter-javascript = "0.20"
+
+[lib]
+path = "src/lib.rs"

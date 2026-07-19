@@ -1,0 +1,16 @@
+[package]
+name = "engram-mcp-server"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "engram"
+path = "src/main.rs"
+
+[dependencies]
+engram-domain = { path = "../domain" }
+engram-repo-map = { path = "../repo-map" }
+engram-retrieval = { path = "../retrieval" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }

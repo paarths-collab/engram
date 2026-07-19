@@ -1,0 +1,9 @@
+# Rust build artifacts
+/target
+
+# Engram local index (SQLite DB) — never committed
+.engram/
+
+# Editor / OS cruft
+**/*.rs.bk
+.DS_Store
