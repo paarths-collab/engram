@@ -1,0 +1,41 @@
+name: Release
+
+# CD: tagging a version (vX.Y.Z) builds the release binary and publishes a
+# GitHub Release with the packaged artifact attached.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: build and publish release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --locked -p engram-mcp-server
+
+      - name: Package
+        run: |
+          tar -czf "engram-${GITHUB_REF_NAME}-linux-x86_64.tar.gz" \
+            -C target/release engram
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: engram-*.tar.gz
+          generate_release_notes: true

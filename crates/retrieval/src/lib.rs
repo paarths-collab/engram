@@ -5,9 +5,7 @@ pub mod embed;
 
 use anyhow::Result;
 use embed::{cosine, Embedder, HashedNgramEmbedder};
-use engram_domain::{
-    EvidenceKind, EvidencePacket, ImpactPrediction, ScoredPath, SymbolRecord,
-};
+use engram_domain::{EvidenceKind, EvidencePacket, ImpactPrediction, ScoredPath, SymbolRecord};
 use engram_repo_map::store::Store;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -81,7 +79,7 @@ impl Engine {
             };
             let body: String = src.chars().take(INDEX_BODY_BYTES).collect();
             // Embed path + a head slice; heads carry imports/signatures = high signal.
-            let embed_text = format!("{} {}", f.path, &body.chars().take(4000).collect::<String>());
+            let embed_text = format!("{} {}", f.path, body.chars().take(4000).collect::<String>());
             let vector = embedder.embed(&embed_text);
             writer.add_document(doc!(f_path => f.path.clone(), f_body => body.clone()))?;
             by_path.insert(f.path.clone(), docs.len());
@@ -120,10 +118,7 @@ impl Engine {
         for (score, addr) in top {
             if let Ok(doc) = searcher.doc::<tantivy::TantivyDocument>(addr) {
                 use tantivy::schema::Value;
-                if let Some(path) = doc
-                    .get_first(self.f_path)
-                    .and_then(|v| v.as_str())
-                {
+                if let Some(path) = doc.get_first(self.f_path).and_then(|v| v.as_str()) {
                     if let Some(&i) = self.by_path.get(path) {
                         out.push((i, score));
                     }
@@ -260,11 +255,7 @@ impl Engine {
     }
 
     /// predict_impact: hybrid hits = direct; co-change graph = historical expansion.
-    pub fn predict_impact(
-        &self,
-        store: &mut Store,
-        query: &str,
-    ) -> Result<ImpactPrediction> {
+    pub fn predict_impact(&self, store: &mut Store, query: &str) -> Result<ImpactPrediction> {
         let direct = self.search(store, query, 8)?;
         let mut likely_files = Vec::new();
         let mut likely_tests = Vec::new();
@@ -308,7 +299,11 @@ impl Engine {
                 if engram_repo_map::inventory::is_test_path(&path) {
                     likely_tests.push(path.clone());
                 }
-                ScoredPath { path, confidence: conf, reason }
+                ScoredPath {
+                    path,
+                    confidence: conf,
+                    reason,
+                }
             })
             .collect();
         cochange_expansions.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
@@ -316,7 +311,11 @@ impl Engine {
         likely_tests.sort();
         likely_tests.dedup();
 
-        Ok(ImpactPrediction { likely_files, likely_tests, cochange_expansions })
+        Ok(ImpactPrediction {
+            likely_files,
+            likely_tests,
+            cochange_expansions,
+        })
     }
 }
 

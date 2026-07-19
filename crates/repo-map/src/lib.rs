@@ -22,7 +22,10 @@ pub fn index_repo(repo_root: &Path, eager_tier1_limit: usize) -> Result<IndexSta
 
     // Eagerly extract symbols for up to N source files (small repos = instant full coverage).
     let mut extracted = 0usize;
-    for f in files.iter().filter(|f| f.language != engram_domain::Language::Other) {
+    for f in files
+        .iter()
+        .filter(|f| f.language != engram_domain::Language::Other)
+    {
         if extracted >= eager_tier1_limit {
             break;
         }

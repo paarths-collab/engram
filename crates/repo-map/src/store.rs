@@ -55,7 +55,12 @@ impl Store {
                  VALUES (?1, ?2, ?3, ?4)
                  ON CONFLICT(path) DO UPDATE SET
                    language=?2, size_bytes=?3, is_test=?4",
-                params![f.path, f.language.as_str(), f.size_bytes as i64, f.is_test as i64],
+                params![
+                    f.path,
+                    f.language.as_str(),
+                    f.size_bytes as i64,
+                    f.is_test as i64
+                ],
             )?;
         }
         tx.commit()?;
@@ -78,7 +83,10 @@ impl Store {
                 ],
             )?;
         }
-        tx.execute("UPDATE files SET tier1_done = 1 WHERE path = ?1", params![path])?;
+        tx.execute(
+            "UPDATE files SET tier1_done = 1 WHERE path = ?1",
+            params![path],
+        )?;
         tx.commit()?;
         Ok(())
     }

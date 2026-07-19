@@ -1,5 +1,7 @@
 # Engram — Engineering Memory MCP Server
 
+[![CI](https://github.com/paarths-collab/engram/actions/workflows/ci.yml/badge.svg)](https://github.com/paarths-collab/engram/actions/workflows/ci.yml)
+
 Headless MCP server that gives coding agents (Claude Code, Cursor, Codex, any MCP client)
 persistent knowledge of a repository: what exists, what to reuse, what a task will affect.
 No LLM inside — the coding agent is the brain; Engram is the fast deterministic memory.
