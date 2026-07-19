@@ -47,7 +47,13 @@ fn kind_for(lang: Language, node_kind: &str) -> Option<SymbolKind> {
 
 fn first_line(src: &str, node: &Node) -> String {
     let text = &src[node.byte_range()];
-    text.lines().next().unwrap_or("").trim().chars().take(200).collect()
+    text.lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .chars()
+        .take(200)
+        .collect()
 }
 
 fn name_of(src: &str, node: &Node) -> Option<String> {

@@ -25,8 +25,8 @@ impl Engram {
         let root = repo_root.clone();
         // Background indexing: server accepts connections immediately;
         // tools report progress until the index is ready.
-        std::thread::spawn(move || {
-            match engram_repo_map::index_repo(&root, EAGER_TIER1_LIMIT) {
+        std::thread::spawn(
+            move || match engram_repo_map::index_repo(&root, EAGER_TIER1_LIMIT) {
                 Ok(stats) => {
                     eprintln!(
                         "[engram] indexed: {} files, {} cochange edges, {} tier1 files",
@@ -35,9 +35,14 @@ impl Engram {
                     ready.store(true, Ordering::SeqCst);
                 }
                 Err(e) => eprintln!("[engram] indexing failed: {e}"),
-            }
-        });
-        Engram { repo_root, engine: None, store: None, index_ready }
+            },
+        );
+        Engram {
+            repo_root,
+            engine: None,
+            store: None,
+            index_ready,
+        }
     }
 
     fn ensure_engine(&mut self) -> Result<(), String> {
@@ -49,14 +54,12 @@ impl Engram {
             );
         }
         if self.store.is_none() {
-            self.store =
-                Some(Store::open(&self.repo_root).map_err(|e| format!("store: {e}"))?);
+            self.store = Some(Store::open(&self.repo_root).map_err(|e| format!("store: {e}"))?);
         }
         if self.engine.is_none() {
             let store = self.store.as_ref().unwrap();
-            self.engine = Some(
-                Engine::build(&self.repo_root, store).map_err(|e| format!("engine: {e}"))?,
-            );
+            self.engine =
+                Some(Engine::build(&self.repo_root, store).map_err(|e| format!("engine: {e}"))?);
         }
         Ok(())
     }
@@ -111,9 +114,7 @@ impl ToolHandler for Engram {
                 if task.is_empty() {
                     return Err("missing required argument: task".into());
                 }
-                let packets = engine
-                    .search(store, task, 8)
-                    .map_err(|e| e.to_string())?;
+                let packets = engine.search(store, task, 8).map_err(|e| e.to_string())?;
                 Ok(json!({ "task": task, "evidence": packets }))
             }
             "find_existing_implementation" => {

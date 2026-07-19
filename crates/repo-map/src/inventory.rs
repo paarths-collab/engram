@@ -5,8 +5,19 @@ use std::path::Path;
 use walkdir::WalkDir;
 
 const IGNORED_DIRS: &[&str] = &[
-    ".git", "node_modules", "target", "dist", "build", ".venv", "venv",
-    "__pycache__", ".next", ".cache", "vendor", ".idea", ".vscode",
+    ".git",
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".next",
+    ".cache",
+    "vendor",
+    ".idea",
+    ".vscode",
 ];
 
 const MAX_FILE_BYTES: u64 = 1_500_000; // skip generated blobs / bundles
