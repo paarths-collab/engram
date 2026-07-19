@@ -79,11 +79,7 @@ impl Engine {
             };
             let body: String = src.chars().take(INDEX_BODY_BYTES).collect();
             // Embed path + a head slice; heads carry imports/signatures = high signal.
-            let embed_text = format!(
-                "{} {}",
-                f.path,
-                &body.chars().take(4000).collect::<String>()
-            );
+            let embed_text = format!("{} {}", f.path, body.chars().take(4000).collect::<String>());
             let vector = embedder.embed(&embed_text);
             writer.add_document(doc!(f_path => f.path.clone(), f_body => body.clone()))?;
             by_path.insert(f.path.clone(), docs.len());
