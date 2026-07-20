@@ -332,6 +332,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "engram-evals"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "engram-domain",
+ "engram-repo-map",
+ "engram-retrieval",
+]
+
+[[package]]
 name = "engram-mcp-server"
 version = "0.1.0"
 dependencies = [

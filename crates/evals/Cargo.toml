@@ -1,0 +1,14 @@
+[package]
+name = "engram-evals"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "engram-evals"
+path = "src/main.rs"
+
+[dependencies]
+engram-domain = { path = "../domain" }
+engram-repo-map = { path = "../repo-map" }
+engram-retrieval = { path = "../retrieval" }
+anyhow = { workspace = true }
