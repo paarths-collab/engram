@@ -16,3 +16,4 @@ engram-connectors-github = { path = "../connectors-github" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
+notify = { workspace = true }

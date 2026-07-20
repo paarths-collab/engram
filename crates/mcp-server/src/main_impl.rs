@@ -16,6 +16,8 @@ pub struct Engram {
     engine: Option<Engine>,
     store: Option<Store>,
     index_ready: Arc<AtomicBool>,
+    /// Flipped by the watcher when files or HEAD change; triggers a lazy rebuild.
+    dirty: Arc<AtomicBool>,
 }
 
 impl Engram {
@@ -37,11 +39,15 @@ impl Engram {
                 Err(e) => eprintln!("[engram] indexing failed: {e}"),
             },
         );
+        // Incremental reindex: watch for file saves and HEAD moves.
+        let dirty = Arc::new(AtomicBool::new(false));
+        crate::watcher::spawn(repo_root.clone(), dirty.clone());
         Engram {
             repo_root,
             engine: None,
             store: None,
             index_ready,
+            dirty,
         }
     }
 
@@ -63,6 +69,11 @@ impl Engram {
 
     fn ensure_engine(&mut self) -> Result<(), String> {
         self.ensure_store()?;
+        // A watcher change invalidates the in-memory index; rebuild lazily here
+        // (cheap: persisted vectors mean only changed files re-embed).
+        if self.dirty.swap(false, Ordering::SeqCst) {
+            self.engine = None;
+        }
         if self.engine.is_none() {
             let store = self.store.as_mut().unwrap();
             self.engine =

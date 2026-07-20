@@ -19,6 +19,7 @@ toml = "0.8"
 serde_yaml = "0.9"
 globset = "0.4"
 petgraph = "0.6"
+notify = "6"
 reqwest = { version = "0.12", default-features = false, features = [
     "blocking",
     "json",

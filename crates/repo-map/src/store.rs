@@ -19,6 +19,7 @@ impl Store {
         conn.execute_batch(
             r#"
             PRAGMA journal_mode = WAL;
+            PRAGMA busy_timeout = 5000;
             CREATE TABLE IF NOT EXISTS files (
                 path TEXT PRIMARY KEY,
                 language TEXT NOT NULL,
@@ -132,6 +133,13 @@ impl Store {
             )?;
         }
         tx.commit()?;
+        Ok(())
+    }
+
+    /// Invalidate one file's cached embedding so it re-embeds on the next build.
+    pub fn invalidate_vector(&mut self, path: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM vectors WHERE path = ?1", params![path])?;
         Ok(())
     }
 
