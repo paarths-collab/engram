@@ -69,6 +69,49 @@ pub fn ensure_tier1(store: &mut Store, repo_root: &Path, path: &str) -> Result<(
     Ok(())
 }
 
+/// Incrementally re-extract a single changed file: refresh its `files` row,
+/// symbols, and imports, and invalidate its cached vector so it re-embeds.
+/// If the file no longer exists (or is unsupported), its extracted data is
+/// cleared. Used by the file-watcher for reindex-on-save.
+pub fn reindex_file(store: &mut Store, repo_root: &Path, path: &str) -> Result<()> {
+    use engram_domain::{FileRecord, Language};
+    let lang = Language::from_path(path);
+    let full = repo_root.join(path);
+    match std::fs::metadata(&full) {
+        Ok(meta) if meta.is_file() => {
+            store.upsert_files(&[FileRecord {
+                is_test: inventory::is_test_path(path),
+                path: path.to_string(),
+                language: lang,
+                size_bytes: meta.len(),
+            }])?;
+            if lang != Language::Other {
+                if let Ok(src) = std::fs::read_to_string(&full) {
+                    store
+                        .replace_symbols_for_file(path, &symbols::extract_file(path, &src, lang))?;
+                    store.replace_imports_for_file(path, &symbols::extract_imports(&src, lang))?;
+                }
+            }
+        }
+        _ => {
+            // Removed or unreadable: clear extracted data.
+            store.replace_symbols_for_file(path, &[])?;
+            store.replace_imports_for_file(path, &[])?;
+        }
+    }
+    store.invalidate_vector(path)?;
+    Ok(())
+}
+
+/// Rebuild the co-change graph and file recency from git history (called when
+/// HEAD moves — a new commit landed).
+pub fn refresh_history(store: &mut Store, repo_root: &Path) -> Result<()> {
+    let history = cochange::build(repo_root);
+    store.replace_cochange(&history.edges)?;
+    store.update_recency(&history.last_commit)?;
+    Ok(())
+}
+
 #[derive(Debug)]
 pub struct IndexStats {
     pub files: usize,
