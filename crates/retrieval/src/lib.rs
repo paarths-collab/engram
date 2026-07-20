@@ -2,6 +2,7 @@
 //! score fusion, lazy Tier-1 extraction on miss, and co-change impact expansion.
 
 pub mod embed;
+pub mod weights;
 
 use anyhow::Result;
 use embed::{cosine, Embedder, HashedNgramEmbedder};
@@ -13,34 +14,23 @@ use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
 use tantivy::schema::{Field, Schema, STORED, TEXT};
 use tantivy::{doc, Index, IndexReader};
+use weights::{classify_path, recency_boost, DocClass, WeightsConfig};
 
-/// Fusion weights — the section-7 formula, trimmed to the signals we have today.
-/// Externalize to config/scoring.toml once numbers stabilize.
-pub struct Weights {
-    pub bm25: f32,
-    pub vector: f32,
-    pub symbol_exact: f32,
-    pub path_match: f32,
-    pub test_bonus_for_tests_query: f32,
-}
-
-impl Default for Weights {
-    fn default() -> Self {
-        Weights {
-            bm25: 1.0,
-            vector: 1.2,
-            symbol_exact: 1.5,
-            path_match: 0.6,
-            test_bonus_for_tests_query: 0.5,
-        }
-    }
-}
+pub use weights::Weights;
 
 struct DocMeta {
     path: String,
     is_test: bool,
     preview: String,
     vector: Vec<f32>,
+    last_commit_ts: Option<i64>,
+}
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 pub struct Engine {
@@ -52,7 +42,7 @@ pub struct Engine {
     docs: Vec<DocMeta>,
     by_path: HashMap<String, usize>,
     embedder: HashedNgramEmbedder,
-    pub weights: Weights,
+    config: WeightsConfig,
 }
 
 const PREVIEW_BYTES: usize = 400;
@@ -71,6 +61,7 @@ impl Engine {
         let embedder = HashedNgramEmbedder;
         let mut docs = Vec::new();
         let mut by_path = HashMap::new();
+        let recency = store.recency_map()?;
 
         for f in store.all_files()? {
             let full = repo_root.join(&f.path);
@@ -85,6 +76,7 @@ impl Engine {
             by_path.insert(f.path.clone(), docs.len());
             docs.push(DocMeta {
                 preview: body.chars().take(PREVIEW_BYTES).collect(),
+                last_commit_ts: recency.get(&f.path).copied(),
                 path: f.path,
                 is_test: f.is_test,
                 vector,
@@ -102,7 +94,7 @@ impl Engine {
             docs,
             by_path,
             embedder,
-            weights: Weights::default(),
+            config: WeightsConfig::load(repo_root),
         })
     }
 
@@ -144,13 +136,17 @@ impl Engine {
     /// Hybrid search: BM25 + vector fused with weighted normalized scores,
     /// plus symbol exact-match boost. Lazily Tier-1 extracts top hits on miss.
     pub fn search(
-        &self,
+        &mut self,
         store: &mut Store,
         query: &str,
         top_k: usize,
     ) -> Result<Vec<EvidencePacket>> {
+        // Dev hot-reload: pick up config/scoring.toml edits without a restart.
+        self.config.reload_if_changed();
         let bm25 = self.bm25_candidates(query, 50);
         let vecs = self.vector_candidates(query, 50);
+        let now = now_unix();
+        let w = &self.config.weights;
 
         let norm = |list: &[(usize, f32)]| -> HashMap<usize, f32> {
             let max = list.iter().map(|x| x.1).fold(0f32, f32::max).max(1e-6);
@@ -164,16 +160,16 @@ impl Engine {
         let mut fused: HashMap<usize, (f32, Vec<String>)> = HashMap::new();
         for (i, s) in &bm25_n {
             let e = fused.entry(*i).or_insert((0.0, Vec::new()));
-            e.0 += self.weights.bm25 * s;
+            e.0 += w.bm25 * s;
             e.1.push("bm25".into());
         }
         for (i, s) in &vec_n {
             let e = fused.entry(*i).or_insert((0.0, Vec::new()));
-            e.0 += self.weights.vector * s;
+            e.0 += w.vector * s;
             e.1.push("vector".into());
         }
 
-        // path token match + test handling
+        // path token match, recency, test handling, and doc/changelog demotion
         let q_tokens: Vec<String> = query
             .split(|c: char| !c.is_alphanumeric())
             .filter(|t| t.len() > 2)
@@ -183,15 +179,33 @@ impl Engine {
             let d = &self.docs[*i];
             let pl = d.path.to_lowercase();
             if q_tokens.iter().any(|t| pl.contains(t)) {
-                *score += self.weights.path_match;
+                *score += w.path_match;
                 signals.push("path".into());
+            }
+            // Additive recency: recently-committed files rank higher.
+            let boost = recency_boost(w, d.last_commit_ts, now);
+            if boost > 1e-4 {
+                *score += boost;
+                signals.push("recent".into());
             }
             if d.is_test {
                 if query_wants_tests {
-                    *score += self.weights.test_bonus_for_tests_query;
+                    *score += w.test_bonus_for_tests_query;
                 } else {
                     *score *= 0.8; // slight demotion, tests still surfaced via impact
                 }
+            }
+            // Demote low-signal docs; changelogs mention every feature so hit hardest.
+            match classify_path(&d.path) {
+                DocClass::Changelog => {
+                    *score *= w.changelog_penalty;
+                    signals.push("changelog_demoted".into());
+                }
+                DocClass::Doc => {
+                    *score *= w.doc_file_penalty;
+                    signals.push("doc_demoted".into());
+                }
+                DocClass::Code => {}
             }
         }
 
@@ -245,7 +259,7 @@ impl Engine {
                     path: s.path.clone(),
                     symbol: Some(s.name.clone()),
                     snippet: Some(s.signature.clone()),
-                    score: self.weights.symbol_exact,
+                    score: self.config.weights.symbol_exact,
                     signals: vec!["symbol".into()],
                 });
             }
@@ -255,7 +269,7 @@ impl Engine {
     }
 
     /// predict_impact: hybrid hits = direct; co-change graph = historical expansion.
-    pub fn predict_impact(&self, store: &mut Store, query: &str) -> Result<ImpactPrediction> {
+    pub fn predict_impact(&mut self, store: &mut Store, query: &str) -> Result<ImpactPrediction> {
         let direct = self.search(store, query, 8)?;
         let mut likely_files = Vec::new();
         let mut likely_tests = Vec::new();

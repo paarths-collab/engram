@@ -17,8 +17,9 @@ pub fn index_repo(repo_root: &Path, eager_tier1_limit: usize) -> Result<IndexSta
     let files = inventory::scan(repo_root);
     store.upsert_files(&files)?;
 
-    let edges = cochange::build(repo_root);
-    store.replace_cochange(&edges)?;
+    let history = cochange::build(repo_root);
+    store.replace_cochange(&history.edges)?;
+    store.update_recency(&history.last_commit)?;
 
     // Eagerly extract symbols for up to N source files (small repos = instant full coverage).
     let mut extracted = 0usize;
@@ -41,7 +42,7 @@ pub fn index_repo(repo_root: &Path, eager_tier1_limit: usize) -> Result<IndexSta
 
     Ok(IndexStats {
         files: files.len(),
-        cochange_edges: edges.len(),
+        cochange_edges: history.edges.len(),
         tier1_files: extracted,
     })
 }

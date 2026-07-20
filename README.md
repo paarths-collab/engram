@@ -39,10 +39,16 @@ Before implementing any task:
 - Hand-rolled MCP stdio server, three tools: get_task_context,
   find_existing_implementation, predict_impact (crates/mcp-server)
 
+## Scoring config
+Fusion weights, doc/changelog demotions, and recency are externalized to
+`config/scoring.toml` (loaded at startup, hot-reloaded in dev when the file
+changes). Tune retrieval without recompiling. Missing keys fall back to
+built-in defaults (retrieval/src/weights.rs).
+
 ## Swap points (marked in code)
 - `Embedder` trait (retrieval/src/embed.rs): replace HashedNgramEmbedder with
   fastembed-rs (local ONNX) or an OpenAI-compatible API — nothing else changes
-- `Weights` (retrieval/src/lib.rs): fusion weights → move to config/scoring.toml
+- `Weights` (retrieval/src/weights.rs): tune via config/scoring.toml
 - SQLite → Postgres for cloud/team mode
 
 ## Next (per blueprint)

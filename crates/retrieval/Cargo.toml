@@ -9,6 +9,7 @@ engram-repo-map = { path = "../repo-map" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
+toml = { workspace = true }
 tantivy = "0.24"
 
 [lib]
