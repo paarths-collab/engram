@@ -57,7 +57,7 @@ impl Engram {
             self.store = Some(Store::open(&self.repo_root).map_err(|e| format!("store: {e}"))?);
         }
         if self.engine.is_none() {
-            let store = self.store.as_ref().unwrap();
+            let store = self.store.as_mut().unwrap();
             self.engine =
                 Some(Engine::build(&self.repo_root, store).map_err(|e| format!("engine: {e}"))?);
         }

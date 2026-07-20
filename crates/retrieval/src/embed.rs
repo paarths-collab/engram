@@ -81,3 +81,58 @@ impl Embedder for HashedNgramEmbedder {
 pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
+
+/// Stable content hash (FNV-1a, hex) used to invalidate cached embeddings when
+/// the embedded text changes. Deterministic across runs and machines.
+pub fn content_hash(text: &str) -> String {
+    format!("{:016x}", fnv1a(text.as_bytes()))
+}
+
+/// Encode an embedding vector as little-endian `f32` bytes for BLOB storage.
+pub fn vector_to_bytes(v: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(v.len() * 4);
+    for x in v {
+        out.extend_from_slice(&x.to_le_bytes());
+    }
+    out
+}
+
+/// Decode little-endian `f32` bytes back into a vector. Returns `None` if the
+/// byte length is not a multiple of 4 or the dimension is wrong.
+pub fn bytes_to_vector(bytes: &[u8]) -> Option<Vec<f32>> {
+    if !bytes.len().is_multiple_of(4) || bytes.len() / 4 != DIM {
+        return None;
+    }
+    Some(
+        bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vector_roundtrips_through_bytes() {
+        let v = HashedNgramEmbedder.embed("fn retry_with_backoff(policy: RetryPolicy)");
+        let bytes = vector_to_bytes(&v);
+        assert_eq!(bytes.len(), DIM * 4);
+        let back = bytes_to_vector(&bytes).expect("decodes");
+        assert_eq!(v, back);
+    }
+
+    #[test]
+    fn bytes_to_vector_rejects_bad_length() {
+        assert!(bytes_to_vector(&[0u8; 3]).is_none());
+        assert!(bytes_to_vector(&[0u8; (DIM - 1) * 4]).is_none());
+    }
+
+    #[test]
+    fn content_hash_is_stable_and_sensitive() {
+        assert_eq!(content_hash("hello world"), content_hash("hello world"));
+        assert_ne!(content_hash("hello world"), content_hash("hello worlds"));
+    }
+}

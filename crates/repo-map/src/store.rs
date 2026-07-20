@@ -50,6 +50,11 @@ impl Store {
             );
             CREATE INDEX IF NOT EXISTS idx_file_imports_target ON file_imports(target);
             CREATE INDEX IF NOT EXISTS idx_file_imports_path ON file_imports(path);
+            CREATE TABLE IF NOT EXISTS vectors (
+                path TEXT PRIMARY KEY,
+                hash TEXT NOT NULL,
+                data BLOB NOT NULL
+            );
             "#,
         )?;
         // Migration for DBs created before recency tracking: add the column if
@@ -79,6 +84,50 @@ impl Store {
             .prepare("SELECT path, last_commit_ts FROM files WHERE last_commit_ts IS NOT NULL")?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
         Ok(rows.filter_map(Result::ok).collect())
+    }
+
+    /// Load every cached embedding as `path -> (content_hash, raw_bytes)`.
+    /// Retrieval decodes the bytes back into `f32` vectors.
+    pub fn load_vectors(&self) -> Result<HashMap<String, (String, Vec<u8>)>> {
+        let mut stmt = self.conn.prepare("SELECT path, hash, data FROM vectors")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                (r.get::<_, String>(1)?, r.get::<_, Vec<u8>>(2)?),
+            ))
+        })?;
+        Ok(rows.filter_map(Result::ok).collect())
+    }
+
+    /// Upsert embeddings: `(path, content_hash, raw_bytes)`.
+    pub fn upsert_vectors(&mut self, rows: &[(String, String, Vec<u8>)]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        for (path, hash, data) in rows {
+            tx.execute(
+                "INSERT INTO vectors (path, hash, data) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(path) DO UPDATE SET hash=?2, data=?3",
+                params![path, hash, data],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Drop cached embeddings for files no longer present in the repo.
+    pub fn prune_vectors(&mut self, keep: &std::collections::HashSet<String>) -> Result<()> {
+        let existing: Vec<String> = {
+            let mut stmt = self.conn.prepare("SELECT path FROM vectors")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            rows.filter_map(Result::ok).collect()
+        };
+        let tx = self.conn.transaction()?;
+        for path in existing {
+            if !keep.contains(&path) {
+                tx.execute("DELETE FROM vectors WHERE path = ?1", params![path])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Replace the import targets recorded for a file. Targets are normalized
