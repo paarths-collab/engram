@@ -20,6 +20,20 @@ use weights::{classify_path, recency_boost, DocClass, WeightsConfig};
 
 pub use weights::Weights;
 
+/// Ranking strategy, used by the benchmark harness to compare hybrid retrieval
+/// against isolated-signal baselines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RankMode {
+    /// Full fusion (bm25 + vector + symbol + path + recency + demotions).
+    Hybrid,
+    /// Tantivy BM25 lexical only.
+    Bm25,
+    /// Hashed-ngram cosine only.
+    Vector,
+    /// Deterministic pseudo-random order (a floor baseline).
+    Random,
+}
+
 struct DocMeta {
     path: String,
     is_test: bool,
@@ -143,6 +157,48 @@ impl Engine {
             graph,
             stopwords,
         })
+    }
+
+    /// Rank file paths for a query under a given strategy (top `k`). Used by the
+    /// benchmark harness to compare hybrid retrieval against baselines.
+    pub fn rank(
+        &mut self,
+        store: &mut Store,
+        query: &str,
+        mode: RankMode,
+        k: usize,
+    ) -> Result<Vec<String>> {
+        let paths = match mode {
+            RankMode::Hybrid => {
+                let mut seen = HashSet::new();
+                self.search(store, query, k)?
+                    .into_iter()
+                    .map(|p| p.path)
+                    .filter(|p| seen.insert(p.clone()))
+                    .take(k)
+                    .collect()
+            }
+            RankMode::Bm25 => self
+                .bm25_candidates(query, k)
+                .into_iter()
+                .map(|(i, _)| self.docs[i].path.clone())
+                .collect(),
+            RankMode::Vector => self
+                .vector_candidates(query, k)
+                .into_iter()
+                .map(|(i, _)| self.docs[i].path.clone())
+                .collect(),
+            RankMode::Random => {
+                let mut idx: Vec<usize> = (0..self.docs.len()).collect();
+                // Deterministic pseudo-random: hash of (query, path).
+                idx.sort_by_key(|&i| embed::content_hash(&format!("{query}{}", self.docs[i].path)));
+                idx.into_iter()
+                    .take(k)
+                    .map(|i| self.docs[i].path.clone())
+                    .collect()
+            }
+        };
+        Ok(paths)
     }
 
     fn bm25_candidates(&self, query: &str, k: usize) -> Vec<(usize, f32)> {
