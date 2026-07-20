@@ -1,0 +1,20 @@
+# Backend service verification profile.
+name: backend
+detect:
+  - "**/*.rs"
+  - "**/*.go"
+  - "**/*.java"
+  - "**/*.kt"
+  - "src/**/*.py"
+  - "app/**/*.py"
+  - "src/**/*.ts"
+  - "server/**/*.ts"
+checks:
+  - "Unit tests cover new and changed logic"
+  - "Integration tests exercise changed endpoints or services"
+  - "Public types and function signatures are type-checked"
+  - "Error handling and edge cases are covered (no silent failures)"
+  - "Authorization is enforced on new or changed endpoints"
+  - "Retryable operations are idempotent"
+  - "Performance-sensitive paths reviewed for regressions"
+  - "Existing abstractions reused instead of reimplemented"

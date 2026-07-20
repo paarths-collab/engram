@@ -123,3 +123,17 @@ pub struct ScoredPath {
     pub confidence: f32,
     pub reason: String,
 }
+
+/// Output of get_verification_plan: the merged checklist for a set of changed
+/// files, plus repo-detected test commands and historically co-failing tests.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerificationPlan {
+    /// Domain profiles whose detection rules matched the changed files.
+    pub matched_profiles: Vec<String>,
+    /// Merged, de-duplicated checklist items from the matched profiles.
+    pub checklist: Vec<String>,
+    /// Test/verify commands detected from the repo's manifests.
+    pub test_commands: Vec<String>,
+    /// Tests that historically change together with the changed files.
+    pub historically_co_failing_tests: Vec<String>,
+}
