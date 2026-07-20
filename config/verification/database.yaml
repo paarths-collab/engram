@@ -1,0 +1,18 @@
+# Database / migration verification profile.
+name: database
+detect:
+  - "**/migrations/**"
+  - "**/migrate/**"
+  - "**/*.sql"
+  - "**/schema.rs"
+  - "**/schema.prisma"
+  - "**/models.py"
+checks:
+  - "Migration applies cleanly on a fresh database"
+  - "A rollback or backward-compatible path exists"
+  - "Schema change is compatible with currently-deployed code"
+  - "Indexes exist for new query patterns"
+  - "Constraints (nullability, foreign keys, uniqueness) are correct"
+  - "Locking / long-running migration risk assessed"
+  - "Data backfill plan defined for non-null columns"
+  - "Deploy ordering (migrate vs. code) is documented"

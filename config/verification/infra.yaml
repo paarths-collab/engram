@@ -1,0 +1,17 @@
+# Infrastructure / deployment verification profile.
+name: infra
+detect:
+  - "**/Dockerfile"
+  - "**/*.tf"
+  - "**/*.yaml"
+  - "**/*.yml"
+  - "**/*.toml"
+  - ".github/workflows/**"
+  - "**/helm/**"
+  - "**/k8s/**"
+checks:
+  - "Configuration validated (lint / plan / dry-run)"
+  - "Deployment plan and rollback behavior defined"
+  - "Secrets handled via a secret store, never committed"
+  - "Resource changes (CPU/memory/limits) reviewed"
+  - "Environment compatibility (dev/staging/prod) checked"

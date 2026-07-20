@@ -45,7 +45,9 @@ impl Engram {
         }
     }
 
-    fn ensure_engine(&mut self) -> Result<(), String> {
+    /// Ensure the background index is ready and the store is open. Cheap tools
+    /// (verification plan) need only this, not the embedding index.
+    fn ensure_store(&mut self) -> Result<(), String> {
         if !self.index_ready.load(Ordering::SeqCst) {
             return Err(
                 "Engram is still indexing this repository in the background. \
@@ -56,6 +58,11 @@ impl Engram {
         if self.store.is_none() {
             self.store = Some(Store::open(&self.repo_root).map_err(|e| format!("store: {e}"))?);
         }
+        Ok(())
+    }
+
+    fn ensure_engine(&mut self) -> Result<(), String> {
+        self.ensure_store()?;
         if self.engine.is_none() {
             let store = self.store.as_mut().unwrap();
             self.engine =
@@ -100,16 +107,31 @@ impl ToolHandler for Engram {
                     },
                     "required": ["task"]
                 }
+            },
+            {
+                "name": "get_verification_plan",
+                "description": "Call this AFTER making changes and BEFORE opening a PR. Given the list of changed files, returns the merged verification checklist for the engineering domains they touch (backend/frontend/database/infra), the repo's detected test commands, and tests that historically change together with these files. Run these checks before considering the change done.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "changed_files": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Repo-relative paths of the files changed, e.g. ['src/billing/cancel.rs', 'migrations/003_add.sql']"
+                        }
+                    },
+                    "required": ["changed_files"]
+                }
             }
         ]})
     }
 
     fn call_tool(&mut self, name: &str, args: &Value) -> Result<Value, String> {
-        self.ensure_engine()?;
-        let engine = self.engine.as_mut().unwrap();
-        let store = self.store.as_mut().unwrap();
         match name {
             "get_task_context" => {
+                self.ensure_engine()?;
+                let engine = self.engine.as_mut().unwrap();
+                let store = self.store.as_mut().unwrap();
                 let task = args.get("task").and_then(|v| v.as_str()).unwrap_or("");
                 if task.is_empty() {
                     return Err("missing required argument: task".into());
@@ -118,6 +140,9 @@ impl ToolHandler for Engram {
                 Ok(json!({ "task": task, "evidence": packets }))
             }
             "find_existing_implementation" => {
+                self.ensure_engine()?;
+                let engine = self.engine.as_mut().unwrap();
+                let store = self.store.as_mut().unwrap();
                 let concept = args.get("concept").and_then(|v| v.as_str()).unwrap_or("");
                 if concept.is_empty() {
                     return Err("missing required argument: concept".into());
@@ -137,6 +162,9 @@ impl ToolHandler for Engram {
                 }))
             }
             "predict_impact" => {
+                self.ensure_engine()?;
+                let engine = self.engine.as_mut().unwrap();
+                let store = self.store.as_mut().unwrap();
                 let task = args.get("task").and_then(|v| v.as_str()).unwrap_or("");
                 if task.is_empty() {
                     return Err("missing required argument: task".into());
@@ -145,6 +173,49 @@ impl ToolHandler for Engram {
                     .predict_impact(store, task)
                     .map_err(|e| e.to_string())?;
                 Ok(serde_json::to_value(impact).map_err(|e| e.to_string())?)
+            }
+            "get_verification_plan" => {
+                self.ensure_store()?;
+                let changed: Vec<String> = args
+                    .get("changed_files")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if changed.is_empty() {
+                    return Err("missing required argument: changed_files (array of paths)".into());
+                }
+                let profiles = engram_verify::load_profiles(&self.repo_root);
+                let m = engram_verify::match_profiles(&profiles, &changed);
+                let test_commands = engram_verify::detect_test_commands(&self.repo_root);
+
+                // Historically co-failing tests: tests in the co-change set of changed files.
+                let store = self.store.as_ref().unwrap();
+                let mut co_failing: Vec<String> = Vec::new();
+                for f in &changed {
+                    if let Ok(edges) = store.cochange_for(f, 10) {
+                        for e in edges {
+                            if engram_repo_map::inventory::is_test_path(&e.path_b)
+                                && !co_failing.contains(&e.path_b)
+                            {
+                                co_failing.push(e.path_b);
+                            }
+                        }
+                    }
+                }
+                co_failing.sort();
+                co_failing.dedup();
+
+                let plan = engram_domain::VerificationPlan {
+                    matched_profiles: m.matched_profiles,
+                    checklist: m.checklist,
+                    test_commands,
+                    historically_co_failing_tests: co_failing,
+                };
+                Ok(serde_json::to_value(plan).map_err(|e| e.to_string())?)
             }
             other => Err(format!("unknown tool: {other}")),
         }

@@ -1,0 +1,18 @@
+# Frontend / UI verification profile.
+name: frontend
+detect:
+  - "**/*.tsx"
+  - "**/*.jsx"
+  - "**/*.vue"
+  - "**/*.svelte"
+  - "**/*.css"
+  - "**/*.scss"
+  - "components/**/*.ts"
+  - "web/**/*.ts"
+checks:
+  - "Existing design-system components reused before adding new ones"
+  - "Loading, error, and empty states handled"
+  - "Accessibility: roles, labels, keyboard navigation"
+  - "Responsive behavior verified at key breakpoints"
+  - "API contract matches the backend it consumes"
+  - "Component and end-to-end tests updated"
