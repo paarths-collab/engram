@@ -1,6 +1,7 @@
 //! engram-repo-map: Tier-0 inventory, Tier-1 symbols, co-change graph, SQLite store.
 
 pub mod cochange;
+pub mod graph;
 pub mod imports;
 pub mod inventory;
 pub mod store;

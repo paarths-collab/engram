@@ -7,6 +7,7 @@ pub mod weights;
 use anyhow::Result;
 use embed::{cosine, Embedder, HashedNgramEmbedder};
 use engram_domain::{EvidenceKind, EvidencePacket, ImpactPrediction, ScoredPath, SymbolRecord};
+use engram_repo_map::graph::{CodeGraph, EdgeKind};
 use engram_repo_map::store::Store;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -43,6 +44,7 @@ pub struct Engine {
     by_path: HashMap<String, usize>,
     embedder: HashedNgramEmbedder,
     config: WeightsConfig,
+    graph: CodeGraph,
 }
 
 const PREVIEW_BYTES: usize = 400;
@@ -117,6 +119,12 @@ impl Engine {
         }
         store.prune_vectors(&present)?;
         eprintln!("[engram] vectors: {reused} reused, {embedded} embedded");
+        let graph = CodeGraph::build(store)?;
+        eprintln!(
+            "[engram] code graph: {} nodes, {} edges",
+            graph.node_count(),
+            graph.edge_count()
+        );
         let reader = index.reader()?;
 
         Ok(Engine {
@@ -129,6 +137,7 @@ impl Engine {
             by_path,
             embedder,
             config: WeightsConfig::load(repo_root),
+            graph,
         })
     }
 
@@ -357,50 +366,41 @@ impl Engine {
         cochange_expansions.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
         cochange_expansions.truncate(8);
 
-        // Import-graph expansion: files that statically import a direct hit.
+        // Import-graph expansion via the in-memory code graph: files that
+        // (transitively, up to 2 hops) import a direct hit. SQL stores the edges;
+        // we traverse them in memory (see docs/adr/0001).
         let direct_paths: std::collections::HashSet<&str> =
             direct.iter().map(|d| d.path.as_str()).collect();
         let cochange_paths: std::collections::HashSet<&str> = cochange_expansions
             .iter()
             .map(|c| c.path.as_str())
             .collect();
-        let mut importer_hits: HashMap<String, Vec<String>> = HashMap::new();
-        for p in &direct {
-            if p.kind == EvidenceKind::Test {
-                continue;
-            }
-            let Some(needle) = engram_repo_map::imports::module_needle(&p.path) else {
-                continue;
-            };
-            for importer in store.importers_of(&needle, &p.path, 10)? {
-                if direct_paths.contains(importer.as_str())
-                    || cochange_paths.contains(importer.as_str())
-                    || !self.by_path.contains_key(importer.as_str())
-                {
-                    continue;
-                }
-                importer_hits
-                    .entry(importer)
-                    .or_default()
-                    .push(p.path.clone());
-            }
-        }
-        let mut import_expansions: Vec<ScoredPath> = importer_hits
-            .into_iter()
-            .map(|(path, mut hits)| {
-                hits.sort();
-                hits.dedup();
-                let confidence = (0.4 + 0.2 * hits.len() as f32).min(1.0);
-                if engram_repo_map::inventory::is_test_path(&path) {
-                    likely_tests.push(path.clone());
-                }
-                ScoredPath {
-                    path,
-                    confidence,
-                    reason: format!("imports {}", hits.join(", ")),
-                }
-            })
+        let seeds: Vec<String> = direct
+            .iter()
+            .filter(|p| p.kind != EvidenceKind::Test)
+            .map(|p| p.path.clone())
             .collect();
+        let mut import_expansions: Vec<ScoredPath> = Vec::new();
+        for hit in self.graph.dependents(&seeds, &[EdgeKind::Imports], 2) {
+            if direct_paths.contains(hit.path.as_str())
+                || cochange_paths.contains(hit.path.as_str())
+            {
+                continue;
+            }
+            if engram_repo_map::inventory::is_test_path(&hit.path) {
+                likely_tests.push(hit.path.clone());
+            }
+            let confidence = if hit.hops <= 1 { 0.6 } else { 0.35 };
+            import_expansions.push(ScoredPath {
+                path: hit.path,
+                confidence,
+                reason: format!(
+                    "imports a likely-changed file ({} hop{})",
+                    hit.hops,
+                    if hit.hops == 1 { "" } else { "s" }
+                ),
+            });
+        }
         import_expansions.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
         import_expansions.truncate(8);
 

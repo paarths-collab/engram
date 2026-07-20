@@ -149,6 +149,29 @@ impl Store {
         Ok(())
     }
 
+    /// All `(importer_path, normalized_target)` import rows. Used to build the
+    /// in-memory code graph (see `crate::graph`).
+    pub fn all_imports(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare("SELECT path, target FROM file_imports")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        Ok(rows.filter_map(Result::ok).collect())
+    }
+
+    /// All directed co-change edges `(path_a, path_b, strength)`.
+    pub fn all_cochange_edges(&self) -> Result<Vec<(String, String, f32)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path_a, path_b, strength FROM cochange")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, f32>(2)?,
+            ))
+        })?;
+        Ok(rows.filter_map(Result::ok).collect())
+    }
+
     /// Files whose import targets contain `needle` (a module key from
     /// [`crate::imports::module_needle`]), excluding `exclude`.
     pub fn importers_of(&self, needle: &str, exclude: &str, limit: usize) -> Result<Vec<String>> {
