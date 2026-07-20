@@ -2,6 +2,7 @@
 //! score fusion, lazy Tier-1 extraction on miss, and co-change impact expansion.
 
 pub mod embed;
+pub mod stopwords;
 pub mod weights;
 
 use anyhow::Result;
@@ -45,6 +46,7 @@ pub struct Engine {
     embedder: HashedNgramEmbedder,
     config: WeightsConfig,
     graph: CodeGraph,
+    stopwords: std::sync::Arc<HashSet<String>>,
 }
 
 const PREVIEW_BYTES: usize = 400;
@@ -64,7 +66,8 @@ impl Engine {
         let index = Index::create_in_ram(schema);
         let mut writer = index.writer(64_000_000)?;
 
-        let embedder = HashedNgramEmbedder;
+        let stopwords = std::sync::Arc::new(stopwords::load(repo_root));
+        let embedder = HashedNgramEmbedder::new(stopwords.clone());
         let mut docs = Vec::new();
         let mut by_path = HashMap::new();
         let recency = store.recency_map()?;
@@ -138,6 +141,7 @@ impl Engine {
             embedder,
             config: WeightsConfig::load(repo_root),
             graph,
+            stopwords,
         })
     }
 
@@ -217,6 +221,7 @@ impl Engine {
             .split(|c: char| !c.is_alphanumeric())
             .filter(|t| t.len() > 2)
             .map(|t| t.to_lowercase())
+            .filter(|t| !self.stopwords.contains(t.as_str()))
             .collect();
         for (i, (score, signals)) in fused.iter_mut() {
             let d = &self.docs[*i];

@@ -7,13 +7,36 @@
 //!   - Later: fastembed-rs (local ONNX bge/minilm) or any OpenAI-compatible API,
 //!     behind the same trait. Nothing else in the pipeline changes.
 
+use std::collections::HashSet;
+use std::sync::Arc;
+
 pub const DIM: usize = 512;
 
 pub trait Embedder: Send + Sync {
     fn embed(&self, text: &str) -> Vec<f32>;
 }
 
-pub struct HashedNgramEmbedder;
+/// Hashed-ngram embedder with an optional stopword set applied to tokens.
+pub struct HashedNgramEmbedder {
+    stopwords: Arc<HashSet<String>>,
+}
+
+impl Default for HashedNgramEmbedder {
+    /// No stopword filtering (used in tests and as a bare default).
+    fn default() -> Self {
+        HashedNgramEmbedder {
+            stopwords: Arc::new(HashSet::new()),
+        }
+    }
+}
+
+impl HashedNgramEmbedder {
+    /// Construct with a shared stopword set; those tokens are dropped from
+    /// both whole-token and trigram features.
+    pub fn new(stopwords: Arc<HashSet<String>>) -> Self {
+        HashedNgramEmbedder { stopwords }
+    }
+}
 
 fn fnv1a(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
@@ -53,7 +76,10 @@ impl Embedder for HashedNgramEmbedder {
     fn embed(&self, text: &str) -> Vec<f32> {
         let mut v = vec![0f32; DIM];
         let tokens = tokenize(text);
-        for tok in &tokens {
+        for tok in tokens
+            .iter()
+            .filter(|t| !self.stopwords.contains(t.as_str()))
+        {
             // whole-token feature (weighted higher)
             let h = fnv1a(tok.as_bytes()) as usize % DIM;
             v[h] += 2.0;
@@ -117,7 +143,7 @@ mod tests {
 
     #[test]
     fn vector_roundtrips_through_bytes() {
-        let v = HashedNgramEmbedder.embed("fn retry_with_backoff(policy: RetryPolicy)");
+        let v = HashedNgramEmbedder::default().embed("fn retry_with_backoff(policy: RetryPolicy)");
         let bytes = vector_to_bytes(&v);
         assert_eq!(bytes.len(), DIM * 4);
         let back = bytes_to_vector(&bytes).expect("decodes");

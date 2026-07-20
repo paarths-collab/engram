@@ -1,0 +1,19 @@
+# Engram stopwords ("word DB").
+#
+# Low-signal words dropped from queries and indexed text before scoring, so
+# noise like "the"/"is"/"for" can't false-match paths or dilute embeddings.
+# One word per line; text after '#' is a comment. Entries here are UNIONED with
+# the built-in English defaults (retrieval/src/stopwords.rs) — add domain noise
+# words below without losing the basics. Loaded at startup.
+#
+# The AI that phrases the query is the coding agent itself; this list just keeps
+# that query clean. No LLM runs inside the server.
+
+# --- project/task boilerplate that rarely helps locate code ---
+please
+todo
+fixme
+pr
+issue
+ticket
+task
