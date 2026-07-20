@@ -44,6 +44,12 @@ impl Store {
                 strength REAL NOT NULL,
                 PRIMARY KEY (path_a, path_b)
             );
+            CREATE TABLE IF NOT EXISTS file_imports (
+                path TEXT NOT NULL,
+                target TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_file_imports_target ON file_imports(target);
+            CREATE INDEX IF NOT EXISTS idx_file_imports_path ON file_imports(path);
             "#,
         )?;
         // Migration for DBs created before recency tracking: add the column if
@@ -72,6 +78,39 @@ impl Store {
             .conn
             .prepare("SELECT path, last_commit_ts FROM files WHERE last_commit_ts IS NOT NULL")?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+        Ok(rows.filter_map(Result::ok).collect())
+    }
+
+    /// Replace the import targets recorded for a file. Targets are normalized
+    /// (see [`crate::imports::normalize_target`]) before storage; empties dropped.
+    pub fn replace_imports_for_file(&mut self, path: &str, targets: &[String]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM file_imports WHERE path = ?1", params![path])?;
+        for raw in targets {
+            let target = crate::imports::normalize_target(raw);
+            if target.is_empty() {
+                continue;
+            }
+            tx.execute(
+                "INSERT INTO file_imports (path, target) VALUES (?1, ?2)",
+                params![path, target],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Files whose import targets contain `needle` (a module key from
+    /// [`crate::imports::module_needle`]), excluding `exclude`.
+    pub fn importers_of(&self, needle: &str, exclude: &str, limit: usize) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT path FROM file_imports
+             WHERE target LIKE ?1 AND path <> ?2 LIMIT ?3",
+        )?;
+        let pattern = format!("%{needle}%");
+        let rows = stmt.query_map(params![pattern, exclude, limit as i64], |r| {
+            r.get::<_, String>(0)
+        })?;
         Ok(rows.filter_map(Result::ok).collect())
     }
 

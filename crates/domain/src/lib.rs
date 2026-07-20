@@ -113,6 +113,8 @@ pub struct ImpactPrediction {
     pub likely_files: Vec<ScoredPath>,
     pub likely_tests: Vec<String>,
     pub cochange_expansions: Vec<ScoredPath>,
+    /// Files that statically import one of the direct hits (import-graph expansion).
+    pub import_expansions: Vec<ScoredPath>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
