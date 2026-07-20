@@ -2,7 +2,7 @@
 //! Tracks which files are extracted to Tier-1 so retrieval can lazily extract on miss.
 
 use anyhow::Result;
-use engram_domain::{CoChange, FileRecord, Language, SymbolKind, SymbolRecord};
+use engram_domain::{CoChange, FileRecord, Language, ReviewComment, SymbolKind, SymbolRecord};
 use rusqlite::{params, Connection};
 use std::collections::HashMap;
 use std::path::Path;
@@ -55,6 +55,28 @@ impl Store {
                 hash TEXT NOT NULL,
                 data BLOB NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS pull_requests (
+                number INTEGER PRIMARY KEY,
+                title TEXT NOT NULL,
+                body TEXT NOT NULL,
+                merged INTEGER NOT NULL,
+                author TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS pr_files (
+                pr_number INTEGER NOT NULL,
+                path TEXT NOT NULL,
+                PRIMARY KEY (pr_number, path)
+            );
+            CREATE INDEX IF NOT EXISTS idx_pr_files_path ON pr_files(path);
+            CREATE TABLE IF NOT EXISTS review_comments (
+                id INTEGER PRIMARY KEY,
+                pr_number INTEGER NOT NULL,
+                path TEXT NOT NULL,
+                line INTEGER,
+                body TEXT NOT NULL,
+                author TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_review_comments_path ON review_comments(path);
             "#,
         )?;
         // Migration for DBs created before recency tracking: add the column if
@@ -128,6 +150,110 @@ impl Store {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Upsert a pull request row.
+    pub fn upsert_pull_request(
+        &mut self,
+        number: i64,
+        title: &str,
+        body: &str,
+        merged: bool,
+        author: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO pull_requests (number, title, body, merged, author)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(number) DO UPDATE SET title=?2, body=?3, merged=?4, author=?5",
+            params![number, title, body, merged as i64, author],
+        )?;
+        Ok(())
+    }
+
+    /// Replace the changed-file list recorded for a PR.
+    pub fn replace_pr_files(&mut self, pr_number: i64, paths: &[String]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM pr_files WHERE pr_number = ?1",
+            params![pr_number],
+        )?;
+        for path in paths {
+            tx.execute(
+                "INSERT OR IGNORE INTO pr_files (pr_number, path) VALUES (?1, ?2)",
+                params![pr_number, path],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Replace the review comments recorded for a PR. `(path, line, body, author)`.
+    pub fn replace_review_comments_for_pr(
+        &mut self,
+        pr_number: i64,
+        comments: &[(String, Option<i64>, String, String)],
+    ) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM review_comments WHERE pr_number = ?1",
+            params![pr_number],
+        )?;
+        for (path, line, body, author) in comments {
+            tx.execute(
+                "INSERT INTO review_comments (pr_number, path, line, body, author)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![pr_number, path, line, body, author],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn count_pull_requests(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("SELECT COUNT(*) FROM pull_requests", [], |r| r.get(0))?)
+    }
+
+    pub fn count_review_comments(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("SELECT COUNT(*) FROM review_comments", [], |r| r.get(0))?)
+    }
+
+    /// All ingested review comments, joined with their PR's title/merged status.
+    pub fn all_review_comments(&self) -> Result<Vec<ReviewComment>> {
+        self.query_review_comments("1=1", params![])
+    }
+
+    /// Review comments left on a specific file path.
+    pub fn review_comments_for_path(&self, path: &str) -> Result<Vec<ReviewComment>> {
+        self.query_review_comments("rc.path = ?1", params![path])
+    }
+
+    fn query_review_comments(
+        &self,
+        where_clause: &str,
+        p: &[&dyn rusqlite::ToSql],
+    ) -> Result<Vec<ReviewComment>> {
+        let sql = format!(
+            "SELECT rc.pr_number, pr.title, pr.merged, rc.path, rc.line, rc.body, rc.author
+             FROM review_comments rc JOIN pull_requests pr ON pr.number = rc.pr_number
+             WHERE {where_clause}"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(p, |r| {
+            Ok(ReviewComment {
+                pr_number: r.get(0)?,
+                pr_title: r.get(1)?,
+                pr_merged: r.get::<_, i64>(2)? == 1,
+                path: r.get(3)?,
+                line: r.get(4)?,
+                body: r.get(5)?,
+                author: r.get(6)?,
+            })
+        })?;
+        Ok(rows.filter_map(Result::ok).collect())
     }
 
     /// Replace the import targets recorded for a file. Targets are normalized
