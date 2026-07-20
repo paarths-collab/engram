@@ -124,6 +124,21 @@ pub struct ScoredPath {
     pub reason: String,
 }
 
+/// A raw human review comment ingested from a pull request. Stored and returned
+/// verbatim — Engram never summarizes review comments; the agent reads them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewComment {
+    pub pr_number: i64,
+    pub pr_title: String,
+    /// Whether the PR the comment was left on was eventually merged.
+    pub pr_merged: bool,
+    pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<i64>,
+    pub body: String,
+    pub author: String,
+}
+
 /// Output of get_verification_plan: the merged checklist for a set of changed
 /// files, plus repo-detected test commands and historically co-failing tests.
 #[derive(Debug, Clone, Serialize, Deserialize)]

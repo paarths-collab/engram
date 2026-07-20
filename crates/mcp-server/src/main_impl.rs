@@ -122,6 +122,17 @@ impl ToolHandler for Engram {
                     },
                     "required": ["changed_files"]
                 }
+            },
+            {
+                "name": "get_review_history",
+                "description": "Call this before changing a file to see what human reviewers said about it before. Returns RAW, unsummarized reviewer comments from past pull requests, with the PR number and whether that PR was merged (accepted). Pass a file 'path' to get comments on that file, and/or a 'task' to rank comments by relevance. Reading these avoids repeating mistakes reviewers already flagged.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Repo-relative file path to fetch review comments for" },
+                        "task": { "type": "string", "description": "Task/concept to rank comments by relevance" }
+                    }
+                }
             }
         ]})
     }
@@ -137,7 +148,17 @@ impl ToolHandler for Engram {
                     return Err("missing required argument: task".into());
                 }
                 let packets = engine.search(store, task, 8).map_err(|e| e.to_string())?;
-                Ok(json!({ "task": task, "evidence": packets }))
+                // past_reviews: raw reviewer comments on the files retrieval matched.
+                let mut past_reviews = Vec::new();
+                let mut seen = std::collections::HashSet::new();
+                for p in &packets {
+                    if seen.insert(p.path.clone()) {
+                        if let Ok(cs) = store.review_comments_for_path(&p.path) {
+                            past_reviews.extend(cs);
+                        }
+                    }
+                }
+                Ok(json!({ "task": task, "evidence": packets, "past_reviews": past_reviews }))
             }
             "find_existing_implementation" => {
                 self.ensure_engine()?;
@@ -217,6 +238,37 @@ impl ToolHandler for Engram {
                 };
                 Ok(serde_json::to_value(plan).map_err(|e| e.to_string())?)
             }
+            "get_review_history" => {
+                self.ensure_store()?;
+                let store = self.store.as_ref().unwrap();
+                let path = args.get("path").and_then(|v| v.as_str());
+                let task = args.get("task").and_then(|v| v.as_str());
+                if path.is_none() && task.is_none() {
+                    return Err("provide 'path' and/or 'task'".into());
+                }
+                let mut comments = match path {
+                    Some(p) => store
+                        .review_comments_for_path(p)
+                        .map_err(|e| e.to_string())?,
+                    None => store.all_review_comments().map_err(|e| e.to_string())?,
+                };
+                if let Some(t) = task {
+                    use engram_retrieval::embed::{cosine, Embedder, HashedNgramEmbedder};
+                    let emb = HashedNgramEmbedder::default();
+                    let qv = emb.embed(t);
+                    let mut scored: Vec<(f32, engram_domain::ReviewComment)> = comments
+                        .into_iter()
+                        .map(|c| (cosine(&qv, &emb.embed(&c.body)), c))
+                        .collect();
+                    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+                    comments = scored.into_iter().map(|(_, c)| c).collect();
+                }
+                comments.truncate(10);
+                Ok(json!({
+                    "review_history": comments,
+                    "note": "Raw reviewer comments, unsummarized. pr_merged=true means that PR was accepted."
+                }))
+            }
             other => Err(format!("unknown tool: {other}")),
         }
     }
@@ -230,7 +282,49 @@ pub fn run() {
             repo = PathBuf::from(p);
         }
     }
+    // Subcommand: `engram ingest-github [--limit N]` ingests PR history, then exits.
+    if args.iter().any(|a| a == "ingest-github") {
+        let limit = args
+            .iter()
+            .position(|a| a == "--limit")
+            .and_then(|i| args.get(i + 1))
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(50);
+        std::process::exit(match ingest_github(&repo, limit) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("[engram] ingest-github failed: {e}");
+                1
+            }
+        });
+    }
     eprintln!("[engram] starting MCP server for {}", repo.display());
     let mut engram = Engram::start(repo);
     serve(&mut engram);
+}
+
+/// Ingest pull-request history for the repo's `origin` remote into the store.
+fn ingest_github(repo: &std::path::Path, limit: usize) -> Result<(), String> {
+    use engram_connectors_github as gh;
+    let token =
+        gh::token_from_env().ok_or("no GitHub token (set ENGRAM_GITHUB_TOKEN or GITHUB_TOKEN)")?;
+    let remote = std::process::Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .current_dir(repo)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .ok_or("could not read git remote 'origin'")?;
+    let (owner, name) = gh::parse_repo_slug(&remote)
+        .ok_or_else(|| format!("cannot parse owner/repo from {remote}"))?;
+    eprintln!("[engram] ingesting up to {limit} PRs from {owner}/{name}");
+    let client = gh::GitHubClient::new(token, owner, name).map_err(|e| e.to_string())?;
+    let mut store = Store::open(repo).map_err(|e| format!("store: {e}"))?;
+    let stats = gh::ingest(&mut store, &client, limit).map_err(|e| e.to_string())?;
+    eprintln!(
+        "[engram] ingested: {} PRs, {} changed files, {} review comments",
+        stats.pull_requests, stats.files, stats.review_comments
+    );
+    Ok(())
 }

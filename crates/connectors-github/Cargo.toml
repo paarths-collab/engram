@@ -1,18 +1,15 @@
 [package]
-name = "engram-mcp-server"
+name = "engram-connectors-github"
 version = "0.1.0"
 edition = "2021"
-
-[[bin]]
-name = "engram"
-path = "src/main.rs"
 
 [dependencies]
 engram-domain = { path = "../domain" }
 engram-repo-map = { path = "../repo-map" }
-engram-retrieval = { path = "../retrieval" }
-engram-verify = { path = "../verify" }
-engram-connectors-github = { path = "../connectors-github" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
+reqwest = { workspace = true }
+
+[lib]
+path = "src/lib.rs"
