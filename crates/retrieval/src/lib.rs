@@ -8,7 +8,7 @@ use anyhow::Result;
 use embed::{cosine, Embedder, HashedNgramEmbedder};
 use engram_domain::{EvidenceKind, EvidencePacket, ImpactPrediction, ScoredPath, SymbolRecord};
 use engram_repo_map::store::Store;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
@@ -50,7 +50,11 @@ const INDEX_BODY_BYTES: usize = 60_000;
 
 impl Engine {
     /// Build the in-memory hybrid index from the current repo + store.
-    pub fn build(repo_root: &Path, store: &Store) -> Result<Engine> {
+    ///
+    /// Embeddings are cached in SQLite keyed by a content hash: unchanged files
+    /// reuse their stored vector instead of re-embedding, so large repos don't
+    /// pay the embedding cost on every server start.
+    pub fn build(repo_root: &Path, store: &mut Store) -> Result<Engine> {
         let mut schema_builder = Schema::builder();
         let f_path = schema_builder.add_text_field("path", TEXT | STORED);
         let f_body = schema_builder.add_text_field("body", TEXT);
@@ -62,6 +66,10 @@ impl Engine {
         let mut docs = Vec::new();
         let mut by_path = HashMap::new();
         let recency = store.recency_map()?;
+        let cached = store.load_vectors()?;
+        let mut fresh: Vec<(String, String, Vec<u8>)> = Vec::new();
+        let mut present: HashSet<String> = HashSet::new();
+        let (mut reused, mut embedded) = (0usize, 0usize);
 
         for f in store.all_files()? {
             let full = repo_root.join(&f.path);
@@ -71,7 +79,28 @@ impl Engine {
             let body: String = src.chars().take(INDEX_BODY_BYTES).collect();
             // Embed path + a head slice; heads carry imports/signatures = high signal.
             let embed_text = format!("{} {}", f.path, body.chars().take(4000).collect::<String>());
-            let vector = embedder.embed(&embed_text);
+            let hash = embed::content_hash(&embed_text);
+            let vector = match cached.get(&f.path) {
+                Some((h, bytes)) if *h == hash => match embed::bytes_to_vector(bytes) {
+                    Some(v) => {
+                        reused += 1;
+                        v
+                    }
+                    None => {
+                        embedded += 1;
+                        let v = embedder.embed(&embed_text);
+                        fresh.push((f.path.clone(), hash, embed::vector_to_bytes(&v)));
+                        v
+                    }
+                },
+                _ => {
+                    embedded += 1;
+                    let v = embedder.embed(&embed_text);
+                    fresh.push((f.path.clone(), hash, embed::vector_to_bytes(&v)));
+                    v
+                }
+            };
+            present.insert(f.path.clone());
             writer.add_document(doc!(f_path => f.path.clone(), f_body => body.clone()))?;
             by_path.insert(f.path.clone(), docs.len());
             docs.push(DocMeta {
@@ -83,6 +112,11 @@ impl Engine {
             });
         }
         writer.commit()?;
+        if !fresh.is_empty() {
+            store.upsert_vectors(&fresh)?;
+        }
+        store.prune_vectors(&present)?;
+        eprintln!("[engram] vectors: {reused} reused, {embedded} embedded");
         let reader = index.reader()?;
 
         Ok(Engine {
