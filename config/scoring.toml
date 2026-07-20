@@ -1,0 +1,27 @@
+# Engram retrieval scoring weights.
+#
+# Loaded at startup from <repo>/config/scoring.toml (falls back to ./config/scoring.toml,
+# then to built-in defaults). In dev the server re-reads this file when it changes on
+# disk, so you can tune weights without recompiling or restarting.
+#
+# Every key is optional; anything omitted uses the built-in default shown here.
+
+# --- Signal fusion weights -------------------------------------------------
+# How much each retrieval signal contributes to a document's fused score.
+bm25 = 1.0                     # Tantivy BM25 lexical relevance
+vector = 1.2                   # hashed-ngram cosine similarity
+symbol_exact = 1.5             # exact symbol-name match (function/struct/class/...)
+path_match = 0.6               # query token appears in the file path
+test_bonus_for_tests_query = 0.5  # add to test files when the query mentions tests
+
+# --- Low-signal document demotions -----------------------------------------
+# Multipliers (< 1.0 demotes). Changelogs mention every feature, so BM25 loves
+# them; these keep docs from crowding out real code.
+doc_file_penalty = 0.6         # .md / .txt / .rst / .adoc documentation files
+changelog_penalty = 0.35       # harsher: CHANGES / CHANGELOG / HISTORY / NEWS files
+
+# --- Recency ---------------------------------------------------------------
+# Files touched by recent commits rank higher. The boost is additive and decays
+# exponentially with the file's last-commit age.
+recency_boost = 0.4            # max additive boost (age 0)
+recency_halflife_days = 90.0   # boost halves every this many days

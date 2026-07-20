@@ -4,6 +4,7 @@
 use anyhow::Result;
 use engram_domain::{CoChange, FileRecord, Language, SymbolKind, SymbolRecord};
 use rusqlite::{params, Connection};
+use std::collections::HashMap;
 use std::path::Path;
 
 pub struct Store {
@@ -23,7 +24,8 @@ impl Store {
                 language TEXT NOT NULL,
                 size_bytes INTEGER NOT NULL,
                 is_test INTEGER NOT NULL,
-                tier1_done INTEGER NOT NULL DEFAULT 0
+                tier1_done INTEGER NOT NULL DEFAULT 0,
+                last_commit_ts INTEGER
             );
             CREATE TABLE IF NOT EXISTS symbols (
                 id INTEGER PRIMARY KEY,
@@ -44,7 +46,33 @@ impl Store {
             );
             "#,
         )?;
+        // Migration for DBs created before recency tracking: add the column if
+        // it is missing. Fails harmlessly ("duplicate column") on fresh DBs.
+        let _ = conn.execute("ALTER TABLE files ADD COLUMN last_commit_ts INTEGER", []);
         Ok(Store { conn })
+    }
+
+    /// Store the last-commit unix timestamp for files touched in git history.
+    /// Paths not present in the files table are silently skipped.
+    pub fn update_recency(&mut self, recency: &HashMap<String, i64>) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        for (path, ts) in recency {
+            tx.execute(
+                "UPDATE files SET last_commit_ts = ?2 WHERE path = ?1",
+                params![path, ts],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Map of path -> last-commit unix timestamp for files that have one.
+    pub fn recency_map(&self) -> Result<HashMap<String, i64>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path, last_commit_ts FROM files WHERE last_commit_ts IS NOT NULL")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+        Ok(rows.filter_map(Result::ok).collect())
     }
 
     pub fn upsert_files(&mut self, files: &[FileRecord]) -> Result<()> {

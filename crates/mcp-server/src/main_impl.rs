@@ -106,7 +106,7 @@ impl ToolHandler for Engram {
 
     fn call_tool(&mut self, name: &str, args: &Value) -> Result<Value, String> {
         self.ensure_engine()?;
-        let engine = self.engine.as_ref().unwrap();
+        let engine = self.engine.as_mut().unwrap();
         let store = self.store.as_mut().unwrap();
         match name {
             "get_task_context" => {
