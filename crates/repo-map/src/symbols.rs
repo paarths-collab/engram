@@ -90,3 +90,80 @@ pub fn extract_file(path: &str, source: &str, lang: Language) -> Vec<SymbolRecor
     }
     out
 }
+
+/// Extract raw import targets from one file (module paths / specifiers).
+/// Normalization into comparable keys is done by `crate::imports::normalize_target`.
+pub fn extract_imports(source: &str, lang: Language) -> Vec<String> {
+    let Some(mut parser) = parser_for(lang) else {
+        return Vec::new();
+    };
+    let Some(tree) = parser.parse(source, None) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if let Some(target) = import_target(source, &node, lang) {
+            if !target.is_empty() {
+                out.push(target);
+            }
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    out
+}
+
+/// Pull the module path/specifier out of an import-like node, as raw text.
+fn import_target(src: &str, node: &Node, lang: Language) -> Option<String> {
+    let text = &src[node.byte_range()];
+    match (lang, node.kind()) {
+        (Language::Rust, "use_declaration") => {
+            // "use a::b::c;" / "use a::b::{c, d};" -> keep the common prefix path
+            let s = text
+                .trim_start_matches("use")
+                .trim()
+                .trim_end_matches(';')
+                .trim();
+            let s = s.split('{').next().unwrap_or(s);
+            let s = s.trim().trim_end_matches("::").trim();
+            (!s.is_empty()).then(|| s.to_string())
+        }
+        (Language::Python, "import_from_statement") => {
+            // "from a.b import c"
+            let after = text.strip_prefix("from")?.trim_start();
+            after.split_whitespace().next().map(|m| m.to_string())
+        }
+        (Language::Python, "import_statement") => {
+            // "import a.b.c" / "import a.b as x"
+            let after = text.strip_prefix("import")?.trim_start();
+            after
+                .split([',', ' ', '\n'])
+                .next()
+                .map(|m| m.trim().to_string())
+        }
+        (Language::TypeScript | Language::JavaScript, "import_statement") => first_quoted(text),
+        (Language::TypeScript | Language::JavaScript, "call_expression") => text
+            .starts_with("require")
+            .then(|| first_quoted(text))
+            .flatten(),
+        _ => None,
+    }
+}
+
+/// Return the contents of the first quoted string in `s` (', ", or `).
+fn first_quoted(s: &str) -> Option<String> {
+    let mut chars = s.char_indices();
+    for (i, c) in chars.by_ref() {
+        if c == '"' || c == '\'' || c == '`' {
+            let start = i + c.len_utf8();
+            if let Some(end) = s[start..].find(c) {
+                return Some(s[start..start + end].to_string());
+            }
+            return None;
+        }
+    }
+    None
+}

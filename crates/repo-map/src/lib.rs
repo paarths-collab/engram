@@ -1,6 +1,7 @@
 //! engram-repo-map: Tier-0 inventory, Tier-1 symbols, co-change graph, SQLite store.
 
 pub mod cochange;
+pub mod imports;
 pub mod inventory;
 pub mod store;
 pub mod symbols;
@@ -36,6 +37,8 @@ pub fn index_repo(repo_root: &Path, eager_tier1_limit: usize) -> Result<IndexSta
         if let Ok(src) = std::fs::read_to_string(repo_root.join(&f.path)) {
             let syms = symbols::extract_file(&f.path, &src, f.language);
             store.replace_symbols_for_file(&f.path, &syms)?;
+            let imports = symbols::extract_imports(&src, f.language);
+            store.replace_imports_for_file(&f.path, &imports)?;
             extracted += 1;
         }
     }
@@ -59,6 +62,8 @@ pub fn ensure_tier1(store: &mut Store, repo_root: &Path, path: &str) -> Result<(
     if let Ok(src) = std::fs::read_to_string(repo_root.join(path)) {
         let syms = symbols::extract_file(path, &src, lang);
         store.replace_symbols_for_file(path, &syms)?;
+        let imports = symbols::extract_imports(&src, lang);
+        store.replace_imports_for_file(path, &imports)?;
     }
     Ok(())
 }

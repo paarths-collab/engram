@@ -322,6 +322,54 @@ impl Engine {
             .collect();
         cochange_expansions.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
         cochange_expansions.truncate(8);
+
+        // Import-graph expansion: files that statically import a direct hit.
+        let direct_paths: std::collections::HashSet<&str> =
+            direct.iter().map(|d| d.path.as_str()).collect();
+        let cochange_paths: std::collections::HashSet<&str> = cochange_expansions
+            .iter()
+            .map(|c| c.path.as_str())
+            .collect();
+        let mut importer_hits: HashMap<String, Vec<String>> = HashMap::new();
+        for p in &direct {
+            if p.kind == EvidenceKind::Test {
+                continue;
+            }
+            let Some(needle) = engram_repo_map::imports::module_needle(&p.path) else {
+                continue;
+            };
+            for importer in store.importers_of(&needle, &p.path, 10)? {
+                if direct_paths.contains(importer.as_str())
+                    || cochange_paths.contains(importer.as_str())
+                    || !self.by_path.contains_key(importer.as_str())
+                {
+                    continue;
+                }
+                importer_hits
+                    .entry(importer)
+                    .or_default()
+                    .push(p.path.clone());
+            }
+        }
+        let mut import_expansions: Vec<ScoredPath> = importer_hits
+            .into_iter()
+            .map(|(path, mut hits)| {
+                hits.sort();
+                hits.dedup();
+                let confidence = (0.4 + 0.2 * hits.len() as f32).min(1.0);
+                if engram_repo_map::inventory::is_test_path(&path) {
+                    likely_tests.push(path.clone());
+                }
+                ScoredPath {
+                    path,
+                    confidence,
+                    reason: format!("imports {}", hits.join(", ")),
+                }
+            })
+            .collect();
+        import_expansions.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
+        import_expansions.truncate(8);
+
         likely_tests.sort();
         likely_tests.dedup();
 
@@ -329,6 +377,7 @@ impl Engine {
             likely_files,
             likely_tests,
             cochange_expansions,
+            import_expansions,
         })
     }
 }
