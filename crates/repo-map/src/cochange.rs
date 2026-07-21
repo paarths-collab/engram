@@ -20,12 +20,20 @@ pub struct History {
     pub last_commit: HashMap<String, i64>,
 }
 
-/// Parse recent git history into per-commit `(unix_timestamp, changed_files)`.
-fn commit_records(repo_root: &Path) -> Vec<(i64, Vec<String>)> {
+/// Parse recent git history into per-commit `(unix_timestamp, changed_files)`,
+/// skipping the `skip` newest commits first (used to build a leakage-free
+/// history that cannot see a held-out evaluation window — see
+/// [`build_from`]).
+fn commit_records_from(
+    repo_root: &Path,
+    skip: usize,
+    max_commits: usize,
+) -> Vec<(i64, Vec<String>)> {
     let output = Command::new("git")
         .args([
             "log",
-            &format!("--max-count={MAX_COMMITS}"),
+            &format!("--skip={skip}"),
+            &format!("--max-count={max_commits}"),
             "--name-only",
             // %ct = committer date, unix timestamp — tacked onto the marker line.
             "--pretty=format:@@COMMIT@@%ct",
@@ -57,7 +65,14 @@ fn commit_records(repo_root: &Path) -> Vec<(i64, Vec<String>)> {
 
 /// Build the co-change edge list and per-file recency from git history.
 pub fn build(repo_root: &Path) -> History {
-    let records = commit_records(repo_root);
+    build_from(repo_root, 0, MAX_COMMITS)
+}
+
+/// Build history from commits `skip..skip+max_commits` back from HEAD (newest
+/// first). Used directly by benchmarks that need a leakage-free graph: skip
+/// the held-out evaluation window so the graph cannot see the future.
+pub fn build_from(repo_root: &Path, skip: usize, max_commits: usize) -> History {
+    let records = commit_records_from(repo_root, skip, max_commits);
     let mut file_commit_count: HashMap<String, u32> = HashMap::new();
     let mut pair_count: HashMap<(String, String), u32> = HashMap::new();
     let mut last_commit: HashMap<String, i64> = HashMap::new();

@@ -120,6 +120,21 @@ impl ToolHandler for Engram {
                 }
             },
             {
+                "name": "find_connected_files",
+                "description": "Call this when you already know which file(s) you are changing (e.g. the current diff) and want everything CONNECTED to them, with zero guessing. Unlike predict_impact (which starts from a fuzzy task description), this takes exact file paths as anchors and returns only files linked by hard, deterministic facts already recorded in the store: the co-change graph (files that historically changed together in the same commits) and the import graph (files that statically import an anchor, up to 2 hops). Every result traces to a concrete recorded edge — this is fact-finding, not prediction. Prefer this over predict_impact whenever you have concrete anchor files.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "files": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Repo-relative paths of files you are changing or about to change, e.g. ['src/billing/cancel.rs']"
+                        }
+                    },
+                    "required": ["files"]
+                }
+            },
+            {
                 "name": "get_verification_plan",
                 "description": "Call this AFTER making changes and BEFORE opening a PR. Given the list of changed files, returns the merged verification checklist for the engineering domains they touch (backend/frontend/database/infra), the repo's detected test commands, and tests that historically change together with these files. Run these checks before considering the change done.",
                 "inputSchema": {
@@ -203,6 +218,27 @@ impl ToolHandler for Engram {
                 }
                 let impact = engine
                     .predict_impact(store, task)
+                    .map_err(|e| e.to_string())?;
+                Ok(serde_json::to_value(impact).map_err(|e| e.to_string())?)
+            }
+            "find_connected_files" => {
+                self.ensure_engine()?;
+                let engine = self.engine.as_mut().unwrap();
+                let store = self.store.as_mut().unwrap();
+                let files: Vec<String> = args
+                    .get("files")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if files.is_empty() {
+                    return Err("missing required argument: files (array of paths)".into());
+                }
+                let impact = engine
+                    .impact_from_files(store, &files)
                     .map_err(|e| e.to_string())?;
                 Ok(serde_json::to_value(impact).map_err(|e| e.to_string())?)
             }

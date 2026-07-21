@@ -3,55 +3,121 @@
 Run with the `engram-evals` crate:
 
 ```bash
-cargo run --release -p engram-evals -- --repo <path> [--max-commits N]
+cargo run --release -p engram-evals -- --repo <path> \
+  [--max-commits N] [--eval-commits N] [--history-commits N]
 ```
 
-## Benchmark 1 — file prediction
+It runs two benchmarks that test two different capabilities. **Benchmark 2 is
+the primary evidence for the product** — it measures the deterministic engine
+(the co-change and import graphs) in isolation, with zero text prediction.
+Benchmark 1 measures the fuzzy text-retrieval front door, which is optional
+and only used when the agent has no concrete anchor file yet.
 
-Each git commit is treated as a `(message → changed files)` sample. The changed
-files are hidden; the commit subject is fed to each ranking strategy and we
-measure **Recall@k** (fraction of the actually-changed files found in the top k)
-and **MRR** (mean reciprocal rank of the first correct file). This tests the core
-thesis: does hybrid retrieval beat BM25-only?
+## Benchmark 2 — connection recovery (no text, no prediction)
+
+**The question:** given one file you already know you're changing, does
+Engram's deterministic graph — the co-change table (a fact recorded from git
+history) and the import graph (a fact derived from static analysis) — recover
+the *other* files that actually changed with it? There is no language model,
+no ranking heuristic, and no guessing involved: `find_connected_files` returns
+only files linked to the anchor by a concrete, already-recorded edge. This is
+fact-finding, not prediction — directly testing the concern that a
+prediction-based approach could be the weak link.
+
+**Leakage-free by construction:** for each evaluation, the co-change graph is
+built *only* from the `--history-commits` commits strictly older than the
+`--eval-commits` evaluation window. It is architecturally incapable of seeing
+the future commit it's being asked to recover.
+
+**Method:** for each of the newest `--eval-commits` commits (non-merge, 2–8
+still-indexed changed files), take the alphabetically-first changed file as
+the anchor and the rest as held-out targets. Call `find_connected_files` with
+only the anchor. Score whether the returned candidates recover the targets.
+
+### Result — langchain-ai/langchain
+
+2,639 files · 68 eligible commits · history from the 300 commits older than
+the 200-commit evaluation window (260 leakage-free co-change edges):
+
+| source | Recall@5 |
+|---|---|
+| co-change only | 0.341 |
+| import graph only | 0.226 |
+| **combined (Recall@10)** | **0.579** |
+
+**Hit rate (found ≥1 real connection): 67.6%** over 68 samples. On average
+each commit had 1.7 held-out target files, and the tool returned 6.2
+candidates.
+
+**Read:** given one anchor file, Engram recovers **58% of the files that
+actually changed alongside it**, from git-history and import-graph facts
+alone — no text, no LLM, no guessing. Co-change and import graph are
+complementary (roughly additive when combined), the same fusion principle as
+Benchmark 1, but here it's fusing *facts* rather than fuzzy signals. This is
+the number that matters most for the product: it's what `find_connected_files`
+does whenever the agent already knows which file it's touching (the common
+case — most tasks start from an existing file or diff, per the CLI's
+`engram impact --diff current`).
+
+### Reproducing
+
+```bash
+git clone --depth 500 https://github.com/langchain-ai/langchain.git /tmp/langchain
+cargo run --release -p engram-evals -- --repo /tmp/langchain \
+  --eval-commits 200 --history-commits 300
+```
+
+---
+
+## Benchmark 1 — file prediction (text query, optional front door)
+
+Each git commit is treated as a `(message → changed files)` sample. The
+changed files are hidden; the commit subject is fed to each ranking strategy
+and we measure **Recall@k** and **MRR**. This is the *text-driven* path — used
+only when the agent has no anchor file yet (e.g. a brand-new task) — and tests
+whether hybrid text retrieval beats BM25-only / vector-only for that narrower
+use case.
 
 Baselines: **bm25-only** (Tantivy lexical), **vector-only** (hashed-ngram
 cosine), **random** (deterministic floor).
 
-### Headline result — langchain-ai/langchain
+### Result — langchain-ai/langchain
 
-A real, large codebase: **2,639 files · 200 commit samples** (recent 400 commits,
-keeping non-merge commits that touch 1–8 still-existing files).
+2,639 files · 202 commit samples:
 
 | strategy | Recall@5 | Recall@10 | Recall@20 | MRR |
 |---|---|---|---|---|
-| **hybrid** | **0.313** | **0.402** | **0.440** | **0.317** |
+| **hybrid** | **0.314** | **0.402** | **0.443** | **0.323** |
 | bm25-only | 0.030 | 0.035 | 0.035 | 0.017 |
-| vector-only | 0.234 | 0.288 | 0.409 | 0.289 |
+| vector-only | 0.234 | 0.290 | 0.412 | 0.278 |
 | random | 0.000 | 0.000 | 0.001 | 0.000 |
 
-**Read:** hybrid beats **bm25-only by ~10×** and **vector-only by ~35%** at
-Recall@5, and everything crushes random. This clears the MVP acceptance
-criterion ("hybrid retrieval beats vector-only") decisively, at scale.
+**Read:** hybrid beats bm25-only by ~10× and vector-only by ~35% at Recall@5.
+Confirms fusion beats any single text signal — but this benchmark starts from
+a one-line commit subject standing in for a task description, and has known
+methodology caveats (see below), so treat it as directional, not a headline
+product number. Benchmark 2 is the more trustworthy evidence.
 
-Why BM25-only collapses here: LangChain's recent history is dominated by
-`chore: bump <dep> …` commits whose changed file is a lockfile/manifest that the
-title barely describes lexically. Hybrid's *path* and *vector* signals recover
-those files — a concrete illustration of why multi-signal fusion wins over any
-single signal.
+### Known caveats of Benchmark 1 (why it's secondary)
 
-Two honest notes on the absolute numbers (the *relative* comparison is the
-thesis, and it holds):
-
-- The vector backend is still the placeholder hashed-ngram embedder. Swapping in
-  real embeddings (fastembed-rs ONNX, behind the existing `Embedder` trait)
-  should lift vector and hybrid further.
-- Dependency-bump/chore commits are intrinsically hard (the message says little
-  about code), which caps the ceiling for every method.
+- **No temporal cutoff.** Unlike Benchmark 2, the index (embeddings, co-change
+  graph feeding the fusion score) is built at current HEAD, which includes the
+  commits being evaluated. This mildly flatters every method equally but isn't
+  a rigorous leakage-free split.
+- **Query proxy is weak.** A one-line commit subject is a poor stand-in for a
+  real task description (a paragraph). Real usage should score higher.
+- **Unstratified.** LangChain's history is dominated by `chore: bump <dep>`
+  commits whose changed file (a lockfile) the title never mentions — no
+  content-based method can predict those, and averaging them in drags every
+  method toward the floor.
+- The vector backend is still the placeholder hashed-ngram embedder; real
+  embeddings (fastembed-rs, behind the existing `Embedder` trait) should lift
+  vector and hybrid further.
 
 ### Secondary result — this repository
 
-`engram` itself · 30 files · 9 eligible commits (kept for reference; too small to
-be conclusive):
+`engram` itself · 30 files · 9 eligible commits (kept for reference; too small
+to be conclusive):
 
 | strategy | Recall@5 | Recall@10 | Recall@20 | MRR |
 |---|---|---|---|---|
@@ -59,12 +125,3 @@ be conclusive):
 | bm25-only | 0.590 | 0.729 | 0.845 | 0.833 |
 | vector-only | 0.462 | 0.625 | 0.888 | 0.731 |
 | random | 0.170 | 0.329 | 0.553 | 0.346 |
-
-### Reproducing
-
-The harness is repo-agnostic — point `--repo` at any git checkout:
-
-```bash
-git clone --depth 400 https://github.com/langchain-ai/langchain.git /tmp/langchain
-cargo run --release -p engram-evals -- --repo /tmp/langchain --max-commits 400
-```
