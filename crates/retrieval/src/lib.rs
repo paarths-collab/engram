@@ -377,9 +377,9 @@ impl Engine {
         let direct = self.search(store, query, 8)?;
         let mut likely_files = Vec::new();
         let mut likely_tests = Vec::new();
-        let mut expansions: HashMap<String, (f32, String)> = HashMap::new();
 
         let max_score = direct.iter().map(|p| p.score).fold(1e-6, f32::max);
+        let mut seeds = Vec::new();
         for p in &direct {
             if p.kind == EvidenceKind::Test {
                 likely_tests.push(p.path.clone());
@@ -389,11 +389,82 @@ impl Engine {
                     confidence: (p.score / max_score).min(1.0),
                     reason: format!("matched task via {}", p.signals.join("+")),
                 });
+                seeds.push(p.path.clone());
             }
-            for edge in store.cochange_for(&p.path, 5)? {
-                if self.by_path.contains_key(&edge.path_b)
-                    && !direct.iter().any(|d| d.path == edge.path_b)
-                {
+        }
+
+        let (cochange_expansions, import_expansions, mut expansion_tests) =
+            self.expand_from_seeds(store, &seeds)?;
+        likely_tests.append(&mut expansion_tests);
+        likely_tests.sort();
+        likely_tests.dedup();
+
+        Ok(ImpactPrediction {
+            likely_files,
+            likely_tests,
+            cochange_expansions,
+            import_expansions,
+        })
+    }
+
+    /// Deterministic impact analysis from known anchor files — no text search,
+    /// no ranking heuristics, no guessing. Given files the agent already knows
+    /// it is touching (e.g. the current diff, per `engram impact --diff current`),
+    /// return everything *connected* to them by hard facts already recorded in
+    /// the store: the co-change graph (git history) and the import graph
+    /// (static analysis). Every result traces to a concrete edge, so this is
+    /// pure fact-finding, not prediction.
+    pub fn impact_from_files(
+        &mut self,
+        store: &mut Store,
+        anchors: &[String],
+    ) -> Result<ImpactPrediction> {
+        let known: Vec<String> = anchors
+            .iter()
+            .filter(|p| self.by_path.contains_key(p.as_str()))
+            .cloned()
+            .collect();
+        let likely_files: Vec<ScoredPath> = known
+            .iter()
+            .map(|path| ScoredPath {
+                path: path.clone(),
+                confidence: 1.0,
+                reason: "given as an anchor file".to_string(),
+            })
+            .collect();
+        let mut likely_tests: Vec<String> = known
+            .iter()
+            .filter(|p| engram_repo_map::inventory::is_test_path(p))
+            .cloned()
+            .collect();
+
+        let (cochange_expansions, import_expansions, mut expansion_tests) =
+            self.expand_from_seeds(store, &known)?;
+        likely_tests.append(&mut expansion_tests);
+        likely_tests.sort();
+        likely_tests.dedup();
+
+        Ok(ImpactPrediction {
+            likely_files,
+            likely_tests,
+            cochange_expansions,
+            import_expansions,
+        })
+    }
+
+    /// Shared deterministic expansion: co-change graph (git history fact) +
+    /// import graph (static-analysis fact, up to 2 hops), excluding files
+    /// already in `seeds`/`likely`. Returns (cochange, imports, discovered_tests).
+    fn expand_from_seeds(
+        &self,
+        store: &mut Store,
+        seeds: &[String],
+    ) -> Result<(Vec<ScoredPath>, Vec<ScoredPath>, Vec<String>)> {
+        let mut likely_tests = Vec::new();
+        let mut expansions: HashMap<String, (f32, String)> = HashMap::new();
+        for seed in seeds {
+            for edge in store.cochange_for(seed, 5)? {
+                if self.by_path.contains_key(&edge.path_b) && !seeds.contains(&edge.path_b) {
                     let e = expansions
                         .entry(edge.path_b.clone())
                         .or_insert((0.0, String::new()));
@@ -401,8 +472,7 @@ impl Engine {
                         *e = (
                             edge.strength,
                             format!(
-                                "changes with {} in {}% of its commits",
-                                p.path,
+                                "changes with {seed} in {}% of its commits",
                                 (edge.strength * 100.0) as u32
                             ),
                         );
@@ -428,23 +498,16 @@ impl Engine {
         cochange_expansions.truncate(8);
 
         // Import-graph expansion via the in-memory code graph: files that
-        // (transitively, up to 2 hops) import a direct hit. SQL stores the edges;
+        // (transitively, up to 2 hops) import a seed. SQL stores the edges;
         // we traverse them in memory (see docs/adr/0001).
-        let direct_paths: std::collections::HashSet<&str> =
-            direct.iter().map(|d| d.path.as_str()).collect();
-        let cochange_paths: std::collections::HashSet<&str> = cochange_expansions
+        let seed_paths: HashSet<&str> = seeds.iter().map(|s| s.as_str()).collect();
+        let cochange_paths: HashSet<&str> = cochange_expansions
             .iter()
             .map(|c| c.path.as_str())
             .collect();
-        let seeds: Vec<String> = direct
-            .iter()
-            .filter(|p| p.kind != EvidenceKind::Test)
-            .map(|p| p.path.clone())
-            .collect();
         let mut import_expansions: Vec<ScoredPath> = Vec::new();
-        for hit in self.graph.dependents(&seeds, &[EdgeKind::Imports], 2) {
-            if direct_paths.contains(hit.path.as_str())
-                || cochange_paths.contains(hit.path.as_str())
+        for hit in self.graph.dependents(seeds, &[EdgeKind::Imports], 2) {
+            if seed_paths.contains(hit.path.as_str()) || cochange_paths.contains(hit.path.as_str())
             {
                 continue;
             }
@@ -465,15 +528,7 @@ impl Engine {
         import_expansions.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
         import_expansions.truncate(8);
 
-        likely_tests.sort();
-        likely_tests.dedup();
-
-        Ok(ImpactPrediction {
-            likely_files,
-            likely_tests,
-            cochange_expansions,
-            import_expansions,
-        })
+        Ok((cochange_expansions, import_expansions, likely_tests))
     }
 }
 
