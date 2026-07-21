@@ -107,14 +107,23 @@ pub enum EvidenceKind {
     RelatedFile,
 }
 
-/// Output of predict_impact.
+/// Deterministic relationships discovered from explicit repository anchors.
+///
+/// Engram does not guess which files a natural-language task will change. The
+/// caller supplies paths already present in its selection or diff, then Engram
+/// expands only relationships backed by source code or git history.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ImpactPrediction {
-    pub likely_files: Vec<ScoredPath>,
-    pub likely_tests: Vec<String>,
-    pub cochange_expansions: Vec<ScoredPath>,
-    /// Files that statically import one of the direct hits (import-graph expansion).
-    pub import_expansions: Vec<ScoredPath>,
+pub struct ConnectionMap {
+    /// Files explicitly supplied by the caller. They are never inferred.
+    pub anchors: Vec<String>,
+    /// Files that directly or transitively import an anchor, as proved by the
+    /// import graph.
+    pub import_dependents: Vec<ScoredPath>,
+    /// Files historically changed with an anchor, including the observed
+    /// co-change strength. This is historical evidence, not a prediction.
+    pub historical_connections: Vec<ScoredPath>,
+    /// Test files reached through either evidence source.
+    pub related_tests: Vec<ScoredPath>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

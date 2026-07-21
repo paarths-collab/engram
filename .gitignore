@@ -7,3 +7,4 @@
 # Editor / OS cruft
 **/*.rs.bk
 .DS_Store
+.gstack/

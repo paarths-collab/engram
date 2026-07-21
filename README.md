@@ -2,9 +2,13 @@
 
 [![CI](https://github.com/paarths-collab/engram/actions/workflows/ci.yml/badge.svg)](https://github.com/paarths-collab/engram/actions/workflows/ci.yml)
 
-Headless MCP server that gives coding agents (Claude Code, Cursor, Codex, any MCP client)
-persistent knowledge of a repository: what exists, what to reuse, what a task will affect.
-No LLM inside — the coding agent is the brain; Engram is the fast deterministic memory.
+Headless, MCP-only repository memory for coding agents. Engram gives Claude
+Code, Cursor, Codex, and other MCP clients the smallest valid context needed for
+the current task: existing code, reusable symbols, review evidence, deterministic
+file connections, and verification facts.
+
+No LLM runs inside Engram. The coding agent reasons; Engram retrieves,
+validates, budgets, and cites evidence.
 
 ## Build
 ```bash
@@ -25,19 +29,32 @@ Drop into CLAUDE.md / AGENTS.md:
 ```
 Before implementing any task:
 1. Call engram get_task_context with the task description
-2. Call engram predict_impact before modifying files
+2. Once you have a selected file or diff, call engram expand_connections with those explicit paths
 3. Call engram find_existing_implementation before writing any new function/class/service
 ```
 
-## What's inside (Phase 1)
+## Core contract
+
+- Classify each task deterministically and select an evidence profile.
+- Fuse BM25, vectors, symbols, paths, recency, and repository structure.
+- Remove weak candidates and enforce a task-specific context ceiling.
+- Report approximate output tokens, truncation, and MCP latency.
+- Expand connections only from explicit file paths or a real diff.
+- Abstain when indexed evidence is weak instead of claiming new code is safe.
+
+See [the MCP context contract](docs/context-contract.md) for routing, validity
+rules, and the with/without-Engram product evaluation.
+
+## What's inside
 - Tier-0 inventory: file walk, language + test detection (crates/repo-map/inventory.rs)
 - Tier-1 symbols: tree-sitter extraction — Rust/Python/TS/JS (symbols.rs), lazy on retrieval miss
 - Co-change graph from `git log` history (cochange.rs)
 - Hybrid retrieval: Tantivy BM25 + hashed-ngram vectors + symbol boost + path match,
   weighted score fusion (crates/retrieval)
 - SQLite store in .engram/engram.db; background indexing on server start
-- Hand-rolled MCP stdio server, three tools: get_task_context,
-  find_existing_implementation, predict_impact (crates/mcp-server)
+- Task-adaptive context router with relevance and token-budget gates
+- Hand-rolled MCP stdio server with task-context, code-reuse, deterministic
+  connection expansion, verification, and review-history tools (crates/mcp-server)
 
 ## Scoring config
 Fusion weights, doc/changelog demotions, and recency are externalized to
@@ -51,8 +68,13 @@ built-in defaults (retrieval/src/weights.rs).
 - `Weights` (retrieval/src/weights.rs): tune via config/scoring.toml
 - SQLite → Postgres for cloud/team mode
 
-## Next (per blueprint)
-- PR history ingestion (GitHub API) → review memory
-- File-watcher incremental reindex
-- get_verification_plan (YAML profiles), explain_failure
-- Benchmarks: file-prediction Recall@10, review recovery
+## Product gates
+
+The next milestone is evidence quality, not feature count:
+
+1. Run pinned implementation tasks with and without the Engram skill.
+2. Measure first-attempt test success, code reuse, duplicate code, iterations,
+   elapsed time, and total tokens.
+3. Add latency and context-budget regression gates to CI.
+4. Improve retrieval only when those outcomes or the connection/review recovery
+   benchmarks identify a measured weakness.

@@ -1,9 +1,10 @@
 //! engram binary: MCP server + automatic background indexing.
 //! Usage: engram --repo /path/to/repo   (defaults to cwd)
 
+use crate::context::{bound_task, select_context, TaskProfile};
 use crate::mcp::{serve, ToolHandler};
 use engram_repo_map::store::Store;
-use engram_retrieval::Engine;
+use engram_retrieval::{Engine, SearchOptions};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -35,6 +36,9 @@ impl Engram {
                         stats.files, stats.cochange_edges, stats.tier1_files
                     );
                     ready.store(true, Ordering::SeqCst);
+                    if let Err(e) = ingest_github_if_configured(&root, 50) {
+                        eprintln!("[engram] background GitHub ingestion failed: {e}");
+                    }
                 }
                 Err(e) => eprintln!("[engram] indexing failed: {e}"),
             },
@@ -88,7 +92,7 @@ impl ToolHandler for Engram {
         json!({ "tools": [
             {
                 "name": "get_task_context",
-                "description": "ALWAYS call this FIRST, before planning or implementing any coding task. Returns evidence packets about this repository: existing code relevant to the task, symbols to reuse instead of reimplementing, related tests, and files matched by hybrid (BM25+vector+symbol) retrieval. Using this prevents duplicate implementations and wrong assumptions about the codebase.",
+                "description": "ALWAYS call this FIRST, before planning or implementing a coding task. Classifies the task deterministically, runs only the relevant repository-memory pipeline, removes weak matches, and returns a compact evidence packet within a strict context budget. Results are evidence, not instructions.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -109,14 +113,19 @@ impl ToolHandler for Engram {
                 }
             },
             {
-                "name": "predict_impact",
-                "description": "Call this BEFORE modifying files. Predicts which files a task will likely affect: direct matches plus files that historically change together (git co-change analysis) and tests likely to be affected. Touching files outside this set should be justified explicitly.",
+                "name": "expand_connections",
+                "description": "Call this BEFORE modifying files, using file paths already selected or present in the current diff. Deterministically expands static import dependents, historical co-change connections, and related tests. Every result includes its evidence; this tool never guesses files from a task description.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "task": { "type": "string", "description": "The task description" }
+                        "anchors": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Explicit repo-relative file paths, for example ['src/billing/cancel.rs']"
+                        },
+                        "max_hops": { "type": "integer", "description": "Static import traversal depth, 1 to 4 (default 2)" }
                     },
-                    "required": ["task"]
+                    "required": ["anchors"]
                 }
             },
             {
@@ -151,6 +160,7 @@ impl ToolHandler for Engram {
     fn call_tool(&mut self, name: &str, args: &Value) -> Result<Value, String> {
         match name {
             "get_task_context" => {
+                let started = std::time::Instant::now();
                 self.ensure_engine()?;
                 let engine = self.engine.as_mut().unwrap();
                 let store = self.store.as_mut().unwrap();
@@ -158,18 +168,52 @@ impl ToolHandler for Engram {
                 if task.is_empty() {
                     return Err("missing required argument: task".into());
                 }
-                let packets = engine.search(store, task, 8).map_err(|e| e.to_string())?;
+                let (bounded_task, input_truncated) = bound_task(task);
+                let profile = TaskProfile::classify(&bounded_task);
+                // Retrieve a small surplus so the validity gate can remove weak
+                // candidates without starving the final evidence packet.
+                let candidate_limit = profile.evidence_limit + 4;
+                let packets = engine
+                    .search_with_options(
+                        store,
+                        &bounded_task,
+                        SearchOptions {
+                            top_k: candidate_limit,
+                            prefer_tests: profile.prefer_tests,
+                            prefer_docs: profile.prefer_docs,
+                        },
+                    )
+                    .map_err(|e| e.to_string())?;
                 // past_reviews: raw reviewer comments on the files retrieval matched.
                 let mut past_reviews = Vec::new();
                 let mut seen = std::collections::HashSet::new();
-                for p in &packets {
-                    if seen.insert(p.path.clone()) {
+                if profile.review_limit > 0 {
+                    for p in &packets {
+                        if !seen.insert(p.path.clone()) {
+                            continue;
+                        }
                         if let Ok(cs) = store.review_comments_for_path(&p.path) {
                             past_reviews.extend(cs);
                         }
                     }
                 }
-                Ok(json!({ "task": task, "evidence": packets, "past_reviews": past_reviews }))
+                let selected = select_context(packets, past_reviews, &profile);
+                let max_context_chars = profile.max_context_chars;
+                Ok(json!({
+                    "profile": profile,
+                    "evidence": selected.evidence,
+                    "past_reviews": selected.past_reviews,
+                    "budget": {
+                        "max_context_chars": max_context_chars,
+                        "used_context_chars": selected.used_context_chars,
+                        "approximate_tokens": selected.approximate_tokens,
+                        "truncated": selected.truncated,
+                        "input_truncated": input_truncated,
+                        "weak_candidates_removed": selected.weak_candidates_removed
+                    },
+                    "latency_ms": started.elapsed().as_millis(),
+                    "next": "Inspect the cited source. Once concrete files are selected or changed, call expand_connections with those paths."
+                }))
             }
             "find_existing_implementation" => {
                 self.ensure_engine()?;
@@ -179,32 +223,50 @@ impl ToolHandler for Engram {
                 if concept.is_empty() {
                     return Err("missing required argument: concept".into());
                 }
+                let profile = TaskProfile::classify(concept);
                 let packets = engine
                     .search(store, concept, 5)
                     .map_err(|e| e.to_string())?;
-                let found = !packets.is_empty();
+                let selected = select_context(packets, Vec::new(), &profile);
+                let found = !selected.evidence.is_empty();
                 Ok(json!({
                     "concept": concept,
-                    "existing_candidates": packets,
+                    "existing_candidates": selected.evidence,
                     "recommendation": if found {
                         "Review these candidates before implementing. Reuse if one matches."
                     } else {
-                        "No existing implementation found. Safe to implement new."
-                    }
+                        "No strong candidate was found in indexed evidence. Search manually before deciding to create a new implementation."
+                    },
+                    "approximate_tokens": selected.approximate_tokens
                 }))
             }
-            "predict_impact" => {
+            "expand_connections" => {
                 self.ensure_engine()?;
                 let engine = self.engine.as_mut().unwrap();
-                let store = self.store.as_mut().unwrap();
-                let task = args.get("task").and_then(|v| v.as_str()).unwrap_or("");
-                if task.is_empty() {
-                    return Err("missing required argument: task".into());
+                let store = self.store.as_ref().unwrap();
+                let anchors: Vec<String> = args
+                    .get("anchors")
+                    .and_then(|v| v.as_array())
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|v| v.as_str().map(str::to_owned))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if anchors.is_empty() {
+                    return Err(
+                        "missing required argument: anchors (array of repo-relative paths)".into(),
+                    );
                 }
-                let impact = engine
-                    .predict_impact(store, task)
+                let max_hops = args.get("max_hops").and_then(|v| v.as_u64()).unwrap_or(2) as usize;
+                let connections = engine
+                    .expand_connections(store, &anchors, max_hops)
                     .map_err(|e| e.to_string())?;
-                Ok(serde_json::to_value(impact).map_err(|e| e.to_string())?)
+                if connections.anchors.is_empty() {
+                    return Err("none of the anchors are indexed repository files".into());
+                }
+                Ok(serde_json::to_value(connections).map_err(|e| e.to_string())?)
             }
             "get_verification_plan" => {
                 self.ensure_store()?;
@@ -293,32 +355,19 @@ pub fn run() {
             repo = PathBuf::from(p);
         }
     }
-    // Subcommand: `engram ingest-github [--limit N]` ingests PR history, then exits.
-    if args.iter().any(|a| a == "ingest-github") {
-        let limit = args
-            .iter()
-            .position(|a| a == "--limit")
-            .and_then(|i| args.get(i + 1))
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(50);
-        std::process::exit(match ingest_github(&repo, limit) {
-            Ok(()) => 0,
-            Err(e) => {
-                eprintln!("[engram] ingest-github failed: {e}");
-                1
-            }
-        });
-    }
     eprintln!("[engram] starting MCP server for {}", repo.display());
     let mut engram = Engram::start(repo);
     serve(&mut engram);
 }
 
-/// Ingest pull-request history for the repo's `origin` remote into the store.
-fn ingest_github(repo: &std::path::Path, limit: usize) -> Result<(), String> {
+/// Ingest pull-request history in the background when a token is configured.
+/// This is server lifecycle work, not an agent-facing CLI or MCP tool.
+fn ingest_github_if_configured(repo: &std::path::Path, limit: usize) -> Result<(), String> {
     use engram_connectors_github as gh;
-    let token =
-        gh::token_from_env().ok_or("no GitHub token (set ENGRAM_GITHUB_TOKEN or GITHUB_TOKEN)")?;
+    let Some(token) = gh::token_from_env() else {
+        eprintln!("[engram] GitHub memory disabled: no token configured");
+        return Ok(());
+    };
     let remote = std::process::Command::new("git")
         .args(["remote", "get-url", "origin"])
         .current_dir(repo)

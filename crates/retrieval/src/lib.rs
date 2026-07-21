@@ -7,7 +7,7 @@ pub mod weights;
 
 use anyhow::Result;
 use embed::{cosine, Embedder, HashedNgramEmbedder};
-use engram_domain::{EvidenceKind, EvidencePacket, ImpactPrediction, ScoredPath, SymbolRecord};
+use engram_domain::{ConnectionMap, EvidenceKind, EvidencePacket, ScoredPath, SymbolRecord};
 use engram_repo_map::graph::{CodeGraph, EdgeKind};
 use engram_repo_map::store::Store;
 use std::collections::{HashMap, HashSet};
@@ -32,6 +32,23 @@ pub enum RankMode {
     Vector,
     /// Deterministic pseudo-random order (a floor baseline).
     Random,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SearchOptions {
+    pub top_k: usize,
+    pub prefer_tests: bool,
+    pub prefer_docs: bool,
+}
+
+impl SearchOptions {
+    pub fn standard(top_k: usize) -> Self {
+        Self {
+            top_k,
+            prefer_tests: false,
+            prefer_docs: false,
+        }
+    }
 }
 
 struct DocMeta {
@@ -244,6 +261,15 @@ impl Engine {
         query: &str,
         top_k: usize,
     ) -> Result<Vec<EvidencePacket>> {
+        self.search_with_options(store, query, SearchOptions::standard(top_k))
+    }
+
+    pub fn search_with_options(
+        &mut self,
+        store: &mut Store,
+        query: &str,
+        options: SearchOptions,
+    ) -> Result<Vec<EvidencePacket>> {
         // Dev hot-reload: pick up config/scoring.toml edits without a restart.
         self.config.reload_if_changed();
         let bm25 = self.bm25_candidates(query, 50);
@@ -258,7 +284,7 @@ impl Engine {
         let bm25_n = norm(&bm25);
         let vec_n = norm(&vecs);
 
-        let query_wants_tests = query.to_lowercase().contains("test");
+        let query_wants_tests = options.prefer_tests || query.to_lowercase().contains("test");
 
         let mut fused: HashMap<usize, (f32, Vec<String>)> = HashMap::new();
         for (i, s) in &bm25_n {
@@ -302,12 +328,22 @@ impl Engine {
             // Demote low-signal docs; changelogs mention every feature so hit hardest.
             match classify_path(&d.path) {
                 DocClass::Changelog => {
-                    *score *= w.changelog_penalty;
-                    signals.push("changelog_demoted".into());
+                    if options.prefer_docs {
+                        *score *= 0.8;
+                        signals.push("documentation_task".into());
+                    } else {
+                        *score *= w.changelog_penalty;
+                        signals.push("changelog_demoted".into());
+                    }
                 }
                 DocClass::Doc => {
-                    *score *= w.doc_file_penalty;
-                    signals.push("doc_demoted".into());
+                    if options.prefer_docs {
+                        *score += w.path_match * 0.5;
+                        signals.push("documentation_task".into());
+                    } else {
+                        *score *= w.doc_file_penalty;
+                        signals.push("doc_demoted".into());
+                    }
                 }
                 DocClass::Code => {}
             }
@@ -316,7 +352,7 @@ impl Engine {
         let mut ranked: Vec<(usize, f32, Vec<String>)> =
             fused.into_iter().map(|(i, (s, sig))| (i, s, sig)).collect();
         ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-        ranked.truncate(top_k);
+        ranked.truncate(options.top_k);
 
         // lazy Tier-1: ensure symbols exist for top hits, then attach best symbols
         let mut packets = Vec::new();
@@ -368,41 +404,38 @@ impl Engine {
                 });
             }
         }
-        packets.truncate(top_k + 3);
+        packets.truncate(options.top_k + 3);
         Ok(packets)
     }
 
-    /// predict_impact: hybrid hits = direct; co-change graph = historical expansion.
-    pub fn predict_impact(&mut self, store: &mut Store, query: &str) -> Result<ImpactPrediction> {
-        let direct = self.search(store, query, 8)?;
-        let mut likely_files = Vec::new();
-        let mut likely_tests = Vec::new();
-        let mut expansions: HashMap<String, (f32, String)> = HashMap::new();
+    /// Expand explicit file anchors using only source and history evidence.
+    pub fn expand_connections(
+        &self,
+        store: &Store,
+        anchors: &[String],
+        max_hops: usize,
+    ) -> Result<ConnectionMap> {
+        let anchors: Vec<String> = anchors
+            .iter()
+            .filter(|path| self.by_path.contains_key(path.as_str()))
+            .cloned()
+            .collect();
+        let anchor_set: HashSet<&str> = anchors.iter().map(String::as_str).collect();
+        let mut historical: HashMap<String, (f32, String)> = HashMap::new();
 
-        let max_score = direct.iter().map(|p| p.score).fold(1e-6, f32::max);
-        for p in &direct {
-            if p.kind == EvidenceKind::Test {
-                likely_tests.push(p.path.clone());
-            } else {
-                likely_files.push(ScoredPath {
-                    path: p.path.clone(),
-                    confidence: (p.score / max_score).min(1.0),
-                    reason: format!("matched task via {}", p.signals.join("+")),
-                });
-            }
-            for edge in store.cochange_for(&p.path, 5)? {
+        for anchor in &anchors {
+            for edge in store.cochange_for(anchor, 10)? {
                 if self.by_path.contains_key(&edge.path_b)
-                    && !direct.iter().any(|d| d.path == edge.path_b)
+                    && !anchor_set.contains(edge.path_b.as_str())
                 {
-                    let e = expansions
+                    let entry = historical
                         .entry(edge.path_b.clone())
                         .or_insert((0.0, String::new()));
-                    if edge.strength > e.0 {
-                        *e = (
+                    if edge.strength > entry.0 {
+                        *entry = (
                             edge.strength,
                             format!(
-                                "changes with {} in {}% of its commits",
-                                p.path,
+                                "historically changed with {anchor} in {}% of commits touching that anchor",
                                 (edge.strength * 100.0) as u32
                             ),
                         );
@@ -411,68 +444,68 @@ impl Engine {
             }
         }
 
-        let mut cochange_expansions: Vec<ScoredPath> = expansions
+        let mut historical_connections: Vec<ScoredPath> = historical
             .into_iter()
-            .map(|(path, (conf, reason))| {
-                if engram_repo_map::inventory::is_test_path(&path) {
-                    likely_tests.push(path.clone());
-                }
-                ScoredPath {
-                    path,
-                    confidence: conf,
-                    reason,
-                }
+            .map(|(path, (confidence, reason))| ScoredPath {
+                path,
+                confidence,
+                reason,
             })
             .collect();
-        cochange_expansions.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
-        cochange_expansions.truncate(8);
+        historical_connections.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
+        historical_connections.truncate(10);
 
-        // Import-graph expansion via the in-memory code graph: files that
-        // (transitively, up to 2 hops) import a direct hit. SQL stores the edges;
-        // we traverse them in memory (see docs/adr/0001).
-        let direct_paths: std::collections::HashSet<&str> =
-            direct.iter().map(|d| d.path.as_str()).collect();
-        let cochange_paths: std::collections::HashSet<&str> = cochange_expansions
-            .iter()
-            .map(|c| c.path.as_str())
-            .collect();
-        let seeds: Vec<String> = direct
-            .iter()
-            .filter(|p| p.kind != EvidenceKind::Test)
-            .map(|p| p.path.clone())
-            .collect();
-        let mut import_expansions: Vec<ScoredPath> = Vec::new();
-        for hit in self.graph.dependents(&seeds, &[EdgeKind::Imports], 2) {
-            if direct_paths.contains(hit.path.as_str())
-                || cochange_paths.contains(hit.path.as_str())
-            {
-                continue;
+        let mut import_dependents = Vec::new();
+        for hit in self
+            .graph
+            .dependents(&anchors, &[EdgeKind::Imports], max_hops.clamp(1, 4))
+        {
+            if !engram_repo_map::inventory::is_test_path(&hit.path) {
+                import_dependents.push(ScoredPath {
+                    path: hit.path,
+                    confidence: if hit.hops == 1 { 1.0 } else { 0.7 },
+                    reason: format!(
+                        "static import dependent ({} hop{})",
+                        hit.hops,
+                        if hit.hops == 1 { "" } else { "s" }
+                    ),
+                });
             }
-            if engram_repo_map::inventory::is_test_path(&hit.path) {
-                likely_tests.push(hit.path.clone());
-            }
-            let confidence = if hit.hops <= 1 { 0.6 } else { 0.35 };
-            import_expansions.push(ScoredPath {
+        }
+        import_dependents.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
+        import_dependents.truncate(10);
+
+        let mut related_tests: Vec<ScoredPath> = self
+            .graph
+            .dependents(&anchors, &[EdgeKind::Imports], max_hops.clamp(1, 4))
+            .into_iter()
+            .filter(|hit| engram_repo_map::inventory::is_test_path(&hit.path))
+            .map(|hit| ScoredPath {
                 path: hit.path,
-                confidence,
+                confidence: if hit.hops == 1 { 1.0 } else { 0.7 },
                 reason: format!(
-                    "imports a likely-changed file ({} hop{})",
+                    "static test dependent ({} hop{})",
                     hit.hops,
                     if hit.hops == 1 { "" } else { "s" }
                 ),
-            });
-        }
-        import_expansions.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
-        import_expansions.truncate(8);
+            })
+            .collect();
+        related_tests.extend(
+            historical_connections
+                .iter()
+                .filter(|connection| engram_repo_map::inventory::is_test_path(&connection.path))
+                .cloned(),
+        );
+        related_tests.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
+        let mut seen_tests = HashSet::new();
+        related_tests.retain(|test| seen_tests.insert(test.path.clone()));
+        related_tests.truncate(10);
 
-        likely_tests.sort();
-        likely_tests.dedup();
-
-        Ok(ImpactPrediction {
-            likely_files,
-            likely_tests,
-            cochange_expansions,
-            import_expansions,
+        Ok(ConnectionMap {
+            anchors,
+            import_dependents,
+            historical_connections,
+            related_tests,
         })
     }
 }

@@ -45,7 +45,9 @@ pub fn serve(handler: &mut dyn ToolHandler) {
                     Ok(result) => Some(json!({
                         "content": [{
                             "type": "text",
-                            "text": serde_json::to_string_pretty(&result).unwrap_or_default()
+                            // Tool payloads are compact JSON because pretty-print
+                            // whitespace consumes the agent's context budget.
+                            "text": serde_json::to_string(&result).unwrap_or_default()
                         }],
                         "isError": false
                     })),

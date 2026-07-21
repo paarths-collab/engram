@@ -1,3 +1,4 @@
+mod context;
 mod main_impl;
 mod mcp;
 mod watcher;
