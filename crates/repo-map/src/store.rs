@@ -34,6 +34,7 @@ impl Store {
                 kind TEXT NOT NULL,
                 path TEXT NOT NULL,
                 start_line INTEGER NOT NULL,
+                end_line INTEGER NOT NULL DEFAULT 0,
                 signature TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
@@ -83,6 +84,20 @@ impl Store {
         // Migration for DBs created before recency tracking: add the column if
         // it is missing. Fails harmlessly ("duplicate column") on fresh DBs.
         let _ = conn.execute("ALTER TABLE files ADD COLUMN last_commit_ts INTEGER", []);
+        // Symbols predating span tracking have no end_line, and a stored zero
+        // is indistinguishable from a real span. The ALTER succeeds exactly
+        // once — on a DB that predates the column — so use that as the signal
+        // to drop the spanless rows and let every file re-extract.
+        if conn
+            .execute(
+                "ALTER TABLE symbols ADD COLUMN end_line INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .is_ok()
+        {
+            let _ = conn.execute("DELETE FROM symbols", []);
+            let _ = conn.execute("UPDATE files SET tier1_done = 0", []);
+        }
         Ok(Store { conn })
     }
 
@@ -378,13 +393,14 @@ impl Store {
         tx.execute("DELETE FROM symbols WHERE path = ?1", params![path])?;
         for s in symbols {
             tx.execute(
-                "INSERT INTO symbols (name, kind, path, start_line, signature)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO symbols (name, kind, path, start_line, end_line, signature)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     s.name,
                     format!("{:?}", s.kind).to_lowercase(),
                     s.path,
                     s.start_line as i64,
+                    s.end_line as i64,
                     s.signature
                 ],
             )?;
@@ -439,19 +455,22 @@ impl Store {
 
     pub fn symbols_matching(&self, needle: &str, limit: usize) -> Result<Vec<SymbolRecord>> {
         let mut stmt = self.conn.prepare(
-            "SELECT name, kind, path, start_line, signature FROM symbols
+            "SELECT name, kind, path, start_line, end_line, signature FROM symbols
              WHERE name LIKE ?1 COLLATE NOCASE LIMIT ?2",
         )?;
         let pattern = format!("%{}%", needle);
-        let rows = stmt.query_map(params![pattern, limit as i64], |r| {
-            Ok(SymbolRecord {
-                name: r.get(0)?,
-                kind: kind_from_str(&r.get::<_, String>(1)?),
-                path: r.get(2)?,
-                start_line: r.get::<_, i64>(3)? as usize,
-                signature: r.get(4)?,
-            })
-        })?;
+        let rows = stmt.query_map(params![pattern, limit as i64], row_to_symbol)?;
+        Ok(rows.filter_map(Result::ok).collect())
+    }
+
+    /// Every extracted symbol for a file, in source order. Retrieval uses the
+    /// spans to embed and quote definitions rather than the head of the file.
+    pub fn symbols_for_path(&self, path: &str) -> Result<Vec<SymbolRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT name, kind, path, start_line, end_line, signature FROM symbols
+             WHERE path = ?1 ORDER BY start_line",
+        )?;
+        let rows = stmt.query_map(params![path], row_to_symbol)?;
         Ok(rows.filter_map(Result::ok).collect())
     }
 
@@ -481,6 +500,19 @@ fn lang_from_str(s: &str) -> Language {
         "go" => Language::Go,
         _ => Language::Other,
     }
+}
+
+/// Shared row mapper for the symbol `SELECT`s above; both must project the
+/// same columns in the same order.
+fn row_to_symbol(r: &rusqlite::Row) -> rusqlite::Result<SymbolRecord> {
+    Ok(SymbolRecord {
+        name: r.get(0)?,
+        kind: kind_from_str(&r.get::<_, String>(1)?),
+        path: r.get(2)?,
+        start_line: r.get::<_, i64>(3)? as usize,
+        end_line: r.get::<_, i64>(4)? as usize,
+        signature: r.get(5)?,
+    })
 }
 
 fn kind_from_str(s: &str) -> SymbolKind {
@@ -549,6 +581,7 @@ mod tests {
             kind: SymbolKind::Function,
             path: path.to_owned(),
             start_line: 1,
+            end_line: 4,
             signature: format!("fn {name}()"),
         }
     }
@@ -585,6 +618,41 @@ mod tests {
         assert!(store.symbols_matching("ghost", 5).unwrap().is_empty());
         assert_eq!(store.symbols_matching("keeper", 5).unwrap().len(), 1);
         assert!(store.all_imports().unwrap().is_empty());
+    }
+
+    #[test]
+    fn symbol_spans_survive_a_round_trip() {
+        let repo = TempRepo::new();
+        let mut store = repo.store();
+        store.upsert_files(&[file("a.rs")]).unwrap();
+        store
+            .replace_symbols_for_file("a.rs", &[symbol("a.rs", "spanned")])
+            .unwrap();
+
+        let found = store.symbols_matching("spanned", 5).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].start_line, 1);
+        assert_eq!(found[0].end_line, 4, "span must survive storage");
+    }
+
+    #[test]
+    fn symbols_for_path_returns_them_in_source_order() {
+        let repo = TempRepo::new();
+        let mut store = repo.store();
+        store.upsert_files(&[file("a.rs")]).unwrap();
+        let mut second = symbol("a.rs", "later");
+        second.start_line = 40;
+        second.end_line = 60;
+        // Inserted out of order on purpose; the query must sort.
+        store
+            .replace_symbols_for_file("a.rs", &[second, symbol("a.rs", "earlier")])
+            .unwrap();
+
+        let found = store.symbols_for_path("a.rs").unwrap();
+        let names: Vec<&str> = found.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["earlier", "later"]);
+        assert_eq!(found[1].start_line, 40);
+        assert_eq!(found[1].end_line, 60);
     }
 
     #[test]
