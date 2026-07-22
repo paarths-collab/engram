@@ -18,6 +18,11 @@ pub fn index_repo(repo_root: &Path, eager_tier1_limit: usize) -> Result<IndexSta
 
     let files = inventory::scan(repo_root);
     store.upsert_files(&files)?;
+    // `upsert_files` never deletes, so files removed from the repo since the
+    // last pass would otherwise keep their row, symbols, and import edges and
+    // go on being cited as evidence.
+    let present: std::collections::HashSet<String> = files.iter().map(|f| f.path.clone()).collect();
+    let pruned_files = store.prune_missing_files(&present)?;
 
     let history = cochange::build(repo_root);
     store.replace_cochange(&history.edges)?;
@@ -48,6 +53,7 @@ pub fn index_repo(repo_root: &Path, eager_tier1_limit: usize) -> Result<IndexSta
         files: files.len(),
         cochange_edges: history.edges.len(),
         tier1_files: extracted,
+        pruned_files,
     })
 }
 
@@ -117,4 +123,6 @@ pub struct IndexStats {
     pub files: usize,
     pub cochange_edges: usize,
     pub tier1_files: usize,
+    /// Paths dropped because they no longer exist in the repository.
+    pub pruned_files: usize,
 }

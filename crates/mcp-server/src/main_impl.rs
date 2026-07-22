@@ -31,8 +31,8 @@ impl Engram {
             move || match engram_repo_map::index_repo(&root, EAGER_TIER1_LIMIT) {
                 Ok(stats) => {
                     eprintln!(
-                        "[engram] indexed: {} files, {} cochange edges, {} tier1 files",
-                        stats.files, stats.cochange_edges, stats.tier1_files
+                        "[engram] indexed: {} files, {} cochange edges, {} tier1 files, {} pruned",
+                        stats.files, stats.cochange_edges, stats.tier1_files, stats.pruned_files
                     );
                     ready.store(true, Ordering::SeqCst);
                 }
