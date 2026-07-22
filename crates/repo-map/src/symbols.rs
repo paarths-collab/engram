@@ -4,6 +4,23 @@
 use engram_domain::{Language, SymbolKind, SymbolRecord};
 use tree_sitter::{Node, Parser};
 
+/// Whether Tier-1 extraction has a parser for this language.
+///
+/// The single source of truth for parser coverage, so callers can skip
+/// extraction instead of running it, finding nothing, and recording that
+/// as "extracted". A file marked `tier1_done` with zero symbols is frozen:
+/// adding a parser later would never revisit it.
+///
+/// Files in unsupported languages are still indexed. They keep their BM25
+/// body, their whole-file embedding, and their co-change edges. What they
+/// lack is symbols and imports, which is exactly what a missing parser costs.
+pub fn supports(lang: Language) -> bool {
+    matches!(
+        lang,
+        Language::Rust | Language::Python | Language::TypeScript | Language::JavaScript
+    )
+}
+
 fn parser_for(lang: Language) -> Option<Parser> {
     let mut p = Parser::new();
     let ok = match lang {
@@ -239,5 +256,37 @@ class Greeter:
     fn unsupported_languages_yield_nothing_rather_than_guessing() {
         assert!(extract_file("a.go", "func main() {}", Language::Go).is_empty());
         assert!(extract_file("a.txt", "hello", Language::Other).is_empty());
+    }
+
+    const ALL_LANGUAGES: [Language; 6] = [
+        Language::Rust,
+        Language::Python,
+        Language::TypeScript,
+        Language::JavaScript,
+        Language::Go,
+        Language::Other,
+    ];
+
+    #[test]
+    fn supports_never_drifts_from_actual_parser_availability() {
+        // Adding a grammar to parser_for without updating supports would leave
+        // that language silently unextracted forever, because callers skip on
+        // supports. This test is the tripwire for that.
+        for lang in ALL_LANGUAGES {
+            assert_eq!(
+                supports(lang),
+                parser_for(lang).is_some(),
+                "supports() disagrees with parser_for() for {lang:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn go_is_declared_unsupported_so_it_is_never_marked_extracted() {
+        // Go is a recognised Language (its files are indexed, searchable, and
+        // present in the co-change graph) but has no grammar. Delete this
+        // assertion when tree-sitter-go lands.
+        assert!(!supports(Language::Go));
+        assert!(supports(Language::Rust));
     }
 }
