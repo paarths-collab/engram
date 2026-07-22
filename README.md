@@ -45,7 +45,10 @@ Before implementing any task:
 
 ## What's inside
 - Tier-0 inventory: file walk, language + test detection (crates/repo-map/inventory.rs)
-- Tier-1 symbols + imports: tree-sitter extraction — Rust/Python/TS/JS, lazy on retrieval miss
+- Tier-1 symbols + imports: tree-sitter extraction — Rust/Python/TS/JS only, lazy on
+  retrieval miss. Files in other languages are still fully indexed (BM25 body, embedding,
+  co-change edges); they just carry no symbols or import edges. Go is recognised as a
+  language but has no grammar yet, so it falls in that second group.
 - Co-change graph from `git log` history + in-memory `petgraph` graph layer for
   multi-hop traversal (crates/repo-map/graph.rs) — see docs/adr/0001
 - Hybrid retrieval: Tantivy BM25 + hashed-ngram vectors + symbol boost + path match +

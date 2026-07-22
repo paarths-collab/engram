@@ -29,11 +29,10 @@ pub fn index_repo(repo_root: &Path, eager_tier1_limit: usize) -> Result<IndexSta
     store.update_recency(&history.last_commit)?;
 
     // Eagerly extract symbols for up to N source files (small repos = instant full coverage).
+    // Languages without a parser are skipped rather than "extracted" to nothing:
+    // see symbols::supports.
     let mut extracted = 0usize;
-    for f in files
-        .iter()
-        .filter(|f| f.language != engram_domain::Language::Other)
-    {
+    for f in files.iter().filter(|f| symbols::supports(f.language)) {
         if extracted >= eager_tier1_limit {
             break;
         }
@@ -63,7 +62,9 @@ pub fn ensure_tier1(store: &mut Store, repo_root: &Path, path: &str) -> Result<(
         return Ok(());
     }
     let lang = engram_domain::Language::from_path(path);
-    if lang == engram_domain::Language::Other {
+    // Checked before touching the disk: this runs per retrieval hit, and an
+    // unsupported file would otherwise be re-read on every single search.
+    if !symbols::supports(lang) {
         return Ok(());
     }
     if let Ok(src) = std::fs::read_to_string(repo_root.join(path)) {
@@ -91,7 +92,7 @@ pub fn reindex_file(store: &mut Store, repo_root: &Path, path: &str) -> Result<(
                 language: lang,
                 size_bytes: meta.len(),
             }])?;
-            if lang != Language::Other {
+            if symbols::supports(lang) {
                 if let Ok(src) = std::fs::read_to_string(&full) {
                     store
                         .replace_symbols_for_file(path, &symbols::extract_file(path, &src, lang))?;
