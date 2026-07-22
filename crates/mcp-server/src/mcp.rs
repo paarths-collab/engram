@@ -260,10 +260,14 @@ mod tests {
         assert_eq!(responses.len(), 2, "the server survived the panic");
         assert_eq!(responses[0]["id"], 8);
         assert_eq!(responses[0]["result"]["isError"], true);
-        assert!(responses[0]["result"]["content"][0]["text"]
+        let text = responses[0]["result"]["content"][0]["text"]
             .as_str()
-            .unwrap()
-            .contains("tool exploded"));
+            .expect("content text");
+        assert!(text.contains("boom"), "should name the tool, got: {text}");
+        assert!(
+            text.contains("tool exploded"),
+            "panic payload was not recovered, got: {text}"
+        );
         // The whole point: the next call still works.
         assert_eq!(responses[1]["id"], 9);
         assert_eq!(responses[1]["result"]["isError"], false);
