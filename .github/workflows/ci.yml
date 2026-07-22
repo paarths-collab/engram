@@ -14,8 +14,10 @@ env:
   RUSTFLAGS: "-D warnings"
 
 jobs:
-  check:
-    name: fmt · clippy · build · test
+  # Lint once. fmt and clippy results do not vary by OS, so running them on
+  # three runners would just burn minutes.
+  lint:
+    name: fmt · clippy
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -35,19 +37,52 @@ jobs:
       - name: Clippy (deny warnings)
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-      - name: Build (release, locked)
-        run: cargo build --workspace --release --locked
+  # Build and test on every OS we claim to support. Engram is a local dev tool
+  # that shells out to git, walks paths, and links bundled C (tree-sitter,
+  # SQLite), so platform differences are real and must be caught here.
+  check:
+    name: build · test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build (locked)
+        run: cargo build --workspace --locked
 
       - name: Test
         run: cargo test --workspace --locked
 
-  # CD: on every push to main, produce the release binary as a downloadable
-  # artifact so a green main always has a ready-to-run engram binary.
+  # CD: on every push to main, produce a release binary per platform as a
+  # downloadable artifact so a green main always has a ready-to-run engram.
   package:
-    name: package binary
-    needs: check
+    name: package binary (${{ matrix.target }})
+    needs: [lint, check]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x86_64
+            binary: target/release/engram
+          - os: windows-latest
+            target: windows-x86_64
+            binary: target/release/engram.exe
+          - os: macos-latest
+            target: macos-arm64
+            binary: target/release/engram
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -64,7 +99,7 @@ jobs:
       - name: Upload engram binary
         uses: actions/upload-artifact@v4
         with:
-          name: engram-linux-x86_64
-          path: target/release/engram
+          name: engram-${{ matrix.target }}
+          path: ${{ matrix.binary }}
           if-no-files-found: error
           retention-days: 14
