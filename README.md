@@ -1,6 +1,7 @@
 # Engram — Engineering Memory MCP Server
 
 [![CI](https://github.com/paarths-collab/engram/actions/workflows/ci.yml/badge.svg)](https://github.com/paarths-collab/engram/actions/workflows/ci.yml)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
 Headless MCP server that gives coding agents (Claude Code, Cursor, Codex, any MCP client)
 persistent knowledge of a repository: what exists, what to reuse, what a task will affect.
@@ -80,3 +81,15 @@ leakage-free temporal split — no text, no LLM, no guessing.
 - Root-cause engine (explain_failure): combine CI failure logs + diff + history
 - Real embeddings (fastembed-rs) behind the existing `Embedder` trait
 - Learning loop: submit_outcome + deterministic feedback scoring
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+
+Apache-2.0 rather than MIT for the explicit patent grant in section 3: contributors
+grant users a patent licence covering their contributions, and that grant terminates
+for anyone who starts patent litigation over the work. MIT is silent on patents.
+
+Dependency licences are not assumed. `cargo deny check licenses` runs on every pull
+request against the allow-list in [deny.toml](deny.toml); a copyleft dependency
+appearing anywhere in the tree fails the build rather than shipping quietly.

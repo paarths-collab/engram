@@ -1,0 +1,40 @@
+# cargo-deny: prove dependency licenses are compatible with Apache-2.0 rather
+# than assuming it. Run locally with `cargo deny check licenses`; CI runs the
+# same check on every PR.
+#
+# Apache-2.0 can absorb permissive licenses (MIT, BSD, ISC, Unlicense). It
+# cannot absorb strong copyleft (GPL, AGPL), and weak copyleft (MPL, LGPL)
+# carries per-file obligations we do not want to take on silently. Neither is
+# listed below, so either one appearing in the tree fails the build instead of
+# shipping quietly.
+
+[licenses]
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "MIT-0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unlicense",
+    "Zlib",
+    "CC0-1.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "BSL-1.0",
+    "OpenSSL",
+]
+confidence-threshold = 0.9
+
+[bans]
+# Duplicate major versions of the same crate bloat the binary and usually mean
+# a dependency needs bumping. Warn rather than fail: not our call to make on
+# transitive deps.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

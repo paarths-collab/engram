@@ -37,6 +37,20 @@ jobs:
       - name: Clippy (deny warnings)
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+  # Engram ships under Apache-2.0, which can absorb permissive dependency
+  # licenses but not copyleft. Prove that on every PR instead of assuming it.
+  licenses:
+    name: dependency licenses
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses bans sources
+
   # Build and test on every OS we claim to support. Engram is a local dev tool
   # that shells out to git, walks paths, and links bundled C (tree-sitter,
   # SQLite), so platform differences are real and must be caught here.
