@@ -436,7 +436,7 @@ impl Store {
     }
 
     /// Files whose import targets contain `needle` (a module key from
-    /// [`crate::imports::module_needle`]), excluding `exclude`.
+    /// [`crate::imports::module_needles`]), excluding `exclude`.
     pub fn importers_of(&self, needle: &str, exclude: &str, limit: usize) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare(
             "SELECT DISTINCT path FROM file_imports
