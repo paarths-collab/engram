@@ -5,12 +5,13 @@
 //! in memory — which is where dense/deep relationship reasoning belongs. No graph
 //! database required: SQL stores the edges, petgraph walks them.
 
-use crate::imports::module_needle;
+use crate::imports::{crate_manifest_for, module_needles, package_name};
 use crate::store::Store;
 use anyhow::Result;
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::Direction::Incoming;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::Path;
 
 /// Kind of relationship an edge represents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,15 +70,26 @@ impl CodeGraph {
     }
 
     /// Build the graph from the store: resolved import edges + co-change edges.
-    pub fn build(store: &Store) -> Result<Self> {
+    pub fn build(store: &Store, repo_root: &Path) -> Result<Self> {
         let files = store.all_files()?;
         let file_set: HashSet<String> = files.iter().map(|f| f.path.clone()).collect();
 
         // needle -> files that expose it (an importable module key)
         let mut needle_map: HashMap<String, Vec<String>> = HashMap::new();
         for f in &files {
-            if let Some(n) = module_needle(&f.path) {
-                needle_map.entry(n).or_default().push(f.path.clone());
+            for needle in module_needles(&f.path) {
+                needle_map.entry(needle).or_default().push(f.path.clone());
+            }
+            // A crate root is imported by the name in its Cargo.toml, which
+            // appears nowhere in its path. Without this alias,
+            // `use engram_retrieval::Engine` and crates/retrieval/src/lib.rs
+            // have no key in common and no import edge is ever produced.
+            if let Some(manifest) = crate_manifest_for(&f.path) {
+                if let Ok(text) = std::fs::read_to_string(repo_root.join(&manifest)) {
+                    if let Some(name) = package_name(&text) {
+                        needle_map.entry(name).or_default().push(f.path.clone());
+                    }
+                }
             }
         }
 
@@ -161,7 +173,7 @@ impl CodeGraph {
 }
 
 /// Candidate module keys contained in a normalized import target `a/b/c`:
-/// each single segment and each adjacent pair (matching `module_needle` shapes).
+/// each single segment and each adjacent pair (matching `module_needles` shapes).
 fn candidate_keys(target: &str) -> Vec<String> {
     let segs: Vec<&str> = target.split('/').filter(|s| !s.is_empty()).collect();
     let mut keys = Vec::new();
@@ -224,5 +236,110 @@ mod tests {
         assert!(keys.contains(&"utils/retry".to_string()));
         assert!(keys.contains(&"retry/backoff".to_string()));
         assert!(keys.contains(&"retry".to_string()));
+    }
+
+    /// Throwaway repo root, removed on drop. Not `tempfile`: CI builds
+    /// `--locked`, so a dev-dependency would need a Cargo.lock regeneration.
+    struct TempRepo(std::path::PathBuf);
+
+    impl TempRepo {
+        fn new(tag: &str) -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("engram-graph-test-{}-{tag}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("create temp repo");
+            TempRepo(path)
+        }
+
+        fn write(&self, rel: &str, contents: &str) {
+            let full = self.0.join(rel);
+            std::fs::create_dir_all(full.parent().unwrap()).expect("mkdir");
+            std::fs::write(full, contents).expect("write");
+        }
+    }
+
+    impl Drop for TempRepo {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn source_file(path: &str) -> engram_domain::FileRecord {
+        engram_domain::FileRecord {
+            path: path.to_owned(),
+            language: engram_domain::Language::Rust,
+            size_bytes: 100,
+            is_test: false,
+        }
+    }
+
+    /// The regression this whole module existed to provide and never did.
+    ///
+    /// Every unit test above passed while `build` produced zero import edges on
+    /// a real Rust repo, because they all checked helpers in isolation and none
+    /// checked that an edge came out the other end.
+    #[test]
+    fn a_crate_name_import_produces_an_edge_to_the_crate_root() {
+        let repo = TempRepo::new("crate-name");
+        repo.write(
+            "crates/retrieval/Cargo.toml",
+            "[package]\nname = \"engram-retrieval\"\nversion = \"0.1.0\"\n",
+        );
+
+        let mut store = Store::open(&repo.0).expect("open store");
+        store
+            .upsert_files(&[
+                source_file("crates/retrieval/src/lib.rs"),
+                source_file("crates/mcp-server/src/main_impl.rs"),
+            ])
+            .expect("upsert files");
+        // Exactly what tree-sitter extracts from `use engram_retrieval::Engine;`
+        store
+            .replace_imports_for_file(
+                "crates/mcp-server/src/main_impl.rs",
+                &["engram_retrieval::Engine".to_owned()],
+            )
+            .expect("record import");
+
+        let graph = CodeGraph::build(&store, &repo.0).expect("build graph");
+        let dependents = graph.dependents(
+            &["crates/retrieval/src/lib.rs".to_owned()],
+            &[EdgeKind::Imports],
+            2,
+        );
+        let paths: Vec<&str> = dependents.iter().map(|h| h.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["crates/mcp-server/src/main_impl.rs"],
+            "importing a crate by name must reach its lib.rs"
+        );
+    }
+
+    #[test]
+    fn a_crate_root_without_a_manifest_still_resolves_by_path() {
+        // No Cargo.toml written: the alias cannot be read, so resolution has to
+        // fall back to the path-derived needles rather than producing nothing.
+        let repo = TempRepo::new("no-manifest");
+        let mut store = Store::open(&repo.0).expect("open store");
+        store
+            .upsert_files(&[
+                source_file("crates/retrieval/src/lib.rs"),
+                source_file("crates/mcp-server/src/main_impl.rs"),
+            ])
+            .expect("upsert files");
+        store
+            .replace_imports_for_file(
+                "crates/mcp-server/src/main_impl.rs",
+                &["retrieval::Engine".to_owned()],
+            )
+            .expect("record import");
+
+        let graph = CodeGraph::build(&store, &repo.0).expect("build graph");
+        let dependents = graph.dependents(
+            &["crates/retrieval/src/lib.rs".to_owned()],
+            &[EdgeKind::Imports],
+            2,
+        );
+        assert_eq!(dependents.len(), 1, "{dependents:?}");
     }
 }

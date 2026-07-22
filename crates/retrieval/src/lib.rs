@@ -228,7 +228,7 @@ impl Engine {
             chunks.len(),
             docs.len()
         );
-        let graph = CodeGraph::build(store)?;
+        let graph = CodeGraph::build(store, repo_root)?;
         eprintln!(
             "[engram] code graph: {} nodes, {} edges",
             graph.node_count(),
