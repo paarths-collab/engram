@@ -459,7 +459,7 @@ impl Store {
              WHERE name LIKE ?1 COLLATE NOCASE LIMIT ?2",
         )?;
         let pattern = format!("%{}%", needle);
-        let rows = stmt.query_map(params![pattern, limit as i64], |r| row_to_symbol(r))?;
+        let rows = stmt.query_map(params![pattern, limit as i64], row_to_symbol)?;
         Ok(rows.filter_map(Result::ok).collect())
     }
 
@@ -470,7 +470,7 @@ impl Store {
             "SELECT name, kind, path, start_line, end_line, signature FROM symbols
              WHERE path = ?1 ORDER BY start_line",
         )?;
-        let rows = stmt.query_map(params![path], |r| row_to_symbol(r))?;
+        let rows = stmt.query_map(params![path], row_to_symbol)?;
         Ok(rows.filter_map(Result::ok).collect())
     }
 
