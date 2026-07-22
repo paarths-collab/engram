@@ -38,8 +38,28 @@ struct DocMeta {
     path: String,
     is_test: bool,
     preview: String,
-    vector: Vec<f32>,
     last_commit_ts: Option<i64>,
+}
+
+/// One embedded slice of a file.
+///
+/// Embedding whole files means embedding a head slice, because files are far
+/// longer than anything a single vector can represent. That leaves a function
+/// at line 900 with no vector at all. A chunk is instead one symbol's source
+/// span, so the vector side can match a definition rather than the file that
+/// happens to contain it.
+struct Chunk {
+    /// Index into `Engine::docs` of the file this span came from.
+    doc: usize,
+    /// `None` for the whole-file head chunk, which carries imports and module
+    /// docs that no symbol span covers.
+    symbol: Option<String>,
+    /// One-based; `0` for the head chunk. Doubles as the cache key.
+    start_line: usize,
+    /// The span's source text, capped at [`CHUNK_BYTES`]. Returned as the
+    /// snippet, so evidence quotes the matching definition itself.
+    text: String,
+    vector: Vec<f32>,
 }
 
 fn now_unix() -> i64 {
@@ -56,6 +76,7 @@ pub struct Engine {
     f_path: Field,
     f_body: Field,
     docs: Vec<DocMeta>,
+    chunks: Vec<Chunk>,
     by_path: HashMap<String, usize>,
     embedder: HashedNgramEmbedder,
     config: WeightsConfig,
@@ -65,6 +86,59 @@ pub struct Engine {
 
 const PREVIEW_BYTES: usize = 400;
 const INDEX_BODY_BYTES: usize = 60_000;
+/// Cap on the source text embedded and quoted for one chunk. Long enough for a
+/// normal definition, short enough that one sprawling function cannot dominate.
+const CHUNK_BYTES: usize = 4_000;
+
+/// Reuse a cached embedding when its content hash still matches, otherwise
+/// embed fresh. Returns the vector and whether it came from cache.
+fn embed_or_reuse(
+    embedder: &HashedNgramEmbedder,
+    cached: Option<&(String, Vec<u8>)>,
+    text: &str,
+    hash: &str,
+) -> (Vec<f32>, bool) {
+    if let Some((cached_hash, bytes)) = cached {
+        if cached_hash == hash {
+            if let Some(vector) = embed::bytes_to_vector(bytes) {
+                return (vector, true);
+            }
+        }
+    }
+    (embedder.embed(text), false)
+}
+
+/// Plan a file's chunks: the head, then one span per extracted symbol.
+///
+/// The head chunk always exists. A file with no chunks could never be returned
+/// by vector search, and symbol extraction is lazy, so plenty of files have no
+/// symbols yet on any given build.
+fn plan_chunks(
+    source: &str,
+    body: &str,
+    symbols: &[SymbolRecord],
+) -> Vec<(usize, Option<String>, String)> {
+    let mut planned = vec![(0usize, None, body.chars().take(CHUNK_BYTES).collect())];
+    let lines: Vec<&str> = source.lines().collect();
+    for symbol in symbols {
+        // Spans from a pre-span database are zero, and a file can shrink
+        // between extraction and this build.
+        if symbol.start_line == 0
+            || symbol.end_line < symbol.start_line
+            || symbol.start_line > lines.len()
+        {
+            continue;
+        }
+        let end = symbol.end_line.min(lines.len());
+        let text: String = lines[symbol.start_line - 1..end]
+            .join("\n")
+            .chars()
+            .take(CHUNK_BYTES)
+            .collect();
+        planned.push((symbol.start_line, Some(symbol.name.clone()), text));
+    }
+    planned
+}
 
 impl Engine {
     /// Build the in-memory hybrid index from the current repo + store.
@@ -83,11 +157,12 @@ impl Engine {
         let stopwords = std::sync::Arc::new(stopwords::load(repo_root));
         let embedder = HashedNgramEmbedder::new(stopwords.clone());
         let mut docs = Vec::new();
+        let mut chunks: Vec<Chunk> = Vec::new();
         let mut by_path = HashMap::new();
         let recency = store.recency_map()?;
-        let cached = store.load_vectors()?;
-        let mut fresh: Vec<(String, String, Vec<u8>)> = Vec::new();
-        let mut present: HashSet<String> = HashSet::new();
+        let cached = store.load_chunk_vectors()?;
+        let mut fresh: Vec<(String, usize, String, Vec<u8>)> = Vec::new();
+        let mut present: HashSet<(String, usize)> = HashSet::new();
         let (mut reused, mut embedded) = (0usize, 0usize);
 
         for f in store.all_files()? {
@@ -96,46 +171,63 @@ impl Engine {
                 continue;
             };
             let body: String = src.chars().take(INDEX_BODY_BYTES).collect();
-            // Embed path + a head slice; heads carry imports/signatures = high signal.
-            let embed_text = format!("{} {}", f.path, body.chars().take(4000).collect::<String>());
-            let hash = embed::content_hash(&embed_text);
-            let vector = match cached.get(&f.path) {
-                Some((h, bytes)) if *h == hash => match embed::bytes_to_vector(bytes) {
-                    Some(v) => {
-                        reused += 1;
-                        v
-                    }
-                    None => {
-                        embedded += 1;
-                        let v = embedder.embed(&embed_text);
-                        fresh.push((f.path.clone(), hash, embed::vector_to_bytes(&v)));
-                        v
-                    }
-                },
-                _ => {
+            let doc_index = docs.len();
+
+            // Symbols are extracted lazily, so a file may legitimately have
+            // none yet; plan_chunks always yields at least the head chunk.
+            let symbols = store.symbols_for_path(&f.path).unwrap_or_default();
+            for (start_line, symbol, text) in plan_chunks(&src, &body, &symbols) {
+                let embed_text = match &symbol {
+                    Some(name) => format!("{} {} {}", f.path, name, text),
+                    None => format!("{} {}", f.path, text),
+                };
+                let hash = embed::content_hash(&embed_text);
+                let key = (f.path.clone(), start_line);
+                let (vector, from_cache) =
+                    embed_or_reuse(&embedder, cached.get(&key), &embed_text, &hash);
+                if from_cache {
+                    reused += 1;
+                } else {
                     embedded += 1;
-                    let v = embedder.embed(&embed_text);
-                    fresh.push((f.path.clone(), hash, embed::vector_to_bytes(&v)));
-                    v
+                    fresh.push((
+                        f.path.clone(),
+                        start_line,
+                        hash,
+                        embed::vector_to_bytes(&vector),
+                    ));
                 }
-            };
-            present.insert(f.path.clone());
+                present.insert(key);
+                chunks.push(Chunk {
+                    doc: doc_index,
+                    symbol,
+                    start_line,
+                    text,
+                    vector,
+                });
+            }
+
             writer.add_document(doc!(f_path => f.path.clone(), f_body => body.clone()))?;
-            by_path.insert(f.path.clone(), docs.len());
+            by_path.insert(f.path.clone(), doc_index);
             docs.push(DocMeta {
                 preview: body.chars().take(PREVIEW_BYTES).collect(),
                 last_commit_ts: recency.get(&f.path).copied(),
                 path: f.path,
                 is_test: f.is_test,
-                vector,
             });
         }
         writer.commit()?;
         if !fresh.is_empty() {
-            store.upsert_vectors(&fresh)?;
+            store.upsert_chunk_vectors(&fresh)?;
         }
-        store.prune_vectors(&present)?;
-        eprintln!("[engram] vectors: {reused} reused, {embedded} embedded");
+        store.prune_chunk_vectors(&present)?;
+        // The head chunk superseded the per-file vector; drop the legacy rows
+        // rather than leave a table that nothing reads slowly going stale.
+        store.prune_vectors(&HashSet::new())?;
+        eprintln!(
+            "[engram] chunks: {} across {} files ({reused} reused, {embedded} embedded)",
+            chunks.len(),
+            docs.len()
+        );
         let graph = CodeGraph::build(store)?;
         eprintln!(
             "[engram] code graph: {} nodes, {} edges",
@@ -151,6 +243,7 @@ impl Engine {
             f_path,
             f_body,
             docs,
+            chunks,
             by_path,
             embedder,
             config: WeightsConfig::load(repo_root),
@@ -223,17 +316,37 @@ impl Engine {
         out
     }
 
-    fn vector_candidates(&self, query: &str, k: usize) -> Vec<(usize, f32)> {
+    /// Score every chunk, then max-pool to the file that owns it: a file is as
+    /// relevant as its single best-matching definition, not as its average.
+    /// Returns `(doc, score, best chunk)` so callers can quote the span that
+    /// actually matched.
+    fn vector_candidates_with_chunk(&self, query: &str, k: usize) -> Vec<(usize, f32, usize)> {
         let qv = self.embedder.embed(query);
-        let mut scored: Vec<(usize, f32)> = self
-            .docs
-            .iter()
-            .enumerate()
-            .map(|(i, d)| (i, cosine(&qv, &d.vector)))
+        let mut best: HashMap<usize, (f32, usize)> = HashMap::new();
+        for (index, chunk) in self.chunks.iter().enumerate() {
+            let score = cosine(&qv, &chunk.vector);
+            match best.get_mut(&chunk.doc) {
+                Some(slot) if slot.0 >= score => {}
+                Some(slot) => *slot = (score, index),
+                None => {
+                    best.insert(chunk.doc, (score, index));
+                }
+            }
+        }
+        let mut scored: Vec<(usize, f32, usize)> = best
+            .into_iter()
+            .map(|(doc, (score, chunk))| (doc, score, chunk))
             .collect();
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         scored.truncate(k);
         scored
+    }
+
+    fn vector_candidates(&self, query: &str, k: usize) -> Vec<(usize, f32)> {
+        self.vector_candidates_with_chunk(query, k)
+            .into_iter()
+            .map(|(doc, score, _)| (doc, score))
+            .collect()
     }
 
     /// Hybrid search: BM25 + vector fused with weighted normalized scores,
@@ -247,7 +360,15 @@ impl Engine {
         // Dev hot-reload: pick up config/scoring.toml edits without a restart.
         self.config.reload_if_changed();
         let bm25 = self.bm25_candidates(query, 50);
-        let vecs = self.vector_candidates(query, 50);
+        let vector_hits = self.vector_candidates_with_chunk(query, 50);
+        let best_chunk: HashMap<usize, usize> = vector_hits
+            .iter()
+            .map(|(doc, _, chunk)| (*doc, *chunk))
+            .collect();
+        let vecs: Vec<(usize, f32)> = vector_hits
+            .iter()
+            .map(|(doc, score, _)| (*doc, *score))
+            .collect();
         let now = now_unix();
         let w = &self.config.weights;
 
@@ -323,14 +444,32 @@ impl Engine {
         for (rank, (i, score, signals)) in ranked.iter().enumerate() {
             let d = &self.docs[*i];
             engram_repo_map::ensure_tier1(store, &self.repo_root, &d.path)?;
-            let symbols = best_symbols_for(store, &d.path, &q_tokens);
-            let (title, symbol, snippet) = match symbols.first() {
-                Some(s) => (
-                    format!("{} in {}", s.name, d.path),
-                    Some(s.name.clone()),
-                    Some(s.signature.clone()),
-                ),
-                None => (d.path.clone(), None, Some(d.preview.clone())),
+            // Prefer the span the vector side actually matched: its text is the
+            // definition itself, where the symbol table only holds a signature
+            // line and the file preview is just the first few hundred bytes.
+            let matched_span = best_chunk
+                .get(i)
+                .map(|&index| &self.chunks[index])
+                .filter(|chunk| chunk.symbol.is_some());
+            let (title, symbol, snippet) = match matched_span {
+                Some(chunk) => {
+                    let name = chunk.symbol.clone().unwrap_or_default();
+                    // path:line, so the agent can open the definition directly
+                    // instead of searching the file for the name again.
+                    (
+                        format!("{} in {}:{}", name, d.path, chunk.start_line),
+                        Some(name),
+                        Some(chunk.text.clone()),
+                    )
+                }
+                None => match best_symbols_for(store, &d.path, &q_tokens).first() {
+                    Some(s) => (
+                        format!("{} in {}", s.name, d.path),
+                        Some(s.name.clone()),
+                        Some(s.signature.clone()),
+                    ),
+                    None => (d.path.clone(), None, Some(d.preview.clone())),
+                },
             };
             packets.push(EvidencePacket {
                 id: format!("ev_{rank:03}"),
@@ -541,4 +680,133 @@ fn best_symbols_for(store: &Store, path: &str, q_tokens: &[String]) -> Vec<Symbo
         }
     }
     hits
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use engram_domain::SymbolKind;
+
+    const SRC: &str = "\
+use std::io;
+
+fn first() {
+    let x = 1;
+}
+
+fn second() {
+    let y = 2;
+}
+";
+
+    fn symbol(name: &str, start_line: usize, end_line: usize) -> SymbolRecord {
+        SymbolRecord {
+            name: name.to_owned(),
+            kind: SymbolKind::Function,
+            path: "a.rs".to_owned(),
+            start_line,
+            end_line,
+            signature: format!("fn {name}()"),
+        }
+    }
+
+    #[test]
+    fn a_file_without_symbols_still_gets_one_chunk() {
+        // A doc with no chunks could never be returned by vector search, and
+        // symbol extraction is lazy, so this is a normal state not an edge case.
+        let planned = plan_chunks(SRC, SRC, &[]);
+        assert_eq!(planned.len(), 1);
+        assert_eq!(planned[0].0, 0, "head chunk is keyed at line 0");
+        assert!(planned[0].1.is_none());
+        assert!(planned[0].2.contains("use std::io;"));
+    }
+
+    #[test]
+    fn each_symbol_becomes_its_own_chunk_holding_its_definition() {
+        let planned = plan_chunks(SRC, SRC, &[symbol("first", 3, 5), symbol("second", 7, 9)]);
+        assert_eq!(planned.len(), 3, "head chunk plus one per symbol");
+
+        let second = planned
+            .iter()
+            .find(|(_, name, _)| name.as_deref() == Some("second"))
+            .expect("second was planned");
+        assert_eq!(second.0, 7, "keyed by its start line");
+        assert!(second.2.starts_with("fn second()"), "got: {}", second.2);
+        assert!(second.2.contains("let y = 2;"), "got: {}", second.2);
+        assert!(
+            !second.2.contains("first"),
+            "bled into the neighbour: {}",
+            second.2
+        );
+    }
+
+    #[test]
+    fn unusable_spans_are_skipped_rather_than_panicking() {
+        // start_line 0 comes from a pre-span database; inverted and
+        // past-the-end spans come from a file edited since extraction.
+        let planned = plan_chunks(
+            SRC,
+            SRC,
+            &[
+                symbol("spanless", 0, 0),
+                symbol("inverted", 9, 3),
+                symbol("past_eof", 900, 950),
+            ],
+        );
+        assert_eq!(planned.len(), 1, "only the head chunk survives");
+    }
+
+    #[test]
+    fn a_span_running_past_a_shrunken_file_is_clamped() {
+        let planned = plan_chunks(SRC, SRC, &[symbol("truncated", 7, 9_999)]);
+        let chunk = &planned[1];
+        assert_eq!(chunk.1.as_deref(), Some("truncated"));
+        assert!(chunk.2.contains("let y = 2;"));
+    }
+
+    #[test]
+    fn chunk_text_is_capped() {
+        let huge = format!("fn big() {{\n{}\n}}\n", "    let x = 1;\n".repeat(2_000));
+        let planned = plan_chunks(&huge, &huge, &[symbol("big", 1, 2_002)]);
+        assert!(planned[1].2.chars().count() <= CHUNK_BYTES);
+    }
+
+    #[test]
+    fn a_matching_cached_hash_is_reused_and_a_stale_one_is_not() {
+        let embedder = HashedNgramEmbedder::default();
+        let vector = embedder.embed("fn retry()");
+        let bytes = embed::vector_to_bytes(&vector);
+
+        let (reused, from_cache) = embed_or_reuse(
+            &embedder,
+            Some(&("h1".to_owned(), bytes.clone())),
+            "fn retry()",
+            "h1",
+        );
+        assert!(from_cache);
+        assert_eq!(reused, vector);
+
+        let (_, from_cache) = embed_or_reuse(
+            &embedder,
+            Some(&("stale".to_owned(), bytes)),
+            "fn retry()",
+            "h1",
+        );
+        assert!(!from_cache, "a changed hash must force a re-embed");
+
+        let (_, from_cache) = embed_or_reuse(&embedder, None, "fn retry()", "h1");
+        assert!(!from_cache);
+    }
+
+    #[test]
+    fn corrupt_cached_bytes_fall_back_to_embedding() {
+        let embedder = HashedNgramEmbedder::default();
+        let (_, from_cache) = embed_or_reuse(
+            &embedder,
+            Some(&("h1".to_owned(), vec![1u8, 2, 3])),
+            "fn retry()",
+            "h1",
+        );
+        assert!(!from_cache, "wrong-length blob must not be trusted");
+    }
 }
