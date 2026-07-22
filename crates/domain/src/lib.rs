@@ -52,6 +52,10 @@ pub struct SymbolRecord {
     pub kind: SymbolKind,
     pub path: String,
     pub start_line: usize,
+    /// Last line of the definition, inclusive. Together with `start_line` this
+    /// gives the symbol's source span, which is what lets retrieval embed and
+    /// quote the definition itself rather than the head of its file.
+    pub end_line: usize,
     /// First line of the definition, used as a cheap signature/preview.
     pub signature: String,
 }

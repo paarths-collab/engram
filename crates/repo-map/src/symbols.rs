@@ -79,6 +79,7 @@ pub fn extract_file(path: &str, source: &str, lang: Language) -> Vec<SymbolRecor
                     kind,
                     path: path.to_string(),
                     start_line: node.start_position().row + 1,
+                    end_line: node.end_position().row + 1,
                     signature: first_line(source, &node),
                 });
             }
@@ -166,4 +167,77 @@ fn first_quoted(s: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const RUST_SRC: &str = "\
+fn first() {
+    let x = 1;
+}
+
+fn second() {
+    let y = 2;
+}
+";
+
+    fn find<'a>(symbols: &'a [SymbolRecord], name: &str) -> &'a SymbolRecord {
+        symbols
+            .iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| panic!("no symbol named {name}"))
+    }
+
+    /// Slice a symbol's span back out of the source, the way retrieval will.
+    fn span_text(source: &str, symbol: &SymbolRecord) -> String {
+        source.lines().collect::<Vec<_>>()[symbol.start_line - 1..symbol.end_line].join("\n")
+    }
+
+    #[test]
+    fn rust_functions_get_one_based_spans() {
+        let symbols = extract_file("a.rs", RUST_SRC, Language::Rust);
+        let first = find(&symbols, "first");
+        assert_eq!((first.start_line, first.end_line), (1, 3));
+        let second = find(&symbols, "second");
+        assert_eq!((second.start_line, second.end_line), (5, 7));
+    }
+
+    #[test]
+    fn spans_slice_back_to_exactly_one_definition() {
+        // This is the property chunk-level embedding depends on: the span must
+        // cover the whole definition and none of its neighbour.
+        let symbols = extract_file("a.rs", RUST_SRC, Language::Rust);
+        let body = span_text(RUST_SRC, find(&symbols, "second"));
+        assert!(body.starts_with("fn second()"), "got: {body}");
+        assert!(body.trim_end().ends_with('}'), "got: {body}");
+        assert!(!body.contains("first"), "bled into the neighbour: {body}");
+        assert!(body.contains("let y = 2;"), "lost the body: {body}");
+    }
+
+    #[test]
+    fn a_nested_python_method_is_contained_by_its_class() {
+        let src = "\
+class Greeter:
+    def hello(self):
+        return \"hi\"
+";
+        let symbols = extract_file("g.py", src, Language::Python);
+        let class = find(&symbols, "Greeter");
+        let method = find(&symbols, "hello");
+        assert!(
+            class.start_line <= method.start_line && method.end_line <= class.end_line,
+            "class {:?} should contain method {:?}",
+            (class.start_line, class.end_line),
+            (method.start_line, method.end_line)
+        );
+        assert!(span_text(src, method).contains("return"));
+    }
+
+    #[test]
+    fn unsupported_languages_yield_nothing_rather_than_guessing() {
+        assert!(extract_file("a.go", "func main() {}", Language::Go).is_empty());
+        assert!(extract_file("a.txt", "hello", Language::Other).is_empty());
+    }
 }
