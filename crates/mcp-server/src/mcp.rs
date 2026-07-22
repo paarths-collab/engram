@@ -88,6 +88,7 @@ pub fn serve_io<R: BufRead, W: Write>(handler: &mut dyn ToolHandler, reader: R, 
 /// inconsistent. That is still strictly better than terminating, because the
 /// next call rebuilds what it needs and the client stays connected.
 fn call_tool_caught(handler: &mut dyn ToolHandler, name: &str, args: &Value) -> Value {
+    install_panic_capture();
     let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         handler.call_tool(name, args)
     }));
@@ -104,7 +105,9 @@ fn call_tool_caught(handler: &mut dyn ToolHandler, name: &str, args: &Value) -> 
             "isError": true
         }),
         Err(payload) => {
-            let detail = panic_detail(&payload);
+            let detail = take_captured_panic()
+                .or_else(|| downcast_panic_detail(&payload))
+                .unwrap_or_else(|| "unknown panic".to_owned());
             eprintln!("[engram] tool '{name}' panicked: {detail}");
             json!({
                 "content": [{
@@ -117,13 +120,48 @@ fn call_tool_caught(handler: &mut dyn ToolHandler, name: &str, args: &Value) -> 
     }
 }
 
-/// Best-effort human-readable text from a panic payload.
-fn panic_detail(payload: &(dyn std::any::Any + Send)) -> String {
+thread_local! {
+    /// Message of the most recent panic on this thread, recorded by the hook
+    /// below and consumed by [`call_tool_caught`].
+    static LAST_PANIC: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+static PANIC_CAPTURE: std::sync::Once = std::sync::Once::new();
+
+/// Record every panic's message where the catch site can read it.
+///
+/// Downcasting the `catch_unwind` payload is not stable across Rust versions:
+/// on 1.97 `panic!("literal")` no longer hands back a `&'static str`, so the
+/// obvious `downcast_ref::<&str>()` silently yields nothing and the operator
+/// loses the one detail that explains the failure. `payload_as_str` on the
+/// hook side is the supported accessor and keeps working.
+///
+/// The previous hook still runs, so normal panic output is unchanged. Storage
+/// is thread-local, so concurrent tool calls cannot read each other's message.
+fn install_panic_capture() {
+    PANIC_CAPTURE.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let message = info
+                .payload_as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| info.to_string());
+            LAST_PANIC.with(|slot| *slot.borrow_mut() = Some(message));
+            previous(info);
+        }));
+    });
+}
+
+fn take_captured_panic() -> Option<String> {
+    LAST_PANIC.with(|slot| slot.borrow_mut().take())
+}
+
+/// Fallback for payloads that predate or bypass the hook.
+fn downcast_panic_detail(payload: &(dyn std::any::Any + Send)) -> Option<String> {
     payload
         .downcast_ref::<&str>()
         .map(|s| (*s).to_owned())
         .or_else(|| payload.downcast_ref::<String>().cloned())
-        .unwrap_or_else(|| "non-string panic payload".to_owned())
 }
 
 #[cfg(test)]
