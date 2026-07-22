@@ -160,6 +160,39 @@ impl Store {
         Ok(())
     }
 
+    /// Drop every trace of files no longer present in the repository.
+    ///
+    /// `upsert_files` only inserts and updates, so without this a file deleted
+    /// from the repo keeps its `files` row, its extracted symbols, and its
+    /// import edges forever. Those ghosts still match `symbols_matching`, still
+    /// resolve as import targets in the code graph, and still rank in
+    /// retrieval — evidence citing a path that is not there any more.
+    ///
+    /// Returns the number of paths removed.
+    pub fn prune_missing_files(
+        &mut self,
+        keep: &std::collections::HashSet<String>,
+    ) -> Result<usize> {
+        let stale: Vec<String> = {
+            let mut stmt = self.conn.prepare("SELECT path FROM files")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            rows.filter_map(Result::ok)
+                .filter(|path| !keep.contains(path))
+                .collect()
+        };
+        if stale.is_empty() {
+            return Ok(0);
+        }
+        let tx = self.conn.transaction()?;
+        for path in &stale {
+            tx.execute("DELETE FROM files WHERE path = ?1", params![path])?;
+            tx.execute("DELETE FROM symbols WHERE path = ?1", params![path])?;
+            tx.execute("DELETE FROM file_imports WHERE path = ?1", params![path])?;
+        }
+        tx.commit()?;
+        Ok(stale.len())
+    }
+
     /// Upsert a pull request row.
     pub fn upsert_pull_request(
         &mut self,
@@ -461,5 +494,135 @@ fn kind_from_str(s: &str) -> SymbolKind {
         "interface" => SymbolKind::Interface,
         "const" => SymbolKind::Const,
         _ => SymbolKind::Module,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    /// A throwaway repo root under the OS temp dir, removed on drop.
+    ///
+    /// Deliberately not `tempfile`: CI builds `--locked`, so adding a
+    /// dev-dependency means regenerating `Cargo.lock` in the same change.
+    struct TempRepo(PathBuf);
+
+    impl TempRepo {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "engram-store-test-{}-{}",
+                std::process::id(),
+                COUNTER.fetch_add(1, Ordering::SeqCst)
+            ));
+            std::fs::create_dir_all(&path).expect("create temp repo");
+            TempRepo(path)
+        }
+
+        fn store(&self) -> Store {
+            Store::open(&self.0).expect("open store")
+        }
+    }
+
+    impl Drop for TempRepo {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn file(path: &str) -> FileRecord {
+        FileRecord {
+            path: path.to_owned(),
+            language: Language::Rust,
+            size_bytes: 10,
+            is_test: false,
+        }
+    }
+
+    fn symbol(path: &str, name: &str) -> SymbolRecord {
+        SymbolRecord {
+            name: name.to_owned(),
+            kind: SymbolKind::Function,
+            path: path.to_owned(),
+            start_line: 1,
+            signature: format!("fn {name}()"),
+        }
+    }
+
+    #[test]
+    fn prune_removes_every_trace_of_a_deleted_file() {
+        let repo = TempRepo::new();
+        let mut store = repo.store();
+        store
+            .upsert_files(&[file("kept.rs"), file("gone.rs")])
+            .unwrap();
+        store
+            .replace_symbols_for_file("kept.rs", &[symbol("kept.rs", "keeper")])
+            .unwrap();
+        store
+            .replace_symbols_for_file("gone.rs", &[symbol("gone.rs", "ghost")])
+            .unwrap();
+        store
+            .replace_imports_for_file("gone.rs", &["utils/retry".to_owned()])
+            .unwrap();
+
+        let keep = HashSet::from(["kept.rs".to_owned()]);
+        assert_eq!(store.prune_missing_files(&keep).unwrap(), 1);
+
+        let paths: Vec<String> = store
+            .all_files()
+            .unwrap()
+            .into_iter()
+            .map(|f| f.path)
+            .collect();
+        assert_eq!(paths, vec!["kept.rs".to_owned()]);
+        // The deleted file must stop being citable as evidence, which means
+        // its symbols and import edges have to go too, not just its row.
+        assert!(store.symbols_matching("ghost", 5).unwrap().is_empty());
+        assert_eq!(store.symbols_matching("keeper", 5).unwrap().len(), 1);
+        assert!(store.all_imports().unwrap().is_empty());
+    }
+
+    #[test]
+    fn prune_is_a_noop_when_every_file_is_still_present() {
+        let repo = TempRepo::new();
+        let mut store = repo.store();
+        store.upsert_files(&[file("a.rs"), file("b.rs")]).unwrap();
+
+        let keep = HashSet::from(["a.rs".to_owned(), "b.rs".to_owned()]);
+        assert_eq!(store.prune_missing_files(&keep).unwrap(), 0);
+        assert_eq!(store.all_files().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn prune_leaves_review_history_alone() {
+        // Review comments are historical evidence about a path. A file being
+        // deleted does not make what reviewers said about it untrue, and
+        // get_review_history takes a raw path, not an indexed file.
+        let repo = TempRepo::new();
+        let mut store = repo.store();
+        store.upsert_files(&[file("gone.rs")]).unwrap();
+        store
+            .upsert_pull_request(1, "old change", "", true, "alice")
+            .unwrap();
+        store
+            .replace_review_comments_for_pr(
+                1,
+                &[(
+                    "gone.rs".to_owned(),
+                    Some(4),
+                    "this needs a guard".to_owned(),
+                    "bob".to_owned(),
+                )],
+            )
+            .unwrap();
+
+        assert_eq!(store.prune_missing_files(&HashSet::new()).unwrap(), 1);
+        assert_eq!(store.count_review_comments().unwrap(), 1);
+        assert_eq!(store.review_comments_for_path("gone.rs").unwrap().len(), 1);
     }
 }
