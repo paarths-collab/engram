@@ -243,6 +243,7 @@ impl Engine {
             f_path,
             f_body,
             docs,
+            chunks,
             by_path,
             embedder,
             config: WeightsConfig::load(repo_root),
