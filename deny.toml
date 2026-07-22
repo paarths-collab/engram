@@ -24,8 +24,27 @@ allow = [
     "Unicode-DFS-2016",
     "BSL-1.0",
     "OpenSSL",
+    # webpki-roots ships Mozilla's CA certificate bundle. CDLA-Permissive-2.0
+    # is a data licence, not a code licence, which fits: the crate is a dataset
+    # of root certificates. It is permissive, imposes no copyleft, and requires
+    # no attribution on downstream distribution.
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.9
+# The list above is forward-looking. An allowed licence that no current
+# dependency uses is not a problem worth failing or warning on.
+unused-allowed-license = "allow"
+
+# ring publishes no SPDX expression in its Cargo.toml, so cargo-deny correctly
+# reports it as unlicensed rather than guessing. It is not actually unlicensed:
+# its code is a mix of its own ISC-style licence and BoringSSL-derived code
+# under the OpenSSL and MIT licences, all of which are permissive and already
+# allowed above. The file hash pins what we read, so a future version that
+# changes its licensing fails the build instead of inheriting this clarification.
+[[licenses.clarify]]
+crate = "ring"
+expression = "MIT AND ISC AND OpenSSL"
+license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
 
 [bans]
 # Duplicate major versions of the same crate bloat the binary and usually mean
@@ -33,6 +52,10 @@ confidence-threshold = 0.9
 # transitive deps.
 multiple-versions = "warn"
 wildcards = "deny"
+# Intra-workspace crates are declared as `{ path = "../domain" }` with no
+# version, which reads as a wildcard. That is the normal shape for a workspace
+# and carries none of the supply-chain risk the wildcard rule exists to catch.
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"
