@@ -7,6 +7,11 @@ use rusqlite::{params, Connection};
 use std::collections::HashMap;
 use std::path::Path;
 
+/// Identity of one embedded chunk: the file, and the one-based line its span
+/// starts at. `0` is reserved for the whole-file fallback used when a file has
+/// no extracted symbols.
+pub type ChunkKey = (String, usize);
+
 pub struct Store {
     pub conn: Connection,
 }
@@ -57,6 +62,18 @@ impl Store {
                 hash TEXT NOT NULL,
                 data BLOB NOT NULL
             );
+            -- One embedding per symbol span, so retrieval can match a
+            -- definition rather than the head of the file containing it.
+            -- start_line 0 is the whole-file fallback for files with no
+            -- extracted symbols; real symbols are one-based.
+            CREATE TABLE IF NOT EXISTS chunk_vectors (
+                path TEXT NOT NULL,
+                start_line INTEGER NOT NULL,
+                hash TEXT NOT NULL,
+                data BLOB NOT NULL,
+                PRIMARY KEY (path, start_line)
+            );
+            CREATE INDEX IF NOT EXISTS idx_chunk_vectors_path ON chunk_vectors(path);
             CREATE TABLE IF NOT EXISTS pull_requests (
                 number INTEGER PRIMARY KEY,
                 title TEXT NOT NULL,
@@ -151,10 +168,73 @@ impl Store {
         Ok(())
     }
 
-    /// Invalidate one file's cached embedding so it re-embeds on the next build.
+    /// Invalidate one file's cached embeddings so they re-embed on the next
+    /// build. Clears the chunk vectors too: the file's symbols have moved, so
+    /// every span keyed to an old line number is stale.
     pub fn invalidate_vector(&mut self, path: &str) -> Result<()> {
         self.conn
             .execute("DELETE FROM vectors WHERE path = ?1", params![path])?;
+        self.conn
+            .execute("DELETE FROM chunk_vectors WHERE path = ?1", params![path])?;
+        Ok(())
+    }
+
+    /// Load every cached chunk embedding as `(path, start_line) -> (hash, bytes)`.
+    pub fn load_chunk_vectors(&self) -> Result<HashMap<ChunkKey, (String, Vec<u8>)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path, start_line, hash, data FROM chunk_vectors")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                (r.get::<_, String>(0)?, r.get::<_, i64>(1)? as usize),
+                (r.get::<_, String>(2)?, r.get::<_, Vec<u8>>(3)?),
+            ))
+        })?;
+        Ok(rows.filter_map(Result::ok).collect())
+    }
+
+    /// Upsert chunk embeddings: `(path, start_line, content_hash, raw_bytes)`.
+    pub fn upsert_chunk_vectors(
+        &mut self,
+        rows: &[(String, usize, String, Vec<u8>)],
+    ) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        for (path, start_line, hash, data) in rows {
+            tx.execute(
+                "INSERT INTO chunk_vectors (path, start_line, hash, data) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(path, start_line) DO UPDATE SET hash=?3, data=?4",
+                params![path, *start_line as i64, hash, data],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Drop cached chunk embeddings whose span no longer exists. Editing a file
+    /// moves its symbols, so stale spans accumulate faster than stale files do.
+    pub fn prune_chunk_vectors(
+        &mut self,
+        keep: &std::collections::HashSet<ChunkKey>,
+    ) -> Result<()> {
+        let existing: Vec<ChunkKey> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT path, start_line FROM chunk_vectors")?;
+            let rows = stmt.query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as usize))
+            })?;
+            rows.filter_map(Result::ok).collect()
+        };
+        let tx = self.conn.transaction()?;
+        for key in existing {
+            if !keep.contains(&key) {
+                tx.execute(
+                    "DELETE FROM chunk_vectors WHERE path = ?1 AND start_line = ?2",
+                    params![key.0, key.1 as i64],
+                )?;
+            }
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -203,6 +283,7 @@ impl Store {
             tx.execute("DELETE FROM files WHERE path = ?1", params![path])?;
             tx.execute("DELETE FROM symbols WHERE path = ?1", params![path])?;
             tx.execute("DELETE FROM file_imports WHERE path = ?1", params![path])?;
+            tx.execute("DELETE FROM chunk_vectors WHERE path = ?1", params![path])?;
         }
         tx.commit()?;
         Ok(stale.len())
@@ -618,6 +699,94 @@ mod tests {
         assert!(store.symbols_matching("ghost", 5).unwrap().is_empty());
         assert_eq!(store.symbols_matching("keeper", 5).unwrap().len(), 1);
         assert!(store.all_imports().unwrap().is_empty());
+    }
+
+    #[test]
+    fn chunk_vectors_round_trip_and_upsert_in_place() {
+        let repo = TempRepo::new();
+        let mut store = repo.store();
+        store
+            .upsert_chunk_vectors(&[
+                ("a.rs".to_owned(), 1, "h1".to_owned(), vec![1u8, 2]),
+                ("a.rs".to_owned(), 40, "h2".to_owned(), vec![3u8]),
+            ])
+            .unwrap();
+
+        let loaded = store.load_chunk_vectors().unwrap();
+        assert_eq!(loaded.len(), 2, "same path, two spans, two rows");
+        assert_eq!(
+            loaded.get(&("a.rs".to_owned(), 40)),
+            Some(&("h2".to_owned(), vec![3u8]))
+        );
+
+        // Re-embedding the same span replaces it rather than duplicating.
+        store
+            .upsert_chunk_vectors(&[("a.rs".to_owned(), 1, "h1b".to_owned(), vec![9u8])])
+            .unwrap();
+        let loaded = store.load_chunk_vectors().unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(
+            loaded.get(&("a.rs".to_owned(), 1)),
+            Some(&("h1b".to_owned(), vec![9u8]))
+        );
+    }
+
+    #[test]
+    fn prune_chunk_vectors_drops_spans_that_moved() {
+        let repo = TempRepo::new();
+        let mut store = repo.store();
+        store
+            .upsert_chunk_vectors(&[
+                ("a.rs".to_owned(), 1, "h".to_owned(), vec![1u8]),
+                ("a.rs".to_owned(), 40, "h".to_owned(), vec![2u8]),
+                ("gone.rs".to_owned(), 1, "h".to_owned(), vec![3u8]),
+            ])
+            .unwrap();
+
+        // The symbol at line 40 moved, and gone.rs was deleted.
+        let keep = HashSet::from([("a.rs".to_owned(), 1)]);
+        store.prune_chunk_vectors(&keep).unwrap();
+
+        let loaded = store.load_chunk_vectors().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded.contains_key(&("a.rs".to_owned(), 1)));
+    }
+
+    #[test]
+    fn invalidating_a_file_clears_its_chunk_vectors_too() {
+        // A file's symbols move when it is edited, so every span keyed to an
+        // old line number is stale, not just the file-level vector.
+        let repo = TempRepo::new();
+        let mut store = repo.store();
+        store
+            .upsert_vectors(&[("a.rs".to_owned(), "h".to_owned(), vec![1u8])])
+            .unwrap();
+        store
+            .upsert_chunk_vectors(&[
+                ("a.rs".to_owned(), 1, "h".to_owned(), vec![1u8]),
+                ("b.rs".to_owned(), 1, "h".to_owned(), vec![2u8]),
+            ])
+            .unwrap();
+
+        store.invalidate_vector("a.rs").unwrap();
+
+        assert!(store.load_vectors().unwrap().is_empty());
+        let chunks = store.load_chunk_vectors().unwrap();
+        assert_eq!(chunks.len(), 1, "only a.rs chunks are cleared");
+        assert!(chunks.contains_key(&("b.rs".to_owned(), 1)));
+    }
+
+    #[test]
+    fn pruning_a_deleted_file_takes_its_chunk_vectors() {
+        let repo = TempRepo::new();
+        let mut store = repo.store();
+        store.upsert_files(&[file("gone.rs")]).unwrap();
+        store
+            .upsert_chunk_vectors(&[("gone.rs".to_owned(), 1, "h".to_owned(), vec![1u8])])
+            .unwrap();
+
+        assert_eq!(store.prune_missing_files(&HashSet::new()).unwrap(), 1);
+        assert!(store.load_chunk_vectors().unwrap().is_empty());
     }
 
     #[test]
