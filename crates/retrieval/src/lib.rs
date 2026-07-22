@@ -454,8 +454,10 @@ impl Engine {
             let (title, symbol, snippet) = match matched_span {
                 Some(chunk) => {
                     let name = chunk.symbol.clone().unwrap_or_default();
+                    // path:line, so the agent can open the definition directly
+                    // instead of searching the file for the name again.
                     (
-                        format!("{} in {}", name, d.path),
+                        format!("{} in {}:{}", name, d.path, chunk.start_line),
                         Some(name),
                         Some(chunk.text.clone()),
                     )
