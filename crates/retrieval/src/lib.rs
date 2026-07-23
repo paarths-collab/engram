@@ -108,6 +108,31 @@ fn embed_or_reuse(
     (embedder.embed(text), false)
 }
 
+/// Whole identifiers in a query, underscores and dots preserved, lowercased.
+///
+/// The fusion tokenizer splits on every non-alphanumeric, so `merge_dicts`
+/// and `model.name` fragment into pieces and the identifier a bug report names
+/// is never searched as a name. This keeps them whole for exact symbol lookup.
+/// A dotted path also yields its last segment, since `utils.merge_dicts` names
+/// the symbol `merge_dicts`.
+fn query_identifiers(query: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for raw in query.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.')) {
+        for candidate in [raw, raw.rsplit('.').next().unwrap_or(raw)] {
+            let ident = candidate.trim_matches('.').to_lowercase();
+            // Require an underscore or mixed case to look identifier-shaped and
+            // be at least 3 chars; a bare English word is not a symbol lookup.
+            let identifier_shaped =
+                ident.contains('_') || candidate.chars().any(|c| c.is_uppercase());
+            if ident.len() >= 3 && identifier_shaped && seen.insert(ident.clone()) {
+                out.push(ident);
+            }
+        }
+    }
+    out
+}
+
 /// Plan a file's chunks: the head, then one span per extracted symbol.
 ///
 /// The head chunk always exists. A file with no chunks could never be returned
@@ -489,7 +514,36 @@ impl Engine {
             });
         }
 
-        // symbol-name exact hits that BM25/vector may have missed
+        // Whole-identifier hits. Splitting on non-alphanumerics turns
+        // `merge_dicts` into `merge` + `dicts`, so a query that names a symbol
+        // never searches for it by name. Recover the identifiers, underscores
+        // and dots intact, and look each up as an exact symbol name.
+        //
+        // An exact identifier match is the strongest signal retrieval has: the
+        // caller typed the symbol's name. It has to outrank fusion, so it is
+        // scored above the current top rather than at the flat symbol_exact
+        // weight (which the langchain miss showed sits *below* fused noise).
+        let top_fused = packets.iter().map(|p| p.score).fold(0.0_f32, f32::max);
+        let exact_score = top_fused + self.config.weights.symbol_exact;
+        for ident in query_identifiers(query) {
+            for s in store.symbols_exact(&ident, 5)? {
+                if packets.iter().any(|p| p.symbol.as_deref() == Some(&s.name)) {
+                    continue;
+                }
+                packets.push(EvidencePacket {
+                    id: format!("ev_exact_{}", s.name.to_lowercase()),
+                    kind: EvidenceKind::Symbol,
+                    title: format!("{} in {}:{}", s.name, s.path, s.start_line),
+                    path: s.path.clone(),
+                    symbol: Some(s.name.clone()),
+                    snippet: Some(s.signature.clone()),
+                    score: exact_score,
+                    signals: vec!["symbol_exact".into()],
+                });
+            }
+        }
+
+        // Weaker substring hits that BM25/vector may have missed entirely.
         for t in &q_tokens {
             for s in store.symbols_matching(t, 3)? {
                 if packets.iter().any(|p| p.symbol.as_deref() == Some(&s.name)) {
@@ -507,6 +561,16 @@ impl Engine {
                 });
             }
         }
+
+        // Re-rank before cutting. The symbol hits above are appended, not
+        // inserted in score order, so without this an exact match sits below
+        // whatever fusion put in the first top_k slots and gets truncated away
+        // — which is exactly how the langchain `merge_dicts` miss happened.
+        packets.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         packets.truncate(top_k + 3);
         Ok(packets)
     }
@@ -708,6 +772,28 @@ fn second() {
             end_line,
             signature: format!("fn {name}()"),
         }
+    }
+
+    #[test]
+    fn query_identifiers_keeps_whole_symbol_names() {
+        // The exact failure from langchain #38366: the query names merge_dicts,
+        // and the tokenizer used to shatter it into merge + dicts.
+        let ids = query_identifiers("merge_dicts doubles model_name and finish_reason");
+        assert!(ids.contains(&"merge_dicts".to_owned()), "{ids:?}");
+        assert!(ids.contains(&"model_name".to_owned()), "{ids:?}");
+    }
+
+    #[test]
+    fn query_identifiers_skips_plain_english_words() {
+        // Bare words are not symbol lookups; only identifier-shaped tokens are.
+        let ids = query_identifiers("fix the retry logic in the parser");
+        assert!(ids.is_empty(), "{ids:?}");
+    }
+
+    #[test]
+    fn query_identifiers_recovers_a_dotted_tail() {
+        let ids = query_identifiers("utils.merge_dicts is wrong");
+        assert!(ids.contains(&"merge_dicts".to_owned()), "{ids:?}");
     }
 
     #[test]

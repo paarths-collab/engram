@@ -544,6 +544,22 @@ impl Store {
         Ok(rows.filter_map(Result::ok).collect())
     }
 
+    /// Symbols whose name equals `needle` exactly (case-insensitive).
+    ///
+    /// `symbols_matching` is a substring `LIKE` search, so a query naming
+    /// `merge_dicts` competes with `merge_content`, `merge_configs`, and every
+    /// other name containing "merge", and the one the caller actually named can
+    /// lose. When a query contains a whole identifier that IS a symbol name,
+    /// that is the strongest signal retrieval has, and it must not be diluted.
+    pub fn symbols_exact(&self, needle: &str, limit: usize) -> Result<Vec<SymbolRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT name, kind, path, start_line, end_line, signature FROM symbols
+             WHERE name = ?1 COLLATE NOCASE LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![needle, limit as i64], row_to_symbol)?;
+        Ok(rows.filter_map(Result::ok).collect())
+    }
+
     /// Every extracted symbol for a file, in source order. Retrieval uses the
     /// spans to embed and quote definitions rather than the head of the file.
     pub fn symbols_for_path(&self, path: &str) -> Result<Vec<SymbolRecord>> {
