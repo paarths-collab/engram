@@ -87,12 +87,23 @@ impl ToolHandler for Engram {
     fn list_tools(&self) -> Value {
         json!({ "tools": [
             {
-                "name": "get_task_context",
-                "description": "ALWAYS call this FIRST, before planning or implementing any coding task. Returns evidence packets about this repository: existing code relevant to the task, symbols to reuse instead of reimplementing, related tests, and files matched by hybrid (BM25+vector+symbol) retrieval. Using this prevents duplicate implementations and wrong assumptions about the codebase.",
+                "name": "search_context",
+                "description": "ALWAYS call this FIRST, before planning or implementing any coding task. Returns ranked, evidence-backed context about this repository: existing code relevant to the query, symbols to reuse instead of reimplementing, related tests, and matched files (hybrid BM25+vector+symbol retrieval), plus any past reviewer comments on the matched files. Using this prevents duplicate implementations and wrong assumptions about the codebase.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "task": { "type": "string", "description": "The task description in natural language, e.g. 'add retry logic to billing webhooks'" }
+                        "query": { "type": "string", "description": "What you are looking for, in natural language, e.g. 'add retry logic to billing webhooks'" }
+                    },
+                    "required": ["query"]
+                }
+            },
+            {
+                "name": "get_task_context",
+                "description": "DEPRECATED alias of search_context (use `query` instead of `task`). Kept for compatibility; will be removed in a future release.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "task": { "type": "string", "description": "The task description in natural language" }
                     },
                     "required": ["task"]
                 }
@@ -109,29 +120,56 @@ impl ToolHandler for Engram {
                 }
             },
             {
-                "name": "predict_impact",
-                "description": "Call this BEFORE modifying files. Predicts which files a task will likely affect: direct matches plus files that historically change together (git co-change analysis) and tests likely to be affected. Touching files outside this set should be justified explicitly.",
+                "name": "expand_connections",
+                "description": "Call this when you already know which file(s) you are changing (e.g. the current diff) and want everything CONNECTED to them, with zero guessing. Takes exact file paths as anchors and returns only files linked by hard, deterministic facts already recorded in the store: the co-change graph (files that historically changed together in the same commits) and the import graph (files that statically import an anchor, up to 2 hops). Every result traces to a concrete recorded edge — this is fact-finding, not prediction. Prefer this over predict_impact whenever you have concrete anchor files.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "task": { "type": "string", "description": "The task description" }
+                        "paths": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Repo-relative paths of files you are changing or about to change, e.g. ['src/billing/cancel.rs']"
+                        }
                     },
-                    "required": ["task"]
+                    "required": ["paths"]
+                }
+            },
+            {
+                "name": "explain_connection",
+                "description": "Call this to see WHY two files are connected, from recorded facts only. Returns the concrete edges linking them — import edges (with direction) and historical co-change — each with a weight, or an empty list if no recorded connection exists. Never a guess.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "source": { "type": "string", "description": "Repo-relative path of the first file" },
+                        "target": { "type": "string", "description": "Repo-relative path of the second file" }
+                    },
+                    "required": ["source", "target"]
                 }
             },
             {
                 "name": "find_connected_files",
-                "description": "Call this when you already know which file(s) you are changing (e.g. the current diff) and want everything CONNECTED to them, with zero guessing. Unlike predict_impact (which starts from a fuzzy task description), this takes exact file paths as anchors and returns only files linked by hard, deterministic facts already recorded in the store: the co-change graph (files that historically changed together in the same commits) and the import graph (files that statically import an anchor, up to 2 hops). Every result traces to a concrete recorded edge — this is fact-finding, not prediction. Prefer this over predict_impact whenever you have concrete anchor files.",
+                "description": "DEPRECATED alias of expand_connections (use `paths` instead of `files`). Kept for compatibility; will be removed in a future release.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "files": {
                             "type": "array",
                             "items": { "type": "string" },
-                            "description": "Repo-relative paths of files you are changing or about to change, e.g. ['src/billing/cancel.rs']"
+                            "description": "Repo-relative paths of files you are changing"
                         }
                     },
                     "required": ["files"]
+                }
+            },
+            {
+                "name": "predict_impact",
+                "description": "EXPERIMENTAL. Predicts which files a fuzzy natural-language task will likely affect (text retrieval + co-change/import expansion). Prefer expand_connections when you have concrete anchor files — prediction from vague tasks is not yet reliable.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "task": { "type": "string", "description": "The task description" }
+                    },
+                    "required": ["task"]
                 }
             },
             {
@@ -165,13 +203,17 @@ impl ToolHandler for Engram {
 
     fn call_tool(&mut self, name: &str, args: &Value) -> Result<Value, String> {
         match name {
-            "get_task_context" => {
+            "search_context" | "get_task_context" => {
                 self.ensure_engine()?;
                 let engine = self.engine.as_mut().unwrap();
                 let store = self.store.as_mut().unwrap();
-                let task = args.get("task").and_then(|v| v.as_str()).unwrap_or("");
+                let task = args
+                    .get("query")
+                    .or_else(|| args.get("task"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 if task.is_empty() {
-                    return Err("missing required argument: task".into());
+                    return Err("missing required argument: query".into());
                 }
                 let packets = engine.search(store, task, 8).map_err(|e| e.to_string())?;
                 // past_reviews: raw reviewer comments on the files retrieval matched.
@@ -221,12 +263,13 @@ impl ToolHandler for Engram {
                     .map_err(|e| e.to_string())?;
                 Ok(serde_json::to_value(impact).map_err(|e| e.to_string())?)
             }
-            "find_connected_files" => {
+            "expand_connections" | "find_connected_files" => {
                 self.ensure_engine()?;
                 let engine = self.engine.as_mut().unwrap();
                 let store = self.store.as_mut().unwrap();
                 let files: Vec<String> = args
-                    .get("files")
+                    .get("paths")
+                    .or_else(|| args.get("files"))
                     .and_then(|v| v.as_array())
                     .map(|a| {
                         a.iter()
@@ -235,12 +278,31 @@ impl ToolHandler for Engram {
                     })
                     .unwrap_or_default();
                 if files.is_empty() {
-                    return Err("missing required argument: files (array of paths)".into());
+                    return Err("missing required argument: paths (array of file paths)".into());
                 }
                 let impact = engine
                     .impact_from_files(store, &files)
                     .map_err(|e| e.to_string())?;
                 Ok(serde_json::to_value(impact).map_err(|e| e.to_string())?)
+            }
+            "explain_connection" => {
+                self.ensure_engine()?;
+                let engine = self.engine.as_mut().unwrap();
+                let store = self.store.as_mut().unwrap();
+                let source = args.get("source").and_then(|v| v.as_str()).unwrap_or("");
+                let target = args.get("target").and_then(|v| v.as_str()).unwrap_or("");
+                if source.is_empty() || target.is_empty() {
+                    return Err("missing required arguments: source and target (file paths)".into());
+                }
+                let reasons = engine
+                    .explain_connection(store, source, target)
+                    .map_err(|e| e.to_string())?;
+                Ok(json!({
+                    "source": source,
+                    "target": target,
+                    "connected": !reasons.is_empty(),
+                    "reasons": reasons,
+                }))
             }
             "get_verification_plan" => {
                 self.ensure_store()?;
