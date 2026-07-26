@@ -432,8 +432,13 @@ fn ingest_github(repo: &std::path::Path, limit: usize) -> Result<(), String> {
     let mut store = Store::open(repo).map_err(|e| format!("store: {e}"))?;
     let stats = gh::ingest(&mut store, &client, limit).map_err(|e| e.to_string())?;
     eprintln!(
-        "[engram] ingested: {} PRs, {} changed files, {} review comments",
-        stats.pull_requests, stats.files, stats.review_comments
+        "[engram] ingested: {} PRs, {} changed files ({} without a diff), \
+         {} commits, {} review comments",
+        stats.pull_requests,
+        stats.files,
+        stats.files_without_patch,
+        stats.commits,
+        stats.review_comments
     );
     Ok(())
 }

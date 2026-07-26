@@ -61,7 +61,11 @@ Before implementing any task:
 - Vector store persisted to SQLite (content-hash keyed; unchanged files skip re-embedding)
 - Incremental reindex: file-watcher (save → reparse just that file) + git-HEAD watcher
   (new commit → refresh co-change graph), both on background threads (crates/mcp-server/watcher.rs)
-- GitHub PR ingestion: merged PRs, changed files, review comments (crates/connectors-github)
+- GitHub PR ingestion: PRs (with base/head SHAs and timestamps), changed files
+  **with their diff hunks**, the PR's commit list in order, and review comments
+  with the hunk and timestamp they were left against (crates/connectors-github).
+  The timestamps are what let a push be attributed to the review comment that
+  prompted it — the basis for mining a repo's house rules from its own history.
 - Benchmark harness: file-prediction Recall@k and leakage-free connection-recovery
   eval (crates/evals) — see docs/benchmarks.md
 - SQLite store in .engram/engram.db; background indexing on server start

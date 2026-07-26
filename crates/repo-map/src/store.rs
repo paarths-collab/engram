@@ -2,7 +2,10 @@
 //! Tracks which files are extracted to Tier-1 so retrieval can lazily extract on miss.
 
 use anyhow::Result;
-use engram_domain::{CoChange, FileRecord, Language, ReviewComment, SymbolKind, SymbolRecord};
+use engram_domain::{
+    CoChange, FileRecord, IngestedComment, Language, PrCommit, PrFileChange, ReviewComment,
+    SymbolKind, SymbolRecord,
+};
 use rusqlite::{params, Connection};
 use std::collections::HashMap;
 use std::path::Path;
@@ -79,28 +82,67 @@ impl Store {
                 title TEXT NOT NULL,
                 body TEXT NOT NULL,
                 merged INTEGER NOT NULL,
-                author TEXT NOT NULL
+                author TEXT NOT NULL,
+                base_sha TEXT NOT NULL DEFAULT '',
+                head_sha TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT '',
+                merged_at TEXT NOT NULL DEFAULT ''
             );
+            -- `patch` holds the unified-diff hunks. A PR without it is just a
+            -- list of filenames: no before/after, so no correction can be
+            -- reconstructed from it.
             CREATE TABLE IF NOT EXISTS pr_files (
                 pr_number INTEGER NOT NULL,
                 path TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT '',
+                additions INTEGER NOT NULL DEFAULT 0,
+                deletions INTEGER NOT NULL DEFAULT 0,
+                patch TEXT NOT NULL DEFAULT '',
                 PRIMARY KEY (pr_number, path)
             );
             CREATE INDEX IF NOT EXISTS idx_pr_files_path ON pr_files(path);
+            -- Commits in PR order. Ordering against review_comments.created_at
+            -- is what attributes a push to the review comment that prompted it.
+            CREATE TABLE IF NOT EXISTS pr_commits (
+                pr_number INTEGER NOT NULL,
+                sha TEXT NOT NULL,
+                message TEXT NOT NULL DEFAULT '',
+                author TEXT NOT NULL DEFAULT '',
+                authored_at TEXT NOT NULL DEFAULT '',
+                ordinal INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (pr_number, sha)
+            );
+            CREATE INDEX IF NOT EXISTS idx_pr_commits_pr ON pr_commits(pr_number);
             CREATE TABLE IF NOT EXISTS review_comments (
                 id INTEGER PRIMARY KEY,
                 pr_number INTEGER NOT NULL,
                 path TEXT NOT NULL,
                 line INTEGER,
                 body TEXT NOT NULL,
-                author TEXT NOT NULL
+                author TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT '',
+                diff_hunk TEXT NOT NULL DEFAULT '',
+                commit_id TEXT NOT NULL DEFAULT '',
+                in_reply_to INTEGER
             );
             CREATE INDEX IF NOT EXISTS idx_review_comments_path ON review_comments(path);
+            CREATE INDEX IF NOT EXISTS idx_review_comments_pr ON review_comments(pr_number);
             "#,
         )?;
-        // Migration for DBs created before recency tracking: add the column if
-        // it is missing. Fails harmlessly ("duplicate column") on fresh DBs.
+        Self::migrate(&conn);
+        Ok(Store { conn })
+    }
+
+    /// Bring a database created by an older Engram up to the current schema.
+    ///
+    /// Every statement here is additive and idempotent: `ALTER TABLE ... ADD
+    /// COLUMN` fails with "duplicate column" on a DB that already has it, which
+    /// is why the results are deliberately discarded. `CREATE TABLE IF NOT
+    /// EXISTS` in [`Store::open`] covers new tables, so only columns need this.
+    fn migrate(conn: &Connection) {
+        // Predates recency tracking.
         let _ = conn.execute("ALTER TABLE files ADD COLUMN last_commit_ts INTEGER", []);
+
         // Symbols predating span tracking have no end_line, and a stored zero
         // is indistinguishable from a real span. The ALTER succeeds exactly
         // once — on a DB that predates the column — so use that as the signal
@@ -115,7 +157,26 @@ impl Store {
             let _ = conn.execute("DELETE FROM symbols", []);
             let _ = conn.execute("UPDATE files SET tier1_done = 0", []);
         }
-        Ok(Store { conn })
+
+        // PR ingestion depth: diffs, SHAs, and timestamps. Rows ingested before
+        // these existed keep their filenames but carry empty patches, so a
+        // re-ingest is needed to mine corrections from an older database.
+        for stmt in [
+            "ALTER TABLE pull_requests ADD COLUMN base_sha TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE pull_requests ADD COLUMN head_sha TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE pull_requests ADD COLUMN created_at TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE pull_requests ADD COLUMN merged_at TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE pr_files ADD COLUMN status TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE pr_files ADD COLUMN additions INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE pr_files ADD COLUMN deletions INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE pr_files ADD COLUMN patch TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE review_comments ADD COLUMN created_at TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE review_comments ADD COLUMN diff_hunk TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE review_comments ADD COLUMN commit_id TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE review_comments ADD COLUMN in_reply_to INTEGER",
+        ] {
+            let _ = conn.execute(stmt, []);
+        }
     }
 
     /// Store the last-commit unix timestamp for files touched in git history.
@@ -290,6 +351,11 @@ impl Store {
     }
 
     /// Upsert a pull request row.
+    ///
+    /// `base_sha`/`head_sha` bound the PR's diff; `created_at`/`merged_at`
+    /// bound it in time. Both are needed to reconstruct the state a reviewer
+    /// was looking at.
+    #[allow(clippy::too_many_arguments)]
     pub fn upsert_pull_request(
         &mut self,
         number: i64,
@@ -297,53 +363,152 @@ impl Store {
         body: &str,
         merged: bool,
         author: &str,
+        base_sha: &str,
+        head_sha: &str,
+        created_at: &str,
+        merged_at: &str,
     ) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO pull_requests (number, title, body, merged, author)
-             VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(number) DO UPDATE SET title=?2, body=?3, merged=?4, author=?5",
-            params![number, title, body, merged as i64, author],
+            "INSERT INTO pull_requests
+                 (number, title, body, merged, author, base_sha, head_sha, created_at, merged_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(number) DO UPDATE SET title=?2, body=?3, merged=?4, author=?5,
+                 base_sha=?6, head_sha=?7, created_at=?8, merged_at=?9",
+            params![
+                number,
+                title,
+                body,
+                merged as i64,
+                author,
+                base_sha,
+                head_sha,
+                created_at,
+                merged_at
+            ],
         )?;
         Ok(())
     }
 
-    /// Replace the changed-file list recorded for a PR.
-    pub fn replace_pr_files(&mut self, pr_number: i64, paths: &[String]) -> Result<()> {
+    /// Replace the changed files recorded for a PR, including their diffs.
+    pub fn replace_pr_files(&mut self, pr_number: i64, files: &[PrFileChange]) -> Result<()> {
         let tx = self.conn.transaction()?;
         tx.execute(
             "DELETE FROM pr_files WHERE pr_number = ?1",
             params![pr_number],
         )?;
-        for path in paths {
+        for f in files {
             tx.execute(
-                "INSERT OR IGNORE INTO pr_files (pr_number, path) VALUES (?1, ?2)",
-                params![pr_number, path],
+                "INSERT OR REPLACE INTO pr_files
+                     (pr_number, path, status, additions, deletions, patch)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    pr_number,
+                    f.path,
+                    f.status,
+                    f.additions,
+                    f.deletions,
+                    f.patch
+                ],
             )?;
         }
         tx.commit()?;
         Ok(())
     }
 
-    /// Replace the review comments recorded for a PR. `(path, line, body, author)`.
+    /// Replace the commit list recorded for a PR.
+    pub fn replace_pr_commits(&mut self, pr_number: i64, commits: &[PrCommit]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM pr_commits WHERE pr_number = ?1",
+            params![pr_number],
+        )?;
+        for c in commits {
+            tx.execute(
+                "INSERT OR REPLACE INTO pr_commits
+                     (pr_number, sha, message, author, authored_at, ordinal)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    pr_number,
+                    c.sha,
+                    c.message,
+                    c.author,
+                    c.authored_at,
+                    c.ordinal
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Replace the review comments recorded for a PR.
     pub fn replace_review_comments_for_pr(
         &mut self,
         pr_number: i64,
-        comments: &[(String, Option<i64>, String, String)],
+        comments: &[IngestedComment],
     ) -> Result<()> {
         let tx = self.conn.transaction()?;
         tx.execute(
             "DELETE FROM review_comments WHERE pr_number = ?1",
             params![pr_number],
         )?;
-        for (path, line, body, author) in comments {
+        for c in comments {
             tx.execute(
-                "INSERT INTO review_comments (pr_number, path, line, body, author)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![pr_number, path, line, body, author],
+                "INSERT INTO review_comments
+                     (pr_number, path, line, body, author, created_at, diff_hunk,
+                      commit_id, in_reply_to)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    pr_number,
+                    c.path,
+                    c.line,
+                    c.body,
+                    c.author,
+                    c.created_at,
+                    c.diff_hunk,
+                    c.commit_id,
+                    c.in_reply_to
+                ],
             )?;
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Commits recorded for a PR, in the order the API returned them.
+    pub fn pr_commits(&self, pr_number: i64) -> Result<Vec<PrCommit>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT sha, message, author, authored_at, ordinal
+             FROM pr_commits WHERE pr_number = ?1 ORDER BY ordinal",
+        )?;
+        let rows = stmt.query_map(params![pr_number], |r| {
+            Ok(PrCommit {
+                sha: r.get(0)?,
+                message: r.get(1)?,
+                author: r.get(2)?,
+                authored_at: r.get(3)?,
+                ordinal: r.get(4)?,
+            })
+        })?;
+        Ok(rows.filter_map(Result::ok).collect())
+    }
+
+    /// Changed files recorded for a PR, with their diffs.
+    pub fn pr_files(&self, pr_number: i64) -> Result<Vec<PrFileChange>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT path, status, additions, deletions, patch
+             FROM pr_files WHERE pr_number = ?1 ORDER BY path",
+        )?;
+        let rows = stmt.query_map(params![pr_number], |r| {
+            Ok(PrFileChange {
+                path: r.get(0)?,
+                status: r.get(1)?,
+                additions: r.get(2)?,
+                deletions: r.get(3)?,
+                patch: r.get(4)?,
+            })
+        })?;
+        Ok(rows.filter_map(Result::ok).collect())
     }
 
     pub fn count_pull_requests(&self) -> Result<i64> {
@@ -374,12 +539,14 @@ impl Store {
         p: &[&dyn rusqlite::ToSql],
     ) -> Result<Vec<ReviewComment>> {
         let sql = format!(
-            "SELECT rc.pr_number, pr.title, pr.merged, rc.path, rc.line, rc.body, rc.author
+            "SELECT rc.pr_number, pr.title, pr.merged, rc.path, rc.line, rc.body, rc.author,
+                    rc.created_at, rc.diff_hunk
              FROM review_comments rc JOIN pull_requests pr ON pr.number = rc.pr_number
              WHERE {where_clause}"
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(p, |r| {
+            let hunk: String = r.get(8)?;
             Ok(ReviewComment {
                 pr_number: r.get(0)?,
                 pr_title: r.get(1)?,
@@ -388,6 +555,8 @@ impl Store {
                 line: r.get(4)?,
                 body: r.get(5)?,
                 author: r.get(6)?,
+                created_at: r.get(7)?,
+                diff_hunk: (!hunk.is_empty()).then_some(hunk),
             })
         })?;
         Ok(rows.filter_map(Result::ok).collect())
@@ -860,22 +1029,163 @@ mod tests {
         let mut store = repo.store();
         store.upsert_files(&[file("gone.rs")]).unwrap();
         store
-            .upsert_pull_request(1, "old change", "", true, "alice")
+            .upsert_pull_request(1, "old change", "", true, "alice", "", "", "", "")
             .unwrap();
         store
             .replace_review_comments_for_pr(
                 1,
-                &[(
-                    "gone.rs".to_owned(),
-                    Some(4),
-                    "this needs a guard".to_owned(),
-                    "bob".to_owned(),
-                )],
+                &[IngestedComment {
+                    path: "gone.rs".to_owned(),
+                    line: Some(4),
+                    body: "this needs a guard".to_owned(),
+                    author: "bob".to_owned(),
+                    ..Default::default()
+                }],
             )
             .unwrap();
 
         assert_eq!(store.prune_missing_files(&HashSet::new()).unwrap(), 1);
         assert_eq!(store.count_review_comments().unwrap(), 1);
         assert_eq!(store.review_comments_for_path("gone.rs").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn round_trips_pr_diffs_commits_and_comment_timestamps() {
+        // The correction triple needs all three to survive storage: the diff
+        // (what changed), the commit order (when), and the comment timestamp
+        // (what prompted it).
+        let repo = TempRepo::new();
+        let mut store = repo.store();
+        store
+            .upsert_pull_request(
+                7,
+                "fix billing",
+                "body",
+                true,
+                "alice",
+                "base111",
+                "head222",
+                "2026-05-01T08:00:00Z",
+                "2026-05-02T08:00:00Z",
+            )
+            .unwrap();
+        store
+            .replace_pr_files(
+                7,
+                &[PrFileChange {
+                    path: "src/api.rs".to_owned(),
+                    status: "modified".to_owned(),
+                    additions: 3,
+                    deletions: 1,
+                    patch: "@@ -1 +1 @@\n-a.unwrap()\n+a.context(\"a\")?".to_owned(),
+                }],
+            )
+            .unwrap();
+        store
+            .replace_pr_commits(
+                7,
+                &[
+                    PrCommit {
+                        sha: "aaa".to_owned(),
+                        message: "first pass".to_owned(),
+                        author: "alice".to_owned(),
+                        authored_at: "2026-05-01T09:00:00Z".to_owned(),
+                        ordinal: 0,
+                    },
+                    PrCommit {
+                        sha: "bbb".to_owned(),
+                        message: "address review".to_owned(),
+                        author: "alice".to_owned(),
+                        authored_at: "2026-05-01T11:00:00Z".to_owned(),
+                        ordinal: 1,
+                    },
+                ],
+            )
+            .unwrap();
+        store
+            .replace_review_comments_for_pr(
+                7,
+                &[IngestedComment {
+                    path: "src/api.rs".to_owned(),
+                    line: Some(1),
+                    body: "wrap this in Context".to_owned(),
+                    author: "bob".to_owned(),
+                    created_at: "2026-05-01T10:00:00Z".to_owned(),
+                    diff_hunk: "@@ -1 +1 @@\n+a.unwrap()".to_owned(),
+                    commit_id: "aaa".to_owned(),
+                    in_reply_to: None,
+                }],
+            )
+            .unwrap();
+
+        let files = store.pr_files(7).unwrap();
+        assert_eq!(files.len(), 1);
+        assert!(files[0].patch.contains("context"));
+        assert_eq!(files[0].additions, 3);
+
+        let commits = store.pr_commits(7).unwrap();
+        assert_eq!(commits.len(), 2);
+        assert_eq!(commits[0].sha, "aaa", "commits come back in PR order");
+        assert_eq!(commits[1].message, "address review");
+
+        let comments = store.review_comments_for_path("src/api.rs").unwrap();
+        assert_eq!(comments[0].created_at, "2026-05-01T10:00:00Z");
+        assert!(comments[0].diff_hunk.as_deref().unwrap().contains("unwrap"));
+
+        // The whole point: the comment lands between the two commits, so the
+        // second commit is attributable to it.
+        assert!(comments[0].created_at > commits[0].authored_at);
+        assert!(comments[0].created_at < commits[1].authored_at);
+    }
+
+    #[test]
+    fn migrates_a_pre_ingestion_depth_database() {
+        // A DB written by an older Engram must keep working: open it with the
+        // old PR schema, then reopen and confirm the new columns are usable.
+        let repo = TempRepo::new();
+        {
+            // Create the DB, then rewrite the PR tables in their old shape.
+            drop(repo.store());
+            let conn = Connection::open(repo.0.join(".engram").join("engram.db")).unwrap();
+            conn.execute_batch(
+                "DROP TABLE IF EXISTS pull_requests;
+                 DROP TABLE IF EXISTS pr_files;
+                 DROP TABLE IF EXISTS review_comments;
+                 CREATE TABLE pull_requests (number INTEGER PRIMARY KEY, title TEXT NOT NULL,
+                     body TEXT NOT NULL, merged INTEGER NOT NULL, author TEXT NOT NULL);
+                 CREATE TABLE pr_files (pr_number INTEGER NOT NULL, path TEXT NOT NULL,
+                     PRIMARY KEY (pr_number, path));
+                 CREATE TABLE review_comments (id INTEGER PRIMARY KEY, pr_number INTEGER NOT NULL,
+                     path TEXT NOT NULL, line INTEGER, body TEXT NOT NULL, author TEXT NOT NULL);
+                 INSERT INTO pull_requests VALUES (1, 'old', '', 1, 'alice');
+                 INSERT INTO pr_files VALUES (1, 'legacy.rs');
+                 INSERT INTO review_comments VALUES (1, 1, 'legacy.rs', 2, 'old note', 'bob');",
+            )
+            .unwrap();
+        }
+
+        let mut store = Store::open(&repo.0).unwrap();
+        // Pre-existing rows survive, with empty defaults for the new columns.
+        let files = store.pr_files(1).unwrap();
+        assert_eq!(files[0].path, "legacy.rs");
+        assert_eq!(
+            files[0].patch, "",
+            "legacy rows have no diff until re-ingest"
+        );
+        let comments = store.review_comments_for_path("legacy.rs").unwrap();
+        assert_eq!(comments[0].body, "old note");
+        assert_eq!(comments[0].created_at, "");
+        // And the new columns actually work on the migrated tables.
+        store
+            .replace_pr_commits(
+                1,
+                &[PrCommit {
+                    sha: "aaa".to_owned(),
+                    ordinal: 0,
+                    ..Default::default()
+                }],
+            )
+            .unwrap();
+        assert_eq!(store.pr_commits(1).unwrap().len(), 1);
     }
 }
