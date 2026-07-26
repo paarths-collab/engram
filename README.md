@@ -3,9 +3,14 @@
 [![CI](https://github.com/paarths-collab/engram/actions/workflows/ci.yml/badge.svg)](https://github.com/paarths-collab/engram/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-Headless MCP server that gives coding agents (Claude Code, Cursor, Codex, any MCP client)
-persistent knowledge of a repository: what exists, what to reuse, what a task will affect.
-No LLM inside — the coding agent is the brain; Engram is the fast deterministic memory.
+**Engram is an evidence-based repository context and change-impact layer for coding agents.**
+It locates exact files, symbols, tests, and definitions; expands from known files/paths/symbols
+to connected code; explains every connection with the fact behind it; and returns compact,
+ranked context. No LLM inside — the coding agent is the brain; Engram is the fast deterministic
+memory. Works with Claude Code, Cursor, Codex, or any MCP client.
+
+The public API is frozen in [`docs/CONTRACT.md`](docs/CONTRACT.md). Canonical tools:
+`search_context(query)`, `expand_connections(paths)`, `explain_connection(source, target)`.
 
 ## Build
 ```bash

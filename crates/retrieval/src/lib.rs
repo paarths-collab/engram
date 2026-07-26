@@ -655,6 +655,62 @@ impl Engine {
         })
     }
 
+    /// Explain, from recorded facts only, why two files are connected. Returns a
+    /// list of structured reasons (import edge with direction/hops, or historical
+    /// co-change), each traceable to a concrete edge. Empty means "no recorded
+    /// connection found" — never a guess. Reuses the same deterministic
+    /// expansion as `impact_from_files`.
+    pub fn explain_connection(
+        &mut self,
+        store: &mut Store,
+        source: &str,
+        target: &str,
+    ) -> Result<Vec<serde_json::Value>> {
+        let mut reasons = Vec::new();
+        // Expansions of `source`: co-change is symmetric; import_expansions here
+        // are files that import `source`, so `target` appearing means target->source.
+        let from_source =
+            self.impact_from_files(store, std::slice::from_ref(&source.to_string()))?;
+        for sp in from_source
+            .cochange_expansions
+            .iter()
+            .filter(|p| p.path == target)
+        {
+            reasons.push(serde_json::json!({
+                "type": "historical_cochange",
+                "detail": sp.reason,
+                "weight": sp.confidence,
+            }));
+        }
+        for sp in from_source
+            .import_expansions
+            .iter()
+            .filter(|p| p.path == target)
+        {
+            reasons.push(serde_json::json!({
+                "type": "import_edge",
+                "detail": format!("{target} imports {source}"),
+                "weight": sp.confidence,
+            }));
+        }
+        // Reverse direction: files that import `target`; `source` appearing means
+        // source->target.
+        let from_target =
+            self.impact_from_files(store, std::slice::from_ref(&target.to_string()))?;
+        for sp in from_target
+            .import_expansions
+            .iter()
+            .filter(|p| p.path == source)
+        {
+            reasons.push(serde_json::json!({
+                "type": "import_edge",
+                "detail": format!("{source} imports {target}"),
+                "weight": sp.confidence,
+            }));
+        }
+        Ok(reasons)
+    }
+
     /// Shared deterministic expansion: co-change graph (git history fact) +
     /// import graph (static-analysis fact, up to 2 hops), excluding files
     /// already in `seeds`/`likely`. Returns (cochange, imports, discovered_tests).
