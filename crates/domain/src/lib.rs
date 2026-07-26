@@ -141,6 +141,70 @@ pub struct ReviewComment {
     pub line: Option<i64>,
     pub body: String,
     pub author: String,
+    /// ISO-8601 timestamp the comment was posted. Empty for rows ingested
+    /// before timestamps were captured. This is what orders a comment against
+    /// the commits that followed it, which is the basis of correction mining.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    #[serde(default)]
+    pub created_at: String,
+    /// The diff hunk the reviewer was looking at when they commented — the
+    /// `code_before` half of a correction triple.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub diff_hunk: Option<String>,
+}
+
+/// A review comment as ingested from the API, before it is joined with its PR.
+///
+/// Carries the fields needed to reconstruct a *correction*: when the comment
+/// was made, which commit it was anchored to, the hunk under discussion, and
+/// whether it is a reply in an existing thread rather than a new request.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct IngestedComment {
+    pub path: String,
+    pub line: Option<i64>,
+    pub body: String,
+    pub author: String,
+    /// ISO-8601 creation timestamp, verbatim from the API.
+    pub created_at: String,
+    /// Diff hunk the comment was anchored to.
+    pub diff_hunk: String,
+    /// SHA the comment was left against.
+    pub commit_id: String,
+    /// Set when this comment replies to another; thread roots are the actual
+    /// change requests, replies are usually discussion.
+    pub in_reply_to: Option<i64>,
+}
+
+/// One file changed by a pull request, including the diff itself.
+///
+/// The `patch` is the unified-diff hunks GitHub returns for the file. Without
+/// it a PR is just a list of filenames and no before/after can be recovered.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PrFileChange {
+    pub path: String,
+    /// `added`, `modified`, `removed`, `renamed`, …
+    pub status: String,
+    pub additions: i64,
+    pub deletions: i64,
+    /// Unified diff hunks. Empty for binary files and for very large diffs,
+    /// which GitHub omits.
+    pub patch: String,
+}
+
+/// One commit belonging to a pull request, in the order the API returned it.
+///
+/// Ordering plus `authored_at` is what lets a later commit be attributed to an
+/// earlier review comment: the push that came *after* the reviewer spoke.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PrCommit {
+    pub sha: String,
+    pub message: String,
+    pub author: String,
+    /// ISO-8601 author timestamp.
+    pub authored_at: String,
+    /// Zero-based position in the PR's commit list.
+    pub ordinal: i64,
 }
 
 /// Output of get_verification_plan: the merged checklist for a set of changed
