@@ -8,6 +8,14 @@ pub struct FileRecord {
     pub path: String,
     pub language: Language,
     pub size_bytes: u64,
+    /// Stable digest of the complete file contents. Empty only for records
+    /// deserialized from indexes that predate content-aware invalidation.
+    #[serde(default)]
+    pub content_hash: String,
+    /// Why this file is inventoried but intentionally excluded from indexing.
+    /// `None` means the file is eligible for Tier-1 and retrieval indexing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub indexing_ineligibility: Option<String>,
     pub is_test: bool,
 }
 
@@ -95,9 +103,23 @@ pub struct EvidencePacket {
     pub path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub symbol: Option<String>,
+    /// One-based source line for symbol evidence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_line: Option<usize>,
+    /// Inclusive one-based end line for symbol evidence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_line: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol_kind: Option<SymbolKind>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snippet: Option<String>,
     pub score: f32,
+    /// Absolute (pre-fusion-normalization) lexical score, when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bm25_score: Option<f32>,
+    /// Absolute cosine score, before per-query normalization, when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vector_score: Option<f32>,
     /// Which signals contributed (bm25, vector, symbol, path, cochange).
     pub signals: Vec<String>,
 }
@@ -109,6 +131,34 @@ pub enum EvidenceKind {
     Symbol,
     Test,
     RelatedFile,
+}
+
+/// Honest conclusion returned by reuse-specific retrieval.
+///
+/// `NoEvidence` means no strong evidence was found; it is deliberately not a
+/// proof that no implementation exists. `IndexIncomplete` makes incomplete
+/// symbol coverage explicit instead of returning a false negative.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReuseState {
+    ReuseLikely,
+    PossibleReuse,
+    NoEvidence,
+    IndexIncomplete,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReuseCandidate {
+    pub state: ReuseState,
+    pub evidence: EvidencePacket,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReuseAssessment {
+    pub state: ReuseState,
+    pub candidates: Vec<ReuseCandidate>,
+    pub indexed_files: usize,
+    pub index_complete: bool,
 }
 
 /// Output of predict_impact.

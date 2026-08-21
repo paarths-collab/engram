@@ -15,6 +15,26 @@ use std::path::Path;
 /// no extracted symbols.
 pub type ChunkKey = (String, usize);
 
+/// Cumulative facts about what the persisted repository index contains.
+///
+/// These are totals in the database, not counts from only the most recent
+/// indexing pass. Callers can therefore report coverage honestly after a warm
+/// restart where no files needed to be re-extracted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StoreCoverage {
+    pub files: usize,
+    /// Inventoried files intentionally excluded from indexing (currently
+    /// oversized source or source-adjacent files).
+    pub ineligible_files: usize,
+    pub parser_supported_files: usize,
+    /// Eligible source files whose language currently has no Tier-1 parser.
+    pub unsupported_source_files: usize,
+    pub tier1_done_files: usize,
+    pub symbols: usize,
+    pub pull_requests: usize,
+    pub review_comments: usize,
+}
+
 pub struct Store {
     pub conn: Connection,
 }
@@ -32,6 +52,8 @@ impl Store {
                 path TEXT PRIMARY KEY,
                 language TEXT NOT NULL,
                 size_bytes INTEGER NOT NULL,
+                content_hash TEXT NOT NULL DEFAULT '',
+                indexing_ineligibility TEXT,
                 is_test INTEGER NOT NULL,
                 tier1_done INTEGER NOT NULL DEFAULT 0,
                 last_commit_ts INTEGER
@@ -142,6 +164,33 @@ impl Store {
     fn migrate(conn: &Connection) {
         // Predates recency tracking.
         let _ = conn.execute("ALTER TABLE files ADD COLUMN last_commit_ts INTEGER", []);
+
+        // A path and byte count cannot detect same-size edits. Databases from
+        // before content hashing have no trustworthy relationship between the
+        // inventory rows and any derived symbols/imports/vectors, so clear all
+        // derived caches once and let the next index pass rebuild them.
+        let _ = conn.execute(
+            "ALTER TABLE files ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        let has_untrusted_derived_data = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM files WHERE content_hash = '')",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap_or(false);
+        if has_untrusted_derived_data {
+            let _ = conn.execute("DELETE FROM symbols", []);
+            let _ = conn.execute("DELETE FROM file_imports", []);
+            let _ = conn.execute("DELETE FROM vectors", []);
+            let _ = conn.execute("DELETE FROM chunk_vectors", []);
+            let _ = conn.execute("UPDATE files SET tier1_done = 0", []);
+        }
+        let _ = conn.execute(
+            "ALTER TABLE files ADD COLUMN indexing_ineligibility TEXT",
+            [],
+        );
 
         // Symbols predating span tracking have no end_line, and a stored zero
         // is indistinguishable from a real span. The ALTER succeeds exactly
@@ -344,6 +393,7 @@ impl Store {
             tx.execute("DELETE FROM files WHERE path = ?1", params![path])?;
             tx.execute("DELETE FROM symbols WHERE path = ?1", params![path])?;
             tx.execute("DELETE FROM file_imports WHERE path = ?1", params![path])?;
+            tx.execute("DELETE FROM vectors WHERE path = ?1", params![path])?;
             tx.execute("DELETE FROM chunk_vectors WHERE path = ?1", params![path])?;
         }
         tx.commit()?;
@@ -621,15 +671,38 @@ impl Store {
     pub fn upsert_files(&mut self, files: &[FileRecord]) -> Result<()> {
         let tx = self.conn.transaction()?;
         for f in files {
+            // Invalidate every derived artifact before replacing an inventory
+            // fingerprint. This transaction is the cold-restart equivalent of
+            // the file watcher's explicit invalidation path.
+            let changed = tx.execute(
+                "UPDATE files SET tier1_done = 0
+                 WHERE path = ?1 AND (
+                   content_hash <> ?2 OR
+                   COALESCE(indexing_ineligibility, '') <> COALESCE(?3, '')
+                 )",
+                params![f.path, f.content_hash, f.indexing_ineligibility],
+            )?;
+            if changed > 0 {
+                tx.execute("DELETE FROM symbols WHERE path = ?1", params![f.path])?;
+                tx.execute("DELETE FROM file_imports WHERE path = ?1", params![f.path])?;
+                tx.execute("DELETE FROM vectors WHERE path = ?1", params![f.path])?;
+                tx.execute("DELETE FROM chunk_vectors WHERE path = ?1", params![f.path])?;
+            }
             tx.execute(
-                "INSERT INTO files (path, language, size_bytes, is_test)
-                 VALUES (?1, ?2, ?3, ?4)
+                "INSERT INTO files (
+                    path, language, size_bytes, content_hash,
+                    indexing_ineligibility, is_test
+                 )
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT(path) DO UPDATE SET
-                   language=?2, size_bytes=?3, is_test=?4",
+                   language=?2, size_bytes=?3, content_hash=?4,
+                   indexing_ineligibility=?5, is_test=?6",
                 params![
                     f.path,
                     f.language.as_str(),
                     f.size_bytes as i64,
+                    f.content_hash,
+                    f.indexing_ineligibility,
                     f.is_test as i64
                 ],
             )?;
@@ -688,16 +761,76 @@ impl Store {
             .unwrap_or(false)
     }
 
+    /// Return cumulative coverage and ingestion counts from the persisted
+    /// store. Parser support is deliberately scoped to languages for which the
+    /// current Tier-1 extractor exists; unsupported source is still available
+    /// to body retrieval but is not misreported as symbol-indexed.
+    pub fn coverage(&self) -> Result<StoreCoverage> {
+        let (
+            files,
+            ineligible_files,
+            parser_supported_files,
+            unsupported_source_files,
+            tier1_done_files,
+            symbols,
+            pull_requests,
+            reviews,
+        ) = self.conn.query_row(
+            "SELECT
+                    (SELECT COUNT(*) FROM files),
+                    (SELECT COUNT(*) FROM files
+                     WHERE indexing_ineligibility IS NOT NULL),
+                    (SELECT COUNT(*) FROM files
+                     WHERE indexing_ineligibility IS NULL
+                       AND language IN ('rust', 'python', 'typescript', 'javascript')),
+                    (SELECT COUNT(*) FROM files
+                     WHERE indexing_ineligibility IS NULL AND language = 'go'),
+                    (SELECT COUNT(*) FROM files
+                     WHERE indexing_ineligibility IS NULL
+                       AND tier1_done = 1
+                       AND language IN ('rust', 'python', 'typescript', 'javascript')),
+                    (SELECT COUNT(*) FROM symbols),
+                    (SELECT COUNT(*) FROM pull_requests),
+                    (SELECT COUNT(*) FROM review_comments)",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
+                ))
+            },
+        )?;
+        Ok(StoreCoverage {
+            files: files as usize,
+            ineligible_files: ineligible_files as usize,
+            parser_supported_files: parser_supported_files as usize,
+            unsupported_source_files: unsupported_source_files as usize,
+            tier1_done_files: tier1_done_files as usize,
+            symbols: symbols as usize,
+            pull_requests: pull_requests as usize,
+            review_comments: reviews as usize,
+        })
+    }
+
     pub fn all_files(&self) -> Result<Vec<FileRecord>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT path, language, size_bytes, is_test FROM files")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT path, language, size_bytes, content_hash, is_test FROM files
+             WHERE indexing_ineligibility IS NULL ORDER BY path",
+        )?;
         let rows = stmt.query_map([], |r| {
             Ok(FileRecord {
                 path: r.get(0)?,
                 language: lang_from_str(&r.get::<_, String>(1)?),
                 size_bytes: r.get::<_, i64>(2)? as u64,
-                is_test: r.get::<_, i64>(3)? == 1,
+                content_hash: r.get(3)?,
+                indexing_ineligibility: None,
+                is_test: r.get::<_, i64>(4)? == 1,
             })
         })?;
         Ok(rows.filter_map(Result::ok).collect())
@@ -706,7 +839,9 @@ impl Store {
     pub fn symbols_matching(&self, needle: &str, limit: usize) -> Result<Vec<SymbolRecord>> {
         let mut stmt = self.conn.prepare(
             "SELECT name, kind, path, start_line, end_line, signature FROM symbols
-             WHERE name LIKE ?1 COLLATE NOCASE LIMIT ?2",
+             WHERE name LIKE ?1 COLLATE NOCASE
+             ORDER BY name COLLATE NOCASE, path, start_line, end_line
+             LIMIT ?2",
         )?;
         let pattern = format!("%{}%", needle);
         let rows = stmt.query_map(params![pattern, limit as i64], row_to_symbol)?;
@@ -723,7 +858,9 @@ impl Store {
     pub fn symbols_exact(&self, needle: &str, limit: usize) -> Result<Vec<SymbolRecord>> {
         let mut stmt = self.conn.prepare(
             "SELECT name, kind, path, start_line, end_line, signature FROM symbols
-             WHERE name = ?1 COLLATE NOCASE LIMIT ?2",
+             WHERE name = ?1 COLLATE NOCASE
+             ORDER BY path, start_line, end_line, name COLLATE NOCASE
+             LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![needle, limit as i64], row_to_symbol)?;
         Ok(rows.filter_map(Result::ok).collect())
@@ -734,7 +871,7 @@ impl Store {
     pub fn symbols_for_path(&self, path: &str) -> Result<Vec<SymbolRecord>> {
         let mut stmt = self.conn.prepare(
             "SELECT name, kind, path, start_line, end_line, signature FROM symbols
-             WHERE path = ?1 ORDER BY start_line",
+             WHERE path = ?1 ORDER BY start_line, end_line, name COLLATE NOCASE",
         )?;
         let rows = stmt.query_map(params![path], row_to_symbol)?;
         Ok(rows.filter_map(Result::ok).collect())
@@ -837,6 +974,8 @@ mod tests {
             path: path.to_owned(),
             language: Language::Rust,
             size_bytes: 10,
+            content_hash: format!("hash:{path}"),
+            indexing_ineligibility: None,
             is_test: false,
         }
     }
@@ -962,6 +1101,36 @@ mod tests {
     }
 
     #[test]
+    fn changed_inventory_hash_invalidates_all_derived_file_data() {
+        let repo = TempRepo::new();
+        let mut store = repo.store();
+        let original = file("a.rs");
+        store.upsert_files(&[original.clone()]).unwrap();
+        store
+            .replace_symbols_for_file("a.rs", &[symbol("a.rs", "stale")])
+            .unwrap();
+        store
+            .replace_imports_for_file("a.rs", &["crate/old".to_owned()])
+            .unwrap();
+        store
+            .upsert_vectors(&[("a.rs".to_owned(), "old".to_owned(), vec![1])])
+            .unwrap();
+        store
+            .upsert_chunk_vectors(&[("a.rs".to_owned(), 1, "old".to_owned(), vec![1])])
+            .unwrap();
+
+        let mut changed = original;
+        changed.content_hash = "different-content-same-size".to_owned();
+        store.upsert_files(&[changed]).unwrap();
+
+        assert!(!store.is_tier1_done("a.rs"));
+        assert!(store.symbols_for_path("a.rs").unwrap().is_empty());
+        assert!(store.all_imports().unwrap().is_empty());
+        assert!(store.load_vectors().unwrap().is_empty());
+        assert!(store.load_chunk_vectors().unwrap().is_empty());
+    }
+
+    #[test]
     fn pruning_a_deleted_file_takes_its_chunk_vectors() {
         let repo = TempRepo::new();
         let mut store = repo.store();
@@ -1007,6 +1176,102 @@ mod tests {
         assert_eq!(names, vec!["earlier", "later"]);
         assert_eq!(found[1].start_line, 40);
         assert_eq!(found[1].end_line, 60);
+    }
+
+    #[test]
+    fn symbol_lookups_have_a_deterministic_tie_order() {
+        let repo = TempRepo::new();
+        let mut store = repo.store();
+        store.upsert_files(&[file("z.rs"), file("a.rs")]).unwrap();
+        store
+            .replace_symbols_for_file("z.rs", &[symbol("z.rs", "retry")])
+            .unwrap();
+        store
+            .replace_symbols_for_file("a.rs", &[symbol("a.rs", "retry")])
+            .unwrap();
+
+        let matching: Vec<String> = store
+            .symbols_matching("retry", 10)
+            .unwrap()
+            .into_iter()
+            .map(|item| item.path)
+            .collect();
+        let exact: Vec<String> = store
+            .symbols_exact("retry", 10)
+            .unwrap()
+            .into_iter()
+            .map(|item| item.path)
+            .collect();
+        assert_eq!(matching, vec!["a.rs", "z.rs"]);
+        assert_eq!(exact, vec!["a.rs", "z.rs"]);
+    }
+
+    #[test]
+    fn coverage_reports_cumulative_index_and_ingestion_totals() {
+        let repo = TempRepo::new();
+        let mut store = repo.store();
+        let mut go_file = file("worker.go");
+        go_file.language = Language::Go;
+        store
+            .upsert_files(&[file("a.rs"), file("b.rs"), go_file])
+            .unwrap();
+        store
+            .replace_symbols_for_file("a.rs", &[symbol("a.rs", "alpha")])
+            .unwrap();
+        // A supported file with no declarations is still a completed Tier-1
+        // extraction and must remain counted on later warm runs.
+        store.replace_symbols_for_file("b.rs", &[]).unwrap();
+        store
+            .upsert_pull_request(7, "reuse", "", true, "alice", "", "", "", "")
+            .unwrap();
+        store
+            .replace_review_comments_for_pr(
+                7,
+                &[IngestedComment {
+                    path: "a.rs".to_owned(),
+                    body: "reuse alpha".to_owned(),
+                    author: "bob".to_owned(),
+                    ..Default::default()
+                }],
+            )
+            .unwrap();
+
+        let coverage = store.coverage().unwrap();
+        assert_eq!(coverage.files, 3);
+        assert_eq!(coverage.ineligible_files, 0);
+        assert_eq!(coverage.parser_supported_files, 2);
+        assert_eq!(coverage.unsupported_source_files, 1);
+        assert_eq!(coverage.tier1_done_files, 2);
+        assert_eq!(coverage.symbols, 1);
+        assert_eq!(coverage.pull_requests, 1);
+        assert_eq!(coverage.review_comments, 1);
+
+        drop(store);
+        assert_eq!(repo.store().coverage().unwrap(), coverage);
+    }
+
+    #[test]
+    fn coverage_counts_ineligible_files_but_all_files_excludes_them() {
+        let repo = TempRepo::new();
+        let mut store = repo.store();
+        let mut oversized = file("generated.rs");
+        oversized.indexing_ineligibility = Some("file_exceeds_limit".to_owned());
+        store.upsert_files(&[file("lib.rs"), oversized]).unwrap();
+
+        let coverage = store.coverage().unwrap();
+        assert_eq!(coverage.files, 2);
+        assert_eq!(coverage.ineligible_files, 1);
+        assert_eq!(coverage.parser_supported_files, 1);
+        assert_eq!(coverage.unsupported_source_files, 0);
+        assert_eq!(
+            store
+                .all_files()
+                .unwrap()
+                .into_iter()
+                .map(|file| file.path)
+                .collect::<Vec<_>>(),
+            vec!["lib.rs"]
+        );
     }
 
     #[test]
@@ -1136,6 +1401,51 @@ mod tests {
         // second commit is attributable to it.
         assert!(comments[0].created_at > commits[0].authored_at);
         assert!(comments[0].created_at < commits[1].authored_at);
+    }
+
+    #[test]
+    fn content_hash_migration_invalidates_legacy_derived_data() {
+        let repo = TempRepo::new();
+        let db_dir = repo.0.join(".engram");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        {
+            let conn = Connection::open(db_dir.join("engram.db")).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE files (
+                    path TEXT PRIMARY KEY, language TEXT NOT NULL,
+                    size_bytes INTEGER NOT NULL, is_test INTEGER NOT NULL,
+                    tier1_done INTEGER NOT NULL DEFAULT 0, last_commit_ts INTEGER
+                 );
+                 CREATE TABLE symbols (
+                    id INTEGER PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL,
+                    path TEXT NOT NULL, start_line INTEGER NOT NULL,
+                    end_line INTEGER NOT NULL DEFAULT 0, signature TEXT NOT NULL
+                 );
+                 CREATE TABLE file_imports (path TEXT NOT NULL, target TEXT NOT NULL);
+                 CREATE TABLE vectors (path TEXT PRIMARY KEY, hash TEXT NOT NULL, data BLOB NOT NULL);
+                 CREATE TABLE chunk_vectors (
+                    path TEXT NOT NULL, start_line INTEGER NOT NULL,
+                    hash TEXT NOT NULL, data BLOB NOT NULL,
+                    PRIMARY KEY (path, start_line)
+                 );
+                 INSERT INTO files VALUES ('legacy.rs', 'rust', 10, 0, 1, NULL);
+                 INSERT INTO symbols VALUES (1, 'stale', 'function', 'legacy.rs', 1, 1, 'fn stale()');
+                 INSERT INTO file_imports VALUES ('legacy.rs', 'crate/old');
+                 INSERT INTO vectors VALUES ('legacy.rs', 'old', X'01');
+                 INSERT INTO chunk_vectors VALUES ('legacy.rs', 1, 'old', X'01');",
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&repo.0).unwrap();
+        assert!(!store.is_tier1_done("legacy.rs"));
+        assert!(store.symbols_for_path("legacy.rs").unwrap().is_empty());
+        assert!(store.all_imports().unwrap().is_empty());
+        assert!(store.load_vectors().unwrap().is_empty());
+        assert!(store.load_chunk_vectors().unwrap().is_empty());
+        let files = store.all_files().unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].content_hash, "");
     }
 
     #[test]

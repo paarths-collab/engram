@@ -2,6 +2,7 @@
 //! Usage: engram --repo /path/to/repo   (defaults to cwd)
 
 use crate::mcp::{serve, ToolHandler};
+use engram_domain::{ReuseAssessment, ReuseCandidate, ReuseState};
 use engram_repo_map::store::Store;
 use engram_retrieval::Engine;
 use serde_json::{json, Value};
@@ -11,6 +12,12 @@ use std::sync::Arc;
 
 const EAGER_TIER1_LIMIT: usize = 3000;
 
+#[derive(Debug, Clone)]
+struct IndexBuild {
+    head_sha: Option<String>,
+    built_at_unix_seconds: u64,
+}
+
 pub struct Engram {
     repo_root: PathBuf,
     engine: Option<Engine>,
@@ -18,6 +25,7 @@ pub struct Engram {
     index_ready: Arc<AtomicBool>,
     /// Flipped by the watcher when files or HEAD change; triggers a lazy rebuild.
     dirty: Arc<AtomicBool>,
+    index_build: Option<IndexBuild>,
 }
 
 impl Engram {
@@ -31,8 +39,17 @@ impl Engram {
             move || match engram_repo_map::index_repo(&root, EAGER_TIER1_LIMIT) {
                 Ok(stats) => {
                     eprintln!(
-                        "[engram] indexed: {} files, {} cochange edges, {} tier1 files, {} pruned",
-                        stats.files, stats.cochange_edges, stats.tier1_files, stats.pruned_files
+                        "[engram] indexed: {} files, {} symbols, {}/{} tier1 files \
+                         ({} extracted this run), {} cochange edges, {} PRs, {} reviews, {} pruned",
+                        stats.files,
+                        stats.symbols,
+                        stats.tier1_files,
+                        stats.parser_supported_files,
+                        stats.tier1_files_extracted_this_run,
+                        stats.cochange_edges,
+                        stats.pull_requests,
+                        stats.review_comments,
+                        stats.pruned_files
                     );
                     ready.store(true, Ordering::SeqCst);
                 }
@@ -48,6 +65,7 @@ impl Engram {
             store: None,
             index_ready,
             dirty,
+            index_build: None,
         }
     }
 
@@ -76,8 +94,16 @@ impl Engram {
         }
         if self.engine.is_none() {
             let store = self.store.as_mut().unwrap();
-            self.engine =
-                Some(Engine::build(&self.repo_root, store).map_err(|e| format!("engine: {e}"))?);
+            let engine =
+                Engine::build(&self.repo_root, store).map_err(|e| format!("engine: {e}"))?;
+            self.index_build = Some(IndexBuild {
+                head_sha: git_text(&self.repo_root, &["rev-parse", "HEAD"]),
+                built_at_unix_seconds: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|duration| duration.as_secs())
+                    .unwrap_or(0),
+            });
+            self.engine = Some(engine);
         }
         Ok(())
     }
@@ -110,7 +136,7 @@ impl ToolHandler for Engram {
             },
             {
                 "name": "find_existing_implementation",
-                "description": "Call this BEFORE writing any new function, class, service, or utility. Checks whether an implementation of this concept already exists in the repository so it can be reused instead of duplicated. Pass the concept you are about to implement.",
+                "description": "Call this BEFORE writing any new function, class, service, or utility. Searches the current-code index for observed evidence of a reusable implementation and reports whether reuse is likely, possible, unsupported by evidence, or unverifiable because the index is incomplete. A no-evidence result does not prove absence.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -230,25 +256,30 @@ impl ToolHandler for Engram {
             }
             "find_existing_implementation" => {
                 self.ensure_engine()?;
-                let engine = self.engine.as_mut().unwrap();
-                let store = self.store.as_mut().unwrap();
-                let concept = args.get("concept").and_then(|v| v.as_str()).unwrap_or("");
+                let concept = args
+                    .get("concept")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .unwrap_or("");
                 if concept.is_empty() {
                     return Err("missing required argument: concept".into());
                 }
-                let packets = engine
-                    .search(store, concept, 5)
-                    .map_err(|e| e.to_string())?;
-                let found = !packets.is_empty();
-                Ok(json!({
-                    "concept": concept,
-                    "existing_candidates": packets,
-                    "recommendation": if found {
-                        "Review these candidates before implementing. Reuse if one matches."
-                    } else {
-                        "No existing implementation found. Safe to implement new."
-                    }
-                }))
+                let (assessment, coverage) = {
+                    let engine = self.engine.as_mut().unwrap();
+                    let store = self.store.as_mut().unwrap();
+                    let assessment = engine
+                        .assess_reuse(store, concept)
+                        .map_err(|e| e.to_string())?;
+                    let coverage = store.coverage().map_err(|e| e.to_string())?;
+                    (assessment, coverage)
+                };
+                Ok(reuse_response(
+                    concept,
+                    assessment,
+                    coverage,
+                    &self.repo_root,
+                    self.index_build.as_ref(),
+                ))
             }
             "predict_impact" => {
                 self.ensure_engine()?;
@@ -383,6 +414,203 @@ impl ToolHandler for Engram {
     }
 }
 
+fn reuse_response(
+    concept: &str,
+    assessment: ReuseAssessment,
+    coverage: engram_repo_map::store::StoreCoverage,
+    repo_root: &std::path::Path,
+    index_build: Option<&IndexBuild>,
+) -> Value {
+    let current_head_sha = git_text(repo_root, &["rev-parse", "HEAD"]);
+    let branch = git_text(repo_root, &["symbolic-ref", "--short", "-q", "HEAD"]);
+    let dirty = git_dirty(repo_root);
+    let indexed_head_sha = index_build.and_then(|build| build.head_sha.clone());
+    let mut missing_reasons = Vec::new();
+
+    if index_build.is_none() {
+        missing_reasons.push("index_build_timestamp_unavailable");
+    }
+    match (&indexed_head_sha, &current_head_sha) {
+        (Some(indexed), Some(current)) if indexed != current => {
+            missing_reasons.push("index_snapshot_differs_from_current_head")
+        }
+        (None, _) => missing_reasons.push("indexed_snapshot_sha_unavailable"),
+        (_, None) => missing_reasons.push("current_snapshot_sha_unavailable"),
+        _ => {}
+    }
+    match dirty {
+        Some(true) => missing_reasons.push("working_tree_has_uncommitted_changes"),
+        None => missing_reasons.push("working_tree_state_unknown"),
+        Some(false) => {}
+    }
+    let supported_files = coverage.files.saturating_sub(coverage.ineligible_files);
+    if assessment.indexed_files != supported_files {
+        missing_reasons.push("engine_file_count_differs_from_persisted_inventory");
+    }
+    if coverage.ineligible_files > 0 {
+        missing_reasons.push("inventory_contains_files_ineligible_for_indexing");
+    }
+    if coverage.unsupported_source_files > 0 {
+        missing_reasons.push("source_files_without_symbol_parser");
+    }
+    if coverage.tier1_done_files != coverage.parser_supported_files {
+        missing_reasons.push("parser_supported_files_not_fully_tier1_indexed");
+    }
+    if !assessment.index_complete {
+        missing_reasons.push("retrieval_engine_reports_incomplete_reuse_index");
+    }
+    missing_reasons.sort_unstable();
+    missing_reasons.dedup();
+
+    let complete = missing_reasons.is_empty();
+    let state = if !complete && assessment.state == ReuseState::NoEvidence {
+        ReuseState::IndexIncomplete
+    } else {
+        assessment.state
+    };
+    let candidates: Vec<Value> = assessment
+        .candidates
+        .iter()
+        .take(3)
+        .map(reuse_candidate_json)
+        .collect();
+    let repository_path = repo_root
+        .canonicalize()
+        .unwrap_or_else(|_| repo_root.to_path_buf())
+        .to_string_lossy()
+        .to_string();
+    let pr_missing_reasons = [
+        "no_ingestion_history_boundary_is_recorded",
+        "ingestion_is_limited_to_recent_closed_pull_requests",
+        "closed_pull_requests_beyond_the_first_100_are_not_imported",
+        "pull_request_files_beyond_the_first_100_are_not_imported",
+        "pull_request_commits_beyond_the_first_100_are_not_imported",
+        "review_comments_beyond_the_first_100_are_not_imported",
+        "pull_request_memory_is_not_used_by_reuse_retrieval",
+    ];
+    let mut coverage_missing = missing_reasons.clone();
+    coverage_missing.extend(pr_missing_reasons);
+    coverage_missing.sort_unstable();
+    coverage_missing.dedup();
+    let response_snapshot_sha = indexed_head_sha
+        .clone()
+        .or_else(|| current_head_sha.clone());
+
+    json!({
+        "concept": concept,
+        "status": state,
+        "existing_candidates": candidates,
+        "recommendation": reuse_recommendation(state),
+        "repository": {
+            "origin": git_text(repo_root, &["remote", "get-url", "origin"]),
+            "path": repository_path,
+        },
+        "snapshot": {
+            "sha": current_head_sha,
+            "branch": branch,
+            "dirty": dirty,
+        },
+        "snapshot_sha": response_snapshot_sha,
+        "coverage": {
+            "discovered_files": coverage.files,
+            "supported_files": supported_files,
+            "indexed_files": assessment.indexed_files,
+            "ineligible_files": coverage.ineligible_files,
+            "unsupported_source_files": coverage.unsupported_source_files,
+            "symbols": coverage.symbols,
+            "symbol_parser_supported_files": coverage.parser_supported_files,
+            "tier1_indexed_files": coverage.tier1_done_files,
+            "prs_imported": coverage.pull_requests,
+            "pr_import_complete": false,
+            "index_complete": complete,
+            "missing": coverage_missing,
+        },
+        "index": {
+            "built_at_unix_seconds": index_build.map(|build| build.built_at_unix_seconds),
+            "snapshot_sha": indexed_head_sha,
+            "complete": complete,
+            "missing_reasons": missing_reasons,
+            "files": {
+                "discovered": coverage.files,
+                "supported": supported_files,
+                "ineligible": coverage.ineligible_files,
+                "unsupported_source": coverage.unsupported_source_files,
+                "parser_supported": coverage.parser_supported_files,
+                "tier1_indexed": coverage.tier1_done_files,
+                "retrieval_indexed": assessment.indexed_files,
+            },
+            "symbols": coverage.symbols,
+        },
+        "pull_request_memory": {
+            "complete": false,
+            "pull_requests": coverage.pull_requests,
+            "review_comments": coverage.review_comments,
+            "missing_reasons": pr_missing_reasons,
+        }
+    })
+}
+
+fn reuse_candidate_json(candidate: &ReuseCandidate) -> Value {
+    let evidence = &candidate.evidence;
+    json!({
+        "status": candidate.state,
+        "memory_status": "OBSERVED",
+        "source": "current-code",
+        "id": evidence.id,
+        "evidence_id": evidence.id,
+        "type": evidence.kind,
+        "title": evidence.title,
+        "path": evidence.path,
+        "symbol": evidence.symbol,
+        "symbol_kind": evidence.symbol_kind,
+        "start_line": evidence.start_line,
+        "end_line": evidence.end_line,
+        "snippet": evidence.snippet,
+        "retrieval_score": evidence.score,
+        "score": evidence.score,
+        "signals": evidence.signals,
+    })
+}
+
+fn reuse_recommendation(state: ReuseState) -> &'static str {
+    match state {
+        ReuseState::ReuseLikely => {
+            "Current-code evidence makes reuse likely. Inspect the cited implementation before writing a new one."
+        }
+        ReuseState::PossibleReuse => {
+            "Current-code evidence suggests possible reuse. Inspect the candidates before deciding whether to implement."
+        }
+        ReuseState::NoEvidence => {
+            "No sufficiently similar current implementation was found in the indexed coverage. This does not prove that no implementation exists."
+        }
+        ReuseState::IndexIncomplete => {
+            "The index is incomplete or stale, so Engram cannot make an honest negative reuse claim."
+        }
+    }
+}
+
+fn git_text(repo_root: &std::path::Path, arguments: &[&str]) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(arguments)
+        .current_dir(repo_root)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    (!value.is_empty()).then_some(value)
+}
+
+fn git_dirty(repo_root: &std::path::Path) -> Option<bool> {
+    let output = std::process::Command::new("git")
+        .args(["status", "--porcelain=v1", "--untracked-files=normal"])
+        .current_dir(repo_root)
+        .output()
+        .ok()?;
+    output.status.success().then(|| !output.stdout.is_empty())
+}
+
 pub fn run() {
     let mut repo = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let args: Vec<String> = std::env::args().collect();
@@ -441,4 +669,110 @@ fn ingest_github(repo: &std::path::Path, limit: usize) -> Result<(), String> {
         stats.review_comments
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use engram_domain::{EvidenceKind, EvidencePacket, ReuseCandidate, SymbolKind};
+
+    fn candidate(state: ReuseState) -> ReuseCandidate {
+        ReuseCandidate {
+            state,
+            evidence: EvidencePacket {
+                id: "ev_retry".to_owned(),
+                kind: EvidenceKind::Symbol,
+                title: "retry in src/retry.rs:12".to_owned(),
+                path: "src/retry.rs".to_owned(),
+                symbol: Some("retry".to_owned()),
+                start_line: Some(12),
+                end_line: Some(20),
+                symbol_kind: Some(SymbolKind::Function),
+                snippet: Some("fn retry() {}".to_owned()),
+                score: 0.91,
+                bm25_score: Some(2.4),
+                vector_score: Some(0.72),
+                signals: vec!["bm25".to_owned(), "symbol_exact".to_owned()],
+            },
+        }
+    }
+
+    #[test]
+    fn reuse_candidate_labels_score_and_observed_current_code() {
+        let value = reuse_candidate_json(&candidate(ReuseState::ReuseLikely));
+        assert_eq!(value["status"], "reuse_likely");
+        assert_eq!(value["memory_status"], "OBSERVED");
+        assert_eq!(value["source"], "current-code");
+        assert_eq!(value["id"], "ev_retry");
+        assert_eq!(value["evidence_id"], "ev_retry");
+        assert_eq!(value["start_line"], 12);
+        assert!((value["retrieval_score"].as_f64().unwrap() - 0.91).abs() < 1e-6);
+        assert!((value["score"].as_f64().unwrap() - 0.91).abs() < 1e-6);
+        assert_eq!(value["signals"], json!(["bm25", "symbol_exact"]));
+    }
+
+    #[test]
+    fn an_unverifiable_negative_becomes_index_incomplete() {
+        let assessment = ReuseAssessment {
+            state: ReuseState::NoEvidence,
+            candidates: Vec::new(),
+            indexed_files: 0,
+            index_complete: true,
+        };
+        let value = reuse_response(
+            "transactional outbox",
+            assessment,
+            engram_repo_map::store::StoreCoverage::default(),
+            std::path::Path::new("path-that-is-not-a-git-repository"),
+            None,
+        );
+        assert_eq!(value["status"], "index_incomplete");
+        assert_eq!(value["index"]["complete"], false);
+        let recommendation = value["recommendation"].as_str().unwrap();
+        assert!(!recommendation.to_ascii_lowercase().contains("safe"));
+    }
+
+    #[test]
+    fn positive_observation_survives_incomplete_repository_metadata() {
+        let assessment = ReuseAssessment {
+            state: ReuseState::ReuseLikely,
+            candidates: vec![candidate(ReuseState::ReuseLikely)],
+            indexed_files: 1,
+            index_complete: true,
+        };
+        let coverage = engram_repo_map::store::StoreCoverage {
+            files: 1,
+            parser_supported_files: 1,
+            tier1_done_files: 1,
+            symbols: 1,
+            ..Default::default()
+        };
+        let value = reuse_response(
+            "retry",
+            assessment,
+            coverage,
+            std::path::Path::new("path-that-is-not-a-git-repository"),
+            None,
+        );
+        assert_eq!(value["status"], "reuse_likely");
+        assert_eq!(value["existing_candidates"].as_array().unwrap().len(), 1);
+        assert_eq!(value["index"]["complete"], false);
+        assert_eq!(value["coverage"]["indexed_files"], 1);
+        assert_eq!(value["coverage"]["supported_files"], 1);
+        assert_eq!(value["coverage"]["symbols"], 1);
+        assert_eq!(value["coverage"]["pr_import_complete"], false);
+    }
+
+    #[test]
+    fn no_recommendation_claims_it_is_safe_to_implement_new() {
+        for state in [
+            ReuseState::ReuseLikely,
+            ReuseState::PossibleReuse,
+            ReuseState::NoEvidence,
+            ReuseState::IndexIncomplete,
+        ] {
+            let text = reuse_recommendation(state).to_ascii_lowercase();
+            assert!(!text.contains("safe to implement"), "{state:?}: {text}");
+        }
+    }
 }

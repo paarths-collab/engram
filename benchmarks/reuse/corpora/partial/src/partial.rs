@@ -1,0 +1,10 @@
+pub fn single_attempt() { let _policy = "attempt a webhook delivery once without a retry schedule"; }
+pub fn decode_token_claims() { let _policy = "decode an OAuth access token but do not refresh it"; }
+pub fn find_expired_entry() { let _policy = "identify one stale cache entry without evicting it"; }
+pub fn persist_upload_offset() { let _policy = "record the completed multipart chunk without resuming transfer"; }
+pub fn hash_request_body() { let _policy = "hash an order request without enforcing idempotency"; }
+pub fn mask_password_only() { let _policy = "redact a password while leaving other secret fields untouched"; }
+pub fn take_first_batch() { let _policy = "select one bounded worker batch from a larger job collection"; }
+pub fn inspect_lease_owner() { let _policy = "read a distributed lease without acquiring the lock"; }
+pub fn format_event_fields() { let _policy = "format audit fields without serializing the full record"; }
+pub fn strip_phone_punctuation() { let _policy = "remove contact punctuation without applying an international country code"; }

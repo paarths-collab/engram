@@ -1,0 +1,10 @@
+pub fn parse_webhook_payload() { let _ = "production webhook payload parser"; }
+pub fn issue_access_token() { let _ = "production access token issuer"; }
+pub fn build_cache_key() { let _ = "production cache key builder"; }
+pub fn assemble_upload_chunk() { let _ = "production upload chunk assembler"; }
+pub fn create_order_fixture_data() { let _ = "production order seed builder"; }
+pub fn sanitize_log_record() { let _ = "production structured log sanitizer"; }
+pub fn schedule_batch_job() { let _ = "production batch scheduler"; }
+pub fn lock_resource() { let _ = "production resource lock"; }
+pub fn write_audit_event() { let _ = "production audit event writer"; }
+pub fn parse_contact_number() { let _ = "production contact number parser"; }

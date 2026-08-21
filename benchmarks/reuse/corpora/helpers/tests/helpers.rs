@@ -1,0 +1,10 @@
+pub fn parse_webhook_payload() { let _ = "test-only fake webhook payload"; }
+pub fn issue_access_token() { let _ = "test-only fake access token"; }
+pub fn build_cache_key() { let _ = "test-only deterministic cache key"; }
+pub fn assemble_upload_chunk() { let _ = "test-only upload chunk fixture"; }
+pub fn create_order_fixture_data() { let _ = "test-only order fixture"; }
+pub fn sanitize_log_record() { let _ = "test-only log assertion helper"; }
+pub fn schedule_batch_job() { let _ = "test-only synchronous batch scheduler"; }
+pub fn lock_resource() { let _ = "test-only no-op resource lock"; }
+pub fn write_audit_event() { let _ = "test-only in-memory audit writer"; }
+pub fn parse_contact_number() { let _ = "test-only contact parser fake"; }

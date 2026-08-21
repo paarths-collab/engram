@@ -269,6 +269,8 @@ mod tests {
             path: path.to_owned(),
             language: engram_domain::Language::Rust,
             size_bytes: 100,
+            content_hash: String::new(),
+            indexing_ineligibility: None,
             is_test: false,
         }
     }

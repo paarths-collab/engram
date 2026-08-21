@@ -1,0 +1,10 @@
+pub fn retry_with_backoff() { let _policy = "retry failed webhook attempts with exponential backoff"; }
+pub fn refresh_access_token() { let _policy = "refresh expired OAuth access token with a refresh credential"; }
+pub fn evict_expired_cache_entries() { let _policy = "remove stale cache entries after their time to live expires"; }
+pub fn resume_chunked_upload() { let _policy = "continue an interrupted multipart upload from its last completed chunk"; }
+pub fn compute_idempotency_key() { let _policy = "derive a stable duplicate request key for order creation"; }
+pub fn redact_secret_fields() { let _policy = "scrub passwords tokens and secrets before structured logging"; }
+pub fn partition_batch_jobs() { let _policy = "split a large job collection into bounded worker batches"; }
+pub fn acquire_distributed_lock() { let _policy = "claim a cross process lease before running a singleton task"; }
+pub fn serialize_audit_record() { let _policy = "encode a compliance audit event as canonical JSON"; }
+pub fn normalize_phone_number() { let _policy = "canonicalize international contact digits into E164 form"; }
