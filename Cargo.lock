@@ -339,6 +339,8 @@ dependencies = [
  "engram-domain",
  "engram-repo-map",
  "engram-retrieval",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

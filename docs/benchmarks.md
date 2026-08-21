@@ -13,6 +13,92 @@ the primary evidence for the product** — it measures the deterministic engine
 Benchmark 1 measures the fuzzy text-retrieval front door, which is optional
 and only used when the agent has no concrete anchor file yet.
 
+The default command above still runs Benchmark 1 and Benchmark 2. Honest reuse
+retrieval is a separate, frozen benchmark:
+
+```bash
+cargo run --release -p engram-evals -- reuse
+```
+
+Add `--check` in CI to return a non-zero status when a launch gate is missed:
+
+```bash
+cargo run --release -p engram-evals -- reuse --check
+```
+
+## Honest reuse retrieval — labeled fixture
+
+**The question:** does `Engine::assess_reuse` return a strong implementation
+candidate only when the evidence supports it, and otherwise explicitly
+abstain? This benchmark is separate from the commit-message-to-file B1 and the
+connection-recovery B2 because neither measures the reuse decision contract.
+
+The frozen labels live in `benchmarks/reuse/cases.json`, outside every indexed
+directory so expected answers cannot leak into retrieval. Its `corpora` map
+assigns each stratum an isolated profile under `benchmarks/reuse/corpora`.
+Consequently a lookalike case cannot retrieve an exact implementation from a
+different stratum. The no-match and incomplete-index strata deliberately share
+the same neutral corpus: only index completeness differs between them.
+
+The runner copies each referenced profile into a temporary repository, sets a
+fixed Git author/committer timestamp, commits it, and indexes the requested
+complete or deliberately incomplete view. It verifies that two index profiles
+of the same corpus have the same reproducible snapshot SHA, then calls the
+public reuse assessment API exactly once per case. Labels are validated before
+the run: each path must stay inside its assigned corpus, and each symbol must be
+defined at the exact labeled line rather than merely occurring somewhere in
+the file.
+
+The 100 cases contain ten examples in each reliability stratum:
+
+- exact existing implementation;
+- same behavior with different terminology;
+- renamed copied function;
+- partial duplication;
+- similar vocabulary but different behavior;
+- deprecated implementation;
+- test helper versus production helper;
+- no matching implementation;
+- incomplete index; and
+- conflicting approved decisions (documentation is not implementation
+  evidence).
+
+The report includes failed case IDs and these metrics:
+
+| metric | definition | `--check` gate |
+|---|---|---:|
+| `reuse_likely` precision | relevant candidates emitted as `reuse_likely` / all candidates emitted as `reuse_likely` | >= 0.90 |
+| Recall@3 | labeled candidate identities recovered in the first three results / all labeled identities | >= 0.80 |
+| correct abstention | `no_evidence` and `index_incomplete` cases returned with the exact labeled state and no candidates | >= 0.85 |
+| citation validity | returned candidates whose path, symbol, line span, snippet, and signals resolve against the frozen snapshot | 1.00 |
+| decision-state accuracy | exact top-level state matches across all cases | informational |
+| query p95 | wall-clock reuse-assessment latency, excluding indexing | informational |
+
+`no_evidence` means only that no sufficiently similar current implementation
+was found in indexed coverage. `index_incomplete` is distinct: the benchmark
+must never turn partial symbol coverage into an apparently definitive negative.
+
+Precision and decision-state accuracy are intentionally separate. A relevant
+candidate is a precision true positive even if a conservative case label says
+`possible_reuse`; that state mismatch is counted only by decision-state
+accuracy.
+
+### Current Phase 1 red gates
+
+The isolated 100-case fixture currently reports 85.5% `reuse_likely`
+precision and 80.0% correct abstention, below the 90% and 85% launch gates.
+Recall@3 is 100% and citation validity is 100%. The failures are retained as
+red tests: vocabulary-heavy UI/lookalike implementations still receive too
+much evidence, and one deliberately unrelated query produces a spurious
+candidate in both the complete and incomplete neutral profiles. `--check`
+therefore exits non-zero until the classifier becomes more conservative; the
+labels and thresholds are not relaxed to manufacture a pass.
+
+To evaluate another compatible frozen manifest without changing the checked-in
+labels, pass `--cases <path>`. Each value in its `corpora` map is resolved
+relative to the manifest file, must stay below that directory, and is used only
+by cases in the corresponding stratum.
+
 ## Benchmark 2 — connection recovery (no text, no prediction)
 
 **The question:** given one file you already know you're changing, does

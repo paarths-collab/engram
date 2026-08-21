@@ -20,7 +20,78 @@ const IGNORED_DIRS: &[&str] = &[
     ".vscode",
 ];
 
-const MAX_FILE_BYTES: u64 = 1_500_000; // skip generated blobs / bundles
+const MAX_FILE_BYTES: u64 = 1_500_000; // avoid indexing generated blobs / bundles
+const OVERSIZED_REASON: &str = "file_exceeds_1_500_000_bytes";
+
+/// Stable FNV-1a digest used to detect edits across process restarts.
+///
+/// This matches the zero-dependency content hashing already used by the
+/// retrieval cache. It is an invalidation fingerprint, not a security digest.
+pub(crate) fn content_hash(bytes: &[u8]) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in bytes {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+fn record(path: &Path, relative_path: String, size_bytes: u64) -> Option<FileRecord> {
+    let language = Language::from_path(&relative_path);
+    if language == Language::Other
+        && !(relative_path.ends_with(".md")
+            || relative_path.ends_with(".toml")
+            || relative_path.ends_with(".json"))
+    {
+        return None;
+    }
+
+    if size_bytes > MAX_FILE_BYTES {
+        return Some(FileRecord {
+            is_test: is_test_path(&relative_path),
+            path: relative_path,
+            language,
+            size_bytes,
+            // An oversized file is not read merely to fingerprint it. The
+            // sentinel still differs from any eligible content digest, which
+            // invalidates derived data if a formerly eligible file grows.
+            content_hash: format!("oversized:{size_bytes}"),
+            indexing_ineligibility: Some(OVERSIZED_REASON.to_owned()),
+        });
+    }
+
+    let contents = match std::fs::read(path) {
+        Ok(contents) => contents,
+        Err(_) => {
+            return Some(FileRecord {
+                is_test: is_test_path(&relative_path),
+                path: relative_path,
+                language,
+                size_bytes,
+                content_hash: format!("unreadable:{size_bytes}"),
+                indexing_ineligibility: Some("file_could_not_be_read".to_owned()),
+            });
+        }
+    };
+    Some(FileRecord {
+        is_test: is_test_path(&relative_path),
+        path: relative_path,
+        language,
+        size_bytes,
+        content_hash: content_hash(&contents),
+        indexing_ineligibility: None,
+    })
+}
+
+/// Inventory one known path using the same eligibility and hashing rules as a
+/// full scan. Used by the file watcher so warm and cold reindexing agree.
+pub(crate) fn scan_path(repo_root: &Path, relative_path: &str) -> Option<FileRecord> {
+    let full_path = repo_root.join(relative_path);
+    let metadata = std::fs::metadata(&full_path).ok()?;
+    metadata
+        .is_file()
+        .then(|| record(&full_path, relative_path.replace('\\', "/"), metadata.len()))?
+}
 
 pub fn is_test_path(path: &str) -> bool {
     let p = path.to_lowercase();
@@ -62,28 +133,15 @@ pub fn scan(repo_root: &Path) -> Vec<FileRecord> {
             Ok(m) => m,
             Err(_) => continue,
         };
-        if meta.len() > MAX_FILE_BYTES {
-            continue;
-        }
         let rel = entry
             .path()
             .strip_prefix(repo_root)
             .unwrap_or(entry.path())
             .to_string_lossy()
             .replace('\\', "/");
-        let language = Language::from_path(&rel);
-        if language == Language::Other {
-            // keep only source-adjacent docs for now
-            if !(rel.ends_with(".md") || rel.ends_with(".toml") || rel.ends_with(".json")) {
-                continue;
-            }
+        if let Some(file) = record(entry.path(), rel, meta.len()) {
+            out.push(file);
         }
-        out.push(FileRecord {
-            is_test: is_test_path(&rel),
-            path: rel,
-            language,
-            size_bytes: meta.len(),
-        });
     }
     out
 }

@@ -30,6 +30,66 @@ vague natural-language task. That path exists (`predict_impact`) but is marked
 Supporting tools (stable): `find_existing_implementation`,
 `get_verification_plan`, `get_review_history`.
 
+## Honest reuse response
+
+`find_existing_implementation(concept)` returns a decision status, not a
+boolean. Its four statuses are:
+
+| Status | Meaning |
+|---|---|
+| `reuse_likely` | An exact symbol matched, or at least two independent retrieval signals agreed. |
+| `possible_reuse` | Some current-code evidence exists, but it is not strong enough to recommend reuse without inspection. |
+| `no_evidence` | No sufficiently similar current implementation was found in the indexed coverage. This is not proof of absence. |
+| `index_incomplete` | Coverage is incomplete or stale, so Engram cannot make an honest negative claim. |
+
+The response is additive to the existing tool surface:
+
+```json
+{
+  "status": "reuse_likely",
+  "existing_candidates": [
+    {
+      "status": "reuse_likely",
+      "memory_status": "OBSERVED",
+      "source": "current-code",
+      "path": "src/payments/retry.rs",
+      "symbol": "retry_with_backoff",
+      "start_line": 42,
+      "snippet": "pub fn retry_with_backoff(...) { ... }",
+      "retrieval_score": 1.37,
+      "score": 1.37,
+      "signals": ["bm25", "vector"]
+    }
+  ],
+  "snapshot_sha": "abc123",
+  "coverage": {
+    "supported_files": 1842,
+    "indexed_files": 1842,
+    "symbols": 13420,
+    "prs_imported": 786,
+    "pr_import_complete": false,
+    "index_complete": true,
+    "missing": ["ingestion_is_limited_to_recent_closed_pull_requests"]
+  }
+}
+```
+
+At most three candidates are returned. Candidate identity is
+`path + symbol + start_line`, so same-named implementations in separate
+modules remain distinct. `retrieval_score` is a ranking value local to the
+query; it is never presented as confidence or as proof of correctness.
+Contributing `signals` and the reuse `status` are reported separately.
+Until a real semantic embedding backend exists, BM25 and the hashed-ngram
+vector count as one lexical signal family; their agreement alone cannot
+establish a reuse candidate without a symbol-name or path identity signal.
+Repository origin/path, the live snapshot state, the indexed snapshot SHA,
+index build timestamp, and detailed index/PR incompleteness reasons are also
+included in the full response.
+
+For compatibility, candidates still expose the deprecated aliases `id` and
+`score`; new clients should use `evidence_id` and `retrieval_score`. Both score
+fields are the same query-local ranking value and neither is confidence.
+
 ## Deprecations
 
 | Old | Status | Replacement |

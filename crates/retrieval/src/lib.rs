@@ -7,7 +7,10 @@ pub mod weights;
 
 use anyhow::Result;
 use embed::{cosine, Embedder, HashedNgramEmbedder};
-use engram_domain::{EvidenceKind, EvidencePacket, ImpactPrediction, ScoredPath, SymbolRecord};
+use engram_domain::{
+    EvidenceKind, EvidencePacket, ImpactPrediction, ReuseAssessment, ReuseCandidate, ReuseState,
+    ScoredPath, SymbolKind, SymbolRecord,
+};
 use engram_repo_map::graph::{CodeGraph, EdgeKind};
 use engram_repo_map::store::Store;
 use std::collections::{HashMap, HashSet};
@@ -56,6 +59,9 @@ struct Chunk {
     symbol: Option<String>,
     /// One-based; `0` for the head chunk. Doubles as the cache key.
     start_line: usize,
+    /// Inclusive one-based end line; `0` for the head chunk.
+    end_line: usize,
+    symbol_kind: Option<SymbolKind>,
     /// The span's source text, capped at [`CHUNK_BYTES`]. Returned as the
     /// snippet, so evidence quotes the matching definition itself.
     text: String,
@@ -82,6 +88,9 @@ pub struct Engine {
     config: WeightsConfig,
     graph: CodeGraph,
     stopwords: std::sync::Arc<HashSet<String>>,
+    /// Whether every parser-supported file had Tier-1 symbols extracted when
+    /// this engine was built. An honest negative reuse result requires this.
+    symbol_index_complete: bool,
 }
 
 const PREVIEW_BYTES: usize = 400;
@@ -89,6 +98,16 @@ const INDEX_BODY_BYTES: usize = 60_000;
 /// Cap on the source text embedded and quoted for one chunk. Long enough for a
 /// normal definition, short enough that one sprawling function cannot dominate.
 const CHUNK_BYTES: usize = 4_000;
+const REUSE_CANDIDATE_LIMIT: usize = 3;
+
+struct PlannedChunk {
+    start_line: usize,
+    end_line: usize,
+    symbol: Option<String>,
+    symbol_kind: Option<SymbolKind>,
+    text: String,
+    truncated: bool,
+}
 
 /// Reuse a cached embedding when its content hash still matches, otherwise
 /// embed fresh. Returns the vector and whether it came from cache.
@@ -133,17 +152,128 @@ fn query_identifiers(query: &str) -> Vec<String> {
     out
 }
 
+fn query_requests_tests(query: &str) -> bool {
+    query
+        .split(|c: char| !c.is_alphanumeric())
+        .map(str::to_ascii_lowercase)
+        .any(|token| {
+            matches!(
+                token.as_str(),
+                "test" | "tests" | "testing" | "spec" | "specs"
+            )
+        })
+}
+
+fn identifier_parts(identifier: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut previous_was_lower_or_digit = false;
+    for ch in identifier.chars() {
+        if !ch.is_alphanumeric() {
+            if !current.is_empty() {
+                parts.push(std::mem::take(&mut current));
+            }
+            previous_was_lower_or_digit = false;
+            continue;
+        }
+        if ch.is_uppercase() && previous_was_lower_or_digit && !current.is_empty() {
+            parts.push(std::mem::take(&mut current));
+        }
+        current.extend(ch.to_lowercase());
+        previous_was_lower_or_digit = ch.is_lowercase() || ch.is_ascii_digit();
+    }
+    if !current.is_empty() {
+        parts.push(current);
+    }
+    parts
+}
+
+fn symbol_has_token(symbol: &str, query_token: &str) -> bool {
+    identifier_parts(symbol)
+        .iter()
+        .any(|part| part == query_token)
+}
+
+fn evidence_id(path: &str, symbol: Option<&str>, start_line: Option<usize>) -> String {
+    let identity = format!(
+        "{}\0{}\0{}",
+        path,
+        symbol.unwrap_or(""),
+        start_line.unwrap_or(0)
+    );
+    format!("ev_{}", embed::content_hash(&identity))
+}
+
+fn same_candidate(a: &EvidencePacket, b: &EvidencePacket) -> bool {
+    a.path == b.path && a.symbol == b.symbol && a.start_line == b.start_line
+}
+
+fn merge_packet(packets: &mut Vec<EvidencePacket>, mut candidate: EvidencePacket) {
+    if let Some(existing) = packets
+        .iter_mut()
+        .find(|existing| same_candidate(existing, &candidate))
+    {
+        existing.score = existing.score.max(candidate.score);
+        existing.bm25_score = match (existing.bm25_score, candidate.bm25_score) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+        existing.vector_score = match (existing.vector_score, candidate.vector_score) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+        if existing.start_line.is_none() {
+            existing.start_line = candidate.start_line;
+        }
+        if existing.end_line.is_none() {
+            existing.end_line = candidate.end_line;
+        }
+        if existing.symbol_kind.is_none() {
+            existing.symbol_kind = candidate.symbol_kind;
+        }
+        if candidate
+            .snippet
+            .as_ref()
+            .is_some_and(|snippet| snippet.len() > existing.snippet.as_deref().unwrap_or("").len())
+        {
+            existing.snippet = candidate.snippet.take();
+        }
+        for signal in candidate.signals {
+            if !existing.signals.contains(&signal) {
+                existing.signals.push(signal);
+            }
+        }
+        existing.signals.sort();
+        return;
+    }
+    candidate.signals.sort();
+    candidate.signals.dedup();
+    packets.push(candidate);
+}
+
+fn compare_packets(a: &EvidencePacket, b: &EvidencePacket) -> std::cmp::Ordering {
+    b.score
+        .partial_cmp(&a.score)
+        .unwrap_or(std::cmp::Ordering::Equal)
+        .then_with(|| a.path.cmp(&b.path))
+        .then_with(|| a.start_line.cmp(&b.start_line))
+        .then_with(|| a.symbol.cmp(&b.symbol))
+}
+
 /// Plan a file's chunks: the head, then one span per extracted symbol.
 ///
 /// The head chunk always exists. A file with no chunks could never be returned
 /// by vector search, and symbol extraction is lazy, so plenty of files have no
 /// symbols yet on any given build.
-fn plan_chunks(
-    source: &str,
-    body: &str,
-    symbols: &[SymbolRecord],
-) -> Vec<(usize, Option<String>, String)> {
-    let mut planned = vec![(0usize, None, body.chars().take(CHUNK_BYTES).collect())];
+fn plan_chunks(source: &str, body: &str, symbols: &[SymbolRecord]) -> Vec<PlannedChunk> {
+    let mut planned = vec![PlannedChunk {
+        start_line: 0,
+        end_line: 0,
+        symbol: None,
+        symbol_kind: None,
+        text: body.chars().take(CHUNK_BYTES).collect(),
+        truncated: source.chars().count() > CHUNK_BYTES,
+    }];
     let lines: Vec<&str> = source.lines().collect();
     for symbol in symbols {
         // Spans from a pre-span database are zero, and a file can shrink
@@ -155,14 +285,126 @@ fn plan_chunks(
             continue;
         }
         let end = symbol.end_line.min(lines.len());
-        let text: String = lines[symbol.start_line - 1..end]
-            .join("\n")
-            .chars()
-            .take(CHUNK_BYTES)
-            .collect();
-        planned.push((symbol.start_line, Some(symbol.name.clone()), text));
+        let full_text = lines[symbol.start_line - 1..end].join("\n");
+        let truncated = full_text.chars().count() > CHUNK_BYTES;
+        let text: String = full_text.chars().take(CHUNK_BYTES).collect();
+        planned.push(PlannedChunk {
+            start_line: symbol.start_line,
+            end_line: end,
+            symbol: Some(symbol.name.clone()),
+            symbol_kind: Some(symbol.kind),
+            text,
+            truncated,
+        });
     }
     planned
+}
+
+fn reuse_state_for_packet(packet: &EvidencePacket, tests_requested: bool) -> Option<ReuseState> {
+    let exact_symbol = packet.signals.iter().any(|signal| signal == "symbol_exact");
+    let fuzzy_symbol = packet.signals.iter().any(|signal| signal == "symbol");
+    let symbol_evidence = packet.symbol.is_some() && (exact_symbol || fuzzy_symbol);
+    let path = packet.signals.iter().any(|signal| signal == "path");
+
+    // The current "vector" backend is hashed token/character n-grams, not a
+    // semantic model. BM25 and that vector therefore form one lexical family,
+    // not two independent votes. Treating them independently recreates the
+    // old false-positive bug for nearly every vocabulary overlap.
+    // One fuzzy name/path signal is useful enough to inspect. BM25 plus the
+    // hashed-ngram backend is still text-only overlap, so without an identity
+    // signal it cannot establish that the matching span is an implementation.
+    if !symbol_evidence && !path {
+        return None;
+    }
+
+    // Symbol-name, path, BM25, and hashed n-grams are all lexical. Only exact
+    // identity, or agreement between the separately indexed symbol and path
+    // identity surfaces, is independent enough for a strong claim today.
+    let mut state = if exact_symbol || (symbol_evidence && path) {
+        ReuseState::ReuseLikely
+    } else {
+        ReuseState::PossibleReuse
+    };
+    if packet.kind == EvidenceKind::Test && !tests_requested {
+        state = ReuseState::PossibleReuse;
+    }
+    Some(state)
+}
+
+fn has_precise_source_evidence(packet: &EvidencePacket) -> bool {
+    let Some(symbol) = packet.symbol.as_deref().filter(|symbol| !symbol.is_empty()) else {
+        return false;
+    };
+    packet.start_line.is_some_and(|line| line > 0)
+        && packet
+            .snippet
+            .as_deref()
+            .is_some_and(|snippet| !snippet.trim().is_empty() && snippet.contains(symbol))
+}
+
+fn is_explicitly_deprecated(packet: &EvidencePacket) -> bool {
+    packet.snippet.as_deref().is_some_and(|snippet| {
+        let lower = snippet.to_ascii_lowercase();
+        lower.contains("#[deprecated")
+            || lower.contains("@deprecated")
+            || lower.contains("deprecationwarning")
+    })
+}
+
+fn reuse_state_priority(state: ReuseState) -> u8 {
+    match state {
+        ReuseState::ReuseLikely => 0,
+        ReuseState::PossibleReuse => 1,
+        ReuseState::NoEvidence => 2,
+        ReuseState::IndexIncomplete => 3,
+    }
+}
+
+fn assess_reuse_packets(
+    pool: Vec<EvidencePacket>,
+    indexed_files: usize,
+    index_complete: bool,
+    tests_requested: bool,
+) -> ReuseAssessment {
+    let mut candidates: Vec<ReuseCandidate> = pool
+        .into_iter()
+        .filter(|packet| classify_path(&packet.path) == DocClass::Code)
+        .filter(has_precise_source_evidence)
+        .filter(|packet| !is_explicitly_deprecated(packet))
+        .filter_map(|evidence| {
+            reuse_state_for_packet(&evidence, tests_requested)
+                .map(|state| ReuseCandidate { state, evidence })
+        })
+        .collect();
+    candidates.sort_by(|a, b| {
+        reuse_state_priority(a.state)
+            .cmp(&reuse_state_priority(b.state))
+            .then_with(|| compare_packets(&a.evidence, &b.evidence))
+    });
+    candidates.truncate(REUSE_CANDIDATE_LIMIT);
+
+    let has_likely = candidates
+        .iter()
+        .any(|candidate| candidate.state == ReuseState::ReuseLikely);
+    let state = if has_likely {
+        ReuseState::ReuseLikely
+    } else if !index_complete {
+        // Weak candidates cannot override missing coverage. Suppress them so
+        // callers cannot accidentally treat an incomplete result as evidence.
+        candidates.clear();
+        ReuseState::IndexIncomplete
+    } else if !candidates.is_empty() {
+        ReuseState::PossibleReuse
+    } else {
+        ReuseState::NoEvidence
+    };
+
+    ReuseAssessment {
+        state,
+        candidates,
+        indexed_files,
+        index_complete,
+    }
 }
 
 impl Engine {
@@ -189,25 +431,38 @@ impl Engine {
         let mut fresh: Vec<(String, usize, String, Vec<u8>)> = Vec::new();
         let mut present: HashSet<(String, usize)> = HashSet::new();
         let (mut reused, mut embedded) = (0usize, 0usize);
+        let mut symbol_index_complete = true;
 
         for f in store.all_files()? {
             let full = repo_root.join(&f.path);
             let Ok(src) = std::fs::read_to_string(&full) else {
+                symbol_index_complete = false;
                 continue;
             };
             let body: String = src.chars().take(INDEX_BODY_BYTES).collect();
             let doc_index = docs.len();
+            if engram_repo_map::symbols::supports(f.language) && !store.is_tier1_done(&f.path) {
+                symbol_index_complete = false;
+            }
+            if f.language != engram_domain::Language::Other
+                && !engram_repo_map::symbols::supports(f.language)
+            {
+                symbol_index_complete = false;
+            }
 
             // Symbols are extracted lazily, so a file may legitimately have
             // none yet; plan_chunks always yields at least the head chunk.
             let symbols = store.symbols_for_path(&f.path).unwrap_or_default();
-            for (start_line, symbol, text) in plan_chunks(&src, &body, &symbols) {
-                let embed_text = match &symbol {
-                    Some(name) => format!("{} {} {}", f.path, name, text),
-                    None => format!("{} {}", f.path, text),
+            for planned in plan_chunks(&src, &body, &symbols) {
+                if planned.truncated && (planned.symbol.is_some() || symbols.is_empty()) {
+                    symbol_index_complete = false;
+                }
+                let embed_text = match &planned.symbol {
+                    Some(name) => format!("{} {} {}", f.path, name, planned.text),
+                    None => format!("{} {}", f.path, planned.text),
                 };
                 let hash = embed::content_hash(&embed_text);
-                let key = (f.path.clone(), start_line);
+                let key = (f.path.clone(), planned.start_line);
                 let (vector, from_cache) =
                     embed_or_reuse(&embedder, cached.get(&key), &embed_text, &hash);
                 if from_cache {
@@ -216,7 +471,7 @@ impl Engine {
                     embedded += 1;
                     fresh.push((
                         f.path.clone(),
-                        start_line,
+                        planned.start_line,
                         hash,
                         embed::vector_to_bytes(&vector),
                     ));
@@ -224,9 +479,11 @@ impl Engine {
                 present.insert(key);
                 chunks.push(Chunk {
                     doc: doc_index,
-                    symbol,
-                    start_line,
-                    text,
+                    symbol: planned.symbol,
+                    start_line: planned.start_line,
+                    end_line: planned.end_line,
+                    symbol_kind: planned.symbol_kind,
+                    text: planned.text,
                     vector,
                 });
             }
@@ -274,7 +531,32 @@ impl Engine {
             config: WeightsConfig::load(repo_root),
             graph,
             stopwords,
+            symbol_index_complete,
         })
+    }
+
+    pub fn indexed_file_count(&self) -> usize {
+        self.docs.len()
+    }
+
+    pub fn symbol_index_complete(&self) -> bool {
+        self.symbol_index_complete
+    }
+
+    /// Assess whether indexed evidence supports reusing an implementation.
+    ///
+    /// Unlike generic search, this API can abstain. It excludes documentation,
+    /// refuses vector-only evidence, distinguishes likely from merely possible
+    /// reuse, and returns at most three deterministic candidates.
+    pub fn assess_reuse(&mut self, store: &mut Store, concept: &str) -> Result<ReuseAssessment> {
+        let tests_requested = query_requests_tests(concept);
+        let pool = self.search(store, concept, 50)?;
+        Ok(assess_reuse_packets(
+            pool,
+            self.indexed_file_count(),
+            self.symbol_index_complete,
+            tests_requested,
+        ))
     }
 
     /// Rank file paths for a query under a given strategy (top `k`). Used by the
@@ -374,6 +656,12 @@ impl Engine {
             .collect()
     }
 
+    fn chunk_for_symbol(&self, path: &str, start_line: usize) -> Option<&Chunk> {
+        self.chunks
+            .iter()
+            .find(|chunk| chunk.start_line == start_line && self.docs[chunk.doc].path == path)
+    }
+
     /// Hybrid search: BM25 + vector fused with weighted normalized scores,
     /// plus symbol exact-match boost. Lazily Tier-1 extracts top hits on miss.
     pub fn search(
@@ -403,8 +691,10 @@ impl Engine {
         };
         let bm25_n = norm(&bm25);
         let vec_n = norm(&vecs);
+        let bm25_raw: HashMap<usize, f32> = bm25.iter().copied().collect();
+        let vector_raw: HashMap<usize, f32> = vecs.iter().copied().collect();
 
-        let query_wants_tests = query.to_lowercase().contains("test");
+        let query_wants_tests = query_requests_tests(query);
 
         let mut fused: HashMap<usize, (f32, Vec<String>)> = HashMap::new();
         for (i, s) in &bm25_n {
@@ -428,7 +718,11 @@ impl Engine {
         for (i, (score, signals)) in fused.iter_mut() {
             let d = &self.docs[*i];
             let pl = d.path.to_lowercase();
-            if q_tokens.iter().any(|t| pl.contains(t)) {
+            let path_tokens: HashSet<&str> = pl
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|token| !token.is_empty())
+                .collect();
+            if q_tokens.iter().any(|t| path_tokens.contains(t.as_str())) {
                 *score += w.path_match;
                 signals.push("path".into());
             }
@@ -461,12 +755,16 @@ impl Engine {
 
         let mut ranked: Vec<(usize, f32, Vec<String>)> =
             fused.into_iter().map(|(i, (s, sig))| (i, s, sig)).collect();
-        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        ranked.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| self.docs[a.0].path.cmp(&self.docs[b.0].path))
+        });
         ranked.truncate(top_k);
 
         // lazy Tier-1: ensure symbols exist for top hits, then attach best symbols
         let mut packets = Vec::new();
-        for (rank, (i, score, signals)) in ranked.iter().enumerate() {
+        for (i, score, signals) in &ranked {
             let d = &self.docs[*i];
             engram_repo_map::ensure_tier1(store, &self.repo_root, &d.path)?;
             // Prefer the span the vector side actually matched: its text is the
@@ -476,7 +774,7 @@ impl Engine {
                 .get(i)
                 .map(|&index| &self.chunks[index])
                 .filter(|chunk| chunk.symbol.is_some());
-            let (title, symbol, snippet) = match matched_span {
+            let (title, symbol, start_line, end_line, symbol_kind, snippet) = match matched_span {
                 Some(chunk) => {
                     let name = chunk.symbol.clone().unwrap_or_default();
                     // path:line, so the agent can open the definition directly
@@ -484,20 +782,35 @@ impl Engine {
                     (
                         format!("{} in {}:{}", name, d.path, chunk.start_line),
                         Some(name),
+                        Some(chunk.start_line),
+                        Some(chunk.end_line),
+                        chunk.symbol_kind,
                         Some(chunk.text.clone()),
                     )
                 }
                 None => match best_symbols_for(store, &d.path, &q_tokens).first() {
                     Some(s) => (
-                        format!("{} in {}", s.name, d.path),
+                        format!("{} in {}:{}", s.name, d.path, s.start_line),
                         Some(s.name.clone()),
+                        Some(s.start_line),
+                        Some(s.end_line),
+                        Some(s.kind),
                         Some(s.signature.clone()),
                     ),
-                    None => (d.path.clone(), None, Some(d.preview.clone())),
+                    None => (
+                        d.path.clone(),
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(d.preview.clone()),
+                    ),
                 },
             };
+            let start_for_id = start_line;
+            let symbol_for_id = symbol.as_deref();
             packets.push(EvidencePacket {
-                id: format!("ev_{rank:03}"),
+                id: evidence_id(&d.path, symbol_for_id, start_for_id),
                 kind: if d.is_test {
                     EvidenceKind::Test
                 } else if symbol.is_some() {
@@ -508,8 +821,13 @@ impl Engine {
                 title,
                 path: d.path.clone(),
                 symbol,
+                start_line,
+                end_line,
+                symbol_kind,
                 snippet,
                 score: *score,
+                bm25_score: bm25_raw.get(i).copied(),
+                vector_score: vector_raw.get(i).copied(),
                 signals: signals.clone(),
             });
         }
@@ -527,38 +845,73 @@ impl Engine {
         let exact_score = top_fused + self.config.weights.symbol_exact;
         for ident in query_identifiers(query) {
             for s in store.symbols_exact(&ident, 5)? {
-                if packets.iter().any(|p| p.symbol.as_deref() == Some(&s.name)) {
-                    continue;
-                }
-                packets.push(EvidencePacket {
-                    id: format!("ev_exact_{}", s.name.to_lowercase()),
-                    kind: EvidenceKind::Symbol,
-                    title: format!("{} in {}:{}", s.name, s.path, s.start_line),
-                    path: s.path.clone(),
-                    symbol: Some(s.name.clone()),
-                    snippet: Some(s.signature.clone()),
-                    score: exact_score,
-                    signals: vec!["symbol_exact".into()],
-                });
+                let chunk = self.chunk_for_symbol(&s.path, s.start_line);
+                merge_packet(
+                    &mut packets,
+                    EvidencePacket {
+                        id: evidence_id(&s.path, Some(&s.name), Some(s.start_line)),
+                        kind: if engram_repo_map::inventory::is_test_path(&s.path) {
+                            EvidenceKind::Test
+                        } else {
+                            EvidenceKind::Symbol
+                        },
+                        title: format!("{} in {}:{}", s.name, s.path, s.start_line),
+                        path: s.path.clone(),
+                        symbol: Some(s.name.clone()),
+                        start_line: Some(s.start_line),
+                        end_line: Some(s.end_line),
+                        symbol_kind: Some(s.kind),
+                        snippet: Some(
+                            chunk
+                                .map(|matched| matched.text.clone())
+                                .unwrap_or_else(|| s.signature.clone()),
+                        ),
+                        score: exact_score,
+                        bm25_score: None,
+                        vector_score: None,
+                        signals: vec!["symbol_exact".into()],
+                    },
+                );
             }
         }
 
-        // Weaker substring hits that BM25/vector may have missed entirely.
+        // Weaker whole identifier-token hits that BM25/vector may have missed.
+        // SQL supplies a broad substring pool; the token filter prevents tiny
+        // words such as `ion` from matching `configuration`.
         for t in &q_tokens {
-            for s in store.symbols_matching(t, 3)? {
-                if packets.iter().any(|p| p.symbol.as_deref() == Some(&s.name)) {
-                    continue;
-                }
-                packets.push(EvidencePacket {
-                    id: format!("ev_sym_{}", s.name.to_lowercase()),
-                    kind: EvidenceKind::Symbol,
-                    title: format!("{} in {}", s.name, s.path),
-                    path: s.path.clone(),
-                    symbol: Some(s.name.clone()),
-                    snippet: Some(s.signature.clone()),
-                    score: self.config.weights.symbol_exact,
-                    signals: vec!["symbol".into()],
-                });
+            for s in store
+                .symbols_matching(t, 25)?
+                .into_iter()
+                .filter(|symbol| symbol_has_token(&symbol.name, t))
+                .take(3)
+            {
+                let chunk = self.chunk_for_symbol(&s.path, s.start_line);
+                merge_packet(
+                    &mut packets,
+                    EvidencePacket {
+                        id: evidence_id(&s.path, Some(&s.name), Some(s.start_line)),
+                        kind: if engram_repo_map::inventory::is_test_path(&s.path) {
+                            EvidenceKind::Test
+                        } else {
+                            EvidenceKind::Symbol
+                        },
+                        title: format!("{} in {}:{}", s.name, s.path, s.start_line),
+                        path: s.path.clone(),
+                        symbol: Some(s.name.clone()),
+                        start_line: Some(s.start_line),
+                        end_line: Some(s.end_line),
+                        symbol_kind: Some(s.kind),
+                        snippet: Some(
+                            chunk
+                                .map(|matched| matched.text.clone())
+                                .unwrap_or_else(|| s.signature.clone()),
+                        ),
+                        score: self.config.weights.symbol_exact,
+                        bm25_score: None,
+                        vector_score: None,
+                        signals: vec!["symbol".into()],
+                    },
+                );
             }
         }
 
@@ -566,12 +919,8 @@ impl Engine {
         // inserted in score order, so without this an exact match sits below
         // whatever fusion put in the first top_k slots and gets truncated away
         // — which is exactly how the langchain `merge_dicts` miss happened.
-        packets.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        packets.truncate(top_k + 3);
+        packets.sort_by(compare_packets);
+        packets.truncate(top_k);
         Ok(packets)
     }
 
@@ -794,8 +1143,9 @@ impl Engine {
 fn best_symbols_for(store: &Store, path: &str, q_tokens: &[String]) -> Vec<SymbolRecord> {
     let mut hits = Vec::new();
     for t in q_tokens {
-        if let Ok(mut syms) = store.symbols_matching(t, 5) {
-            syms.retain(|s| s.path == path);
+        if let Ok(mut syms) = store.symbols_matching(t, 25) {
+            syms.retain(|s| s.path == path && symbol_has_token(&s.name, t));
+            syms.truncate(5);
             hits.extend(syms);
         }
     }
@@ -830,6 +1180,31 @@ fn second() {
         }
     }
 
+    fn packet(
+        path: &str,
+        symbol: Option<&str>,
+        kind: EvidenceKind,
+        score: f32,
+        signals: &[&str],
+    ) -> EvidencePacket {
+        let start_line = symbol.map(|_| 10);
+        EvidencePacket {
+            id: evidence_id(path, symbol, start_line),
+            kind,
+            title: path.to_owned(),
+            path: path.to_owned(),
+            symbol: symbol.map(str::to_owned),
+            start_line,
+            end_line: symbol.map(|_| 14),
+            symbol_kind: symbol.map(|_| SymbolKind::Function),
+            snippet: symbol.map(|name| format!("fn {name}() {{}}")),
+            score,
+            bm25_score: None,
+            vector_score: None,
+            signals: signals.iter().map(|signal| (*signal).to_owned()).collect(),
+        }
+    }
+
     #[test]
     fn query_identifiers_keeps_whole_symbol_names() {
         // The exact failure from langchain #38366: the query names merge_dicts,
@@ -853,14 +1228,279 @@ fn second() {
     }
 
     #[test]
+    fn test_intent_uses_tokens_not_substrings() {
+        assert!(query_requests_tests("find the unit tests for retries"));
+        assert!(query_requests_tests("reuse a spec helper"));
+        assert!(!query_requests_tests("use the latest retry helper"));
+    }
+
+    #[test]
+    fn symbol_token_matching_rejects_embedded_substrings() {
+        assert!(symbol_has_token("retry_policy", "retry"));
+        assert!(symbol_has_token("RetryPolicy", "policy"));
+        assert!(!symbol_has_token("configuration", "ion"));
+        assert!(!symbol_has_token("latest_value", "test"));
+    }
+
+    #[test]
+    fn exact_symbol_is_reuse_likely() {
+        let assessment = assess_reuse_packets(
+            vec![packet(
+                "src/retry.rs",
+                Some("retry_policy"),
+                EvidenceKind::Symbol,
+                4.0,
+                &["symbol_exact"],
+            )],
+            1,
+            true,
+            false,
+        );
+        assert_eq!(assessment.state, ReuseState::ReuseLikely);
+        assert_eq!(assessment.candidates[0].state, ReuseState::ReuseLikely);
+    }
+
+    #[test]
+    fn unrelated_vector_only_result_abstains() {
+        let mut noisy = packet(
+            "src/recent.rs",
+            Some("unrelated"),
+            EvidenceKind::Symbol,
+            1.2,
+            &["vector", "recent"],
+        );
+        noisy.vector_score = Some(0.91);
+        let assessment = assess_reuse_packets(vec![noisy], 1, true, false);
+        assert_eq!(assessment.state, ReuseState::NoEvidence);
+        assert!(assessment.candidates.is_empty());
+    }
+
+    #[test]
+    fn same_named_symbols_in_different_files_are_preserved() {
+        let mut packets = Vec::new();
+        merge_packet(
+            &mut packets,
+            packet(
+                "src/a.rs",
+                Some("retry_policy"),
+                EvidenceKind::Symbol,
+                2.0,
+                &["symbol_exact"],
+            ),
+        );
+        merge_packet(
+            &mut packets,
+            packet(
+                "src/b.rs",
+                Some("retry_policy"),
+                EvidenceKind::Symbol,
+                2.0,
+                &["symbol_exact"],
+            ),
+        );
+        assert_eq!(packets.len(), 2);
+        assert_ne!(packets[0].id, packets[1].id);
+    }
+
+    #[test]
+    fn exact_and_fuzzy_evidence_for_one_symbol_is_merged() {
+        let mut packets = vec![packet(
+            "src/retry.rs",
+            Some("retry_policy"),
+            EvidenceKind::Symbol,
+            1.0,
+            &["symbol"],
+        )];
+        merge_packet(
+            &mut packets,
+            packet(
+                "src/retry.rs",
+                Some("retry_policy"),
+                EvidenceKind::Symbol,
+                3.0,
+                &["symbol_exact"],
+            ),
+        );
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].score, 3.0);
+        assert_eq!(packets[0].signals, vec!["symbol", "symbol_exact"]);
+    }
+
+    #[test]
+    fn documentation_cannot_be_called_reusable_code() {
+        let assessment = assess_reuse_packets(
+            vec![packet(
+                "README.md",
+                Some("retry_policy"),
+                EvidenceKind::Symbol,
+                5.0,
+                &["symbol_exact"],
+            )],
+            1,
+            true,
+            false,
+        );
+        assert_eq!(assessment.state, ReuseState::NoEvidence);
+        assert!(assessment.candidates.is_empty());
+    }
+
+    #[test]
+    fn tests_are_possible_not_likely_unless_explicitly_requested() {
+        let test = packet(
+            "tests/retry.rs",
+            Some("retry_policy"),
+            EvidenceKind::Test,
+            5.0,
+            &["symbol_exact"],
+        );
+        let ordinary = assess_reuse_packets(vec![test.clone()], 1, true, false);
+        assert_eq!(ordinary.state, ReuseState::PossibleReuse);
+        assert_eq!(ordinary.candidates[0].state, ReuseState::PossibleReuse);
+
+        let explicitly_requested = assess_reuse_packets(vec![test], 1, true, true);
+        assert_eq!(explicitly_requested.state, ReuseState::ReuseLikely);
+    }
+
+    #[test]
+    fn weak_single_non_vector_signal_is_only_possible_reuse() {
+        let assessment = assess_reuse_packets(
+            vec![packet(
+                "src/retry.rs",
+                Some("retry_policy"),
+                EvidenceKind::Symbol,
+                1.5,
+                &["symbol"],
+            )],
+            1,
+            true,
+            false,
+        );
+        assert_eq!(assessment.state, ReuseState::PossibleReuse);
+        assert_eq!(assessment.candidates[0].state, ReuseState::PossibleReuse);
+    }
+
+    #[test]
+    fn correlated_text_only_signals_abstain() {
+        let mut text_only = packet(
+            "src/retry.rs",
+            Some("some_span"),
+            EvidenceKind::Symbol,
+            2.0,
+            &["bm25", "vector"],
+        );
+        text_only.bm25_score = Some(2.0);
+        text_only.vector_score = Some(0.7);
+        let abstained = assess_reuse_packets(vec![text_only], 1, true, false);
+        assert_eq!(abstained.state, ReuseState::NoEvidence);
+        assert!(abstained.candidates.is_empty());
+
+        let mut symbol_and_vector = packet(
+            "src/retry.rs",
+            Some("retry_policy"),
+            EvidenceKind::Symbol,
+            2.0,
+            &["symbol", "vector"],
+        );
+        symbol_and_vector.vector_score = Some(0.7);
+        let possible = assess_reuse_packets(vec![symbol_and_vector], 1, true, false);
+        assert_eq!(possible.state, ReuseState::PossibleReuse);
+
+        let symbol_and_path = packet(
+            "src/retry.rs",
+            Some("retry_policy"),
+            EvidenceKind::Symbol,
+            2.0,
+            &["symbol", "path"],
+        );
+        let likely = assess_reuse_packets(vec![symbol_and_path], 1, true, false);
+        assert_eq!(likely.state, ReuseState::ReuseLikely);
+    }
+
+    #[test]
+    fn candidates_without_exact_symbol_evidence_are_not_returned() {
+        let mut head = packet(
+            "src/retry.rs",
+            None,
+            EvidenceKind::ExistingCode,
+            2.0,
+            &["bm25", "vector"],
+        );
+        head.bm25_score = Some(2.0);
+        head.vector_score = Some(0.7);
+        let assessment = assess_reuse_packets(vec![head], 1, true, false);
+        assert_eq!(assessment.state, ReuseState::NoEvidence);
+        assert!(assessment.candidates.is_empty());
+    }
+
+    #[test]
+    fn explicitly_deprecated_symbols_do_not_guide_reuse() {
+        let mut deprecated = packet(
+            "src/legacy.rs",
+            Some("legacy_retry"),
+            EvidenceKind::Symbol,
+            5.0,
+            &["symbol_exact"],
+        );
+        deprecated.snippet =
+            Some("#[deprecated(note = \"unsafe\")] pub fn legacy_retry() {}".to_owned());
+        let assessment = assess_reuse_packets(vec![deprecated], 1, true, false);
+        assert_eq!(assessment.state, ReuseState::NoEvidence);
+        assert!(assessment.candidates.is_empty());
+    }
+
+    #[test]
+    fn incomplete_coverage_overrides_weak_candidates() {
+        let weak = packet(
+            "src/retry.rs",
+            Some("retry_policy"),
+            EvidenceKind::Symbol,
+            1.5,
+            &["symbol"],
+        );
+        let assessment = assess_reuse_packets(vec![weak], 100, false, false);
+        assert_eq!(assessment.state, ReuseState::IndexIncomplete);
+        assert!(assessment.candidates.is_empty());
+    }
+
+    #[test]
+    fn empty_result_reports_incomplete_index_honestly() {
+        let assessment = assess_reuse_packets(Vec::new(), 100, false, false);
+        assert_eq!(assessment.state, ReuseState::IndexIncomplete);
+        assert!(!assessment.index_complete);
+    }
+
+    #[test]
+    fn reuse_candidates_are_stable_and_capped_at_three() {
+        let pool = ["e.rs", "d.rs", "c.rs", "b.rs", "a.rs"]
+            .into_iter()
+            .map(|path| {
+                packet(
+                    path,
+                    Some("retry_policy"),
+                    EvidenceKind::Symbol,
+                    4.0,
+                    &["symbol_exact"],
+                )
+            })
+            .collect();
+        let assessment = assess_reuse_packets(pool, 5, true, false);
+        let paths: Vec<&str> = assessment
+            .candidates
+            .iter()
+            .map(|candidate| candidate.evidence.path.as_str())
+            .collect();
+        assert_eq!(paths, vec!["a.rs", "b.rs", "c.rs"]);
+    }
+
+    #[test]
     fn a_file_without_symbols_still_gets_one_chunk() {
         // A doc with no chunks could never be returned by vector search, and
         // symbol extraction is lazy, so this is a normal state not an edge case.
         let planned = plan_chunks(SRC, SRC, &[]);
         assert_eq!(planned.len(), 1);
-        assert_eq!(planned[0].0, 0, "head chunk is keyed at line 0");
-        assert!(planned[0].1.is_none());
-        assert!(planned[0].2.contains("use std::io;"));
+        assert_eq!(planned[0].start_line, 0, "head chunk is keyed at line 0");
+        assert!(planned[0].symbol.is_none());
+        assert!(planned[0].text.contains("use std::io;"));
     }
 
     #[test]
@@ -870,15 +1510,21 @@ fn second() {
 
         let second = planned
             .iter()
-            .find(|(_, name, _)| name.as_deref() == Some("second"))
+            .find(|chunk| chunk.symbol.as_deref() == Some("second"))
             .expect("second was planned");
-        assert_eq!(second.0, 7, "keyed by its start line");
-        assert!(second.2.starts_with("fn second()"), "got: {}", second.2);
-        assert!(second.2.contains("let y = 2;"), "got: {}", second.2);
+        assert_eq!(second.start_line, 7, "keyed by its start line");
+        assert_eq!(second.end_line, 9);
+        assert_eq!(second.symbol_kind, Some(SymbolKind::Function));
         assert!(
-            !second.2.contains("first"),
+            second.text.starts_with("fn second()"),
+            "got: {}",
+            second.text
+        );
+        assert!(second.text.contains("let y = 2;"), "got: {}", second.text);
+        assert!(
+            !second.text.contains("first"),
             "bled into the neighbour: {}",
-            second.2
+            second.text
         );
     }
 
@@ -902,15 +1548,16 @@ fn second() {
     fn a_span_running_past_a_shrunken_file_is_clamped() {
         let planned = plan_chunks(SRC, SRC, &[symbol("truncated", 7, 9_999)]);
         let chunk = &planned[1];
-        assert_eq!(chunk.1.as_deref(), Some("truncated"));
-        assert!(chunk.2.contains("let y = 2;"));
+        assert_eq!(chunk.symbol.as_deref(), Some("truncated"));
+        assert!(chunk.text.contains("let y = 2;"));
     }
 
     #[test]
     fn chunk_text_is_capped() {
         let huge = format!("fn big() {{\n{}\n}}\n", "    let x = 1;\n".repeat(2_000));
         let planned = plan_chunks(&huge, &huge, &[symbol("big", 1, 2_002)]);
-        assert!(planned[1].2.chars().count() <= CHUNK_BYTES);
+        assert!(planned[1].text.chars().count() <= CHUNK_BYTES);
+        assert!(planned[1].truncated);
     }
 
     #[test]

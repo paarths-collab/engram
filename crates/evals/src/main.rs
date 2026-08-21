@@ -18,6 +18,9 @@
 //!
 //! Usage: engram-evals [--repo PATH] [--max-commits N]
 //!                      [--eval-commits N] [--history-commits N]
+//!        engram-evals reuse [--cases PATH] [--check]
+
+mod reuse;
 
 use anyhow::Result;
 use engram_repo_map::cochange;
@@ -42,6 +45,10 @@ struct ConnectionSample {
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("reuse") {
+        return reuse::run(&args[2..]);
+    }
+
     let repo = arg(&args, "--repo")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
