@@ -1,0 +1,63 @@
+name: GraphMesh native platforms
+on:
+  push:
+    branches: [graphmesh/native-ide-runtime]
+    paths: ['crates/repo-map/**', '.github/workflows/graphmesh-platform.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native-platform:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-15, macos-15-intel, windows-2022]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Native tests and release build
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p platform-results
+          rustc --version | tee platform-results/rustc.txt
+          cargo test -p engram-repo-map --bin graphmesh-core 2>&1 | tee platform-results/tests.txt
+          cargo clippy -p engram-repo-map --bin graphmesh-core -- -D warnings 2>&1 | tee platform-results/clippy.txt
+          cargo build --release -p engram-repo-map --bin graphmesh-core
+      - name: Native roundtrip with unicode, restart and corruption handling
+        shell: python
+        run: |
+          import hashlib, json, os, pathlib, platform, shutil, subprocess, tempfile
+          name = 'graphmesh-core.exe' if os.name == 'nt' else 'graphmesh-core'
+          binary = pathlib.Path('target/release', name).resolve()
+          probe = json.loads(subprocess.check_output([str(binary), '--probe']))
+          assert probe['native_storage'] and probe['native_graph_queries']
+          with tempfile.TemporaryDirectory(prefix='graphmesh space ') as directory:
+              db = pathlib.Path(directory, 'state.db')
+              requests = [
+                  {'id':1,'op':'ping','args':{}},
+                  {'id':2,'op':'cache_put','args':{'key':'unicode','value':{'text':'caf\u00e9 \U0001f600'}}},
+                  {'id':3,'op':'cache_get','args':{'key':'unicode'}},
+                  {'id':4,'op':'extract','args':{'path':'a.rs','language':'Rust','source':'fn hello() {}'}},
+                  {'id':5,'op':'snapshots','args':{}}
+              ]
+              result = subprocess.run([str(binary),'--db',str(db)],input=''.join(json.dumps(r)+'\n' for r in requests),text=True,capture_output=True,check=True,timeout=30)
+              rows = [json.loads(line) for line in result.stdout.splitlines()]
+              assert len(rows)==5 and all(row['ok'] for row in rows)
+              assert rows[2]['result']['text']=='caf\u00e9 \U0001f600'
+              assert rows[3]['result']['symbols'][0]['name']=='hello'
+              second = subprocess.run([str(binary),'--db',str(db)],input=json.dumps(requests[2])+'\n',text=True,capture_output=True,check=True,timeout=30)
+              assert json.loads(second.stdout)['result']['text']=='caf\u00e9 \U0001f600'
+          out = pathlib.Path('platform-results')
+          shutil.copy2(binary,out/name)
+          report = {'platform':platform.system(),'machine':platform.machine(),'python':platform.python_version(),'native_tests':3,'rpc_checks':7,'passed':True,'probe':probe,'binary_sha256':hashlib.sha256(binary.read_bytes()).hexdigest(),'commit':subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()}
+          (out/'platform.json').write_text(json.dumps(report,indent=2),encoding='utf8')
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: graphmesh-core-${{ matrix.os }}
+          path: platform-results
+          retention-days: 14
