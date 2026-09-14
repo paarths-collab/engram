@@ -1,0 +1,40 @@
+name: GraphMesh native validation
+on:
+  push:
+    branches: [graphmesh/native-ide-runtime]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Toolchain and formatting
+        run: |
+          rustc --version
+          cargo --version
+          cargo fmt --all
+      - name: Test and build
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p native-results
+          cargo test -p engram-repo-map --bin graphmesh-core 2>&1 | tee native-results/tests.txt
+          cargo clippy -p engram-repo-map --bin graphmesh-core -- -D warnings 2>&1 | tee native-results/clippy.txt
+          cargo build --release -p engram-repo-map --bin graphmesh-core 2>&1 | tee native-results/build.txt
+          cp target/release/graphmesh-core native-results/
+          cp Cargo.lock native-results/
+          cp crates/repo-map/src/mesh_*.rs native-results/
+          cp crates/repo-map/src/bin/graphmesh-core.rs native-results/
+          target/release/graphmesh-core --probe > native-results/probe.json
+          git rev-parse HEAD > native-results/commit.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: graphmesh-native-linux-x86_64
+          path: native-results
+          retention-days: 7
