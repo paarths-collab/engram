@@ -105,7 +105,9 @@ captured at engram `0a0b1d3`, before the `pack` object existed):
   comment is only included when its file is in `evidence`.
 - The search asks for 8 results and keeps at most 11 evidence entries after
   ranking. Anything cut by that cap is listed in `pack.omitted` with reason
-  `below_cap`.
+  `below_cap`. The best 20 of the fused candidates cut before any result was
+  built (past the 8 asked for) are named too, by path, in rank order; the rest
+  are only counted in `pack.omitted_count`.
 - Results are ordered by score descending, then path ascending, then start line
   ascending (`pack.ordering` = `score_desc,path_asc,line_asc`).
 
@@ -576,7 +578,7 @@ object, so this shape is documented from the source (`crates/retrieval/src/budge
 | `used_tokens` | The estimate for the whole response, `pack` included. |
 | `truncated` | `true` when anything was omitted or any unit came back minimal. |
 | `omitted_count` | Count of all omitted candidates, even those not listed. |
-| `omitted` | Up to a bounded list of `{path, symbol?, kind?, reason}`. Under a budget the list holds at most one entry per 250 budget tokens, and at most 20 entries. `kind` appears only for kinds other than `evidence` (for example `cochange`, `import`, `test`, `review_comment`). |
+| `omitted` | Up to a bounded list of `{path, symbol?, kind?, reason}`. Under a budget the list holds at most one entry per 250 budget tokens, and at most 20 entries, but never fewer than 3 (or fewer than there are enumerable omissions): disclosure does not depend on spare room, so the lowest-ranked kept units are given up to make room for those entries. When only the bare `pack` fits, it lists as many entries as fit. `kind` appears only for kinds other than `evidence` (for example `cochange`, `import`, `test`, `review_comment`). |
 | `omitted[].reason` | `over_budget` (the budget cut it), `below_cap` (the search's own cap cut it), or `recommendation_cap` (an expansion cap cut it). |
 | `ordering` | `score_desc,path_asc,line_asc` for search; `confidence_desc,path_asc` for expansion. |
 | `within_budget` | `true` when the whole response is within `budget_tokens`. |

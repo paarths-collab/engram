@@ -167,6 +167,13 @@ release tags.
 - For equal confidence, `likely_files` in `expand_connections` is ordered by path.
 
 ### Fixed
+- **A budgeted pack always names some of what it omitted.** `pack.omitted` was
+  empty when every result was kept and the only omissions were candidates the
+  search's first cap cut (counted, never named), so `omitted_count` could be
+  positive with nothing listed. The best 20 of those candidates are now listed
+  with reason `below_cap`, and under a budget the list holds at least
+  `min(3, enumerable omissions)` entries whatever room is left, falling back to
+  as many as fit when only the bare `pack` does.
 - **Equal-length import routes are deterministic.** The graph is built from
   edges sorted by (importer, imported), and traversals visit parents and seeds
   in path order, so `expand_connections` and `explain_connection` report the same

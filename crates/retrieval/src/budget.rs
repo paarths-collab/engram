@@ -45,6 +45,11 @@ pub const MAX_OMITTED_LISTED: usize = 20;
 /// per this many budget tokens (at most [`MAX_OMITTED_LISTED`]), so the list
 /// that apologises for omissions cannot eat the room the evidence needed.
 const BUDGET_TOKENS_PER_LISTED_OMISSION: usize = 250;
+/// Under a budget the pack names at least this many omissions (fewer only when
+/// fewer are enumerable): disclosure never depends on spare room. The list is
+/// kept this long by giving up the lowest-ranked kept units, and it overrides
+/// the one-per-250-tokens bound for budgets below 750 tokens.
+pub const MIN_OMITTED_LISTED: usize = 3;
 /// `pack.ordering` for search results: evidence by score descending, then path,
 /// then line; `past_reviews` follow the evidence they annotate and are ordered
 /// by `pr_number, path, line, created_at` (the store query's ORDER BY, so they
@@ -119,6 +124,25 @@ pub struct PackPlan {
     pub cap_omissions: Vec<CapOmission>,
     /// Further cap-withheld candidates that are counted but not enumerated.
     pub cap_unlisted: usize,
+}
+
+impl PackPlan {
+    /// Name the first `paths.len()` candidates of the ones counted but not
+    /// enumerated (`cap_unlisted`) as `below_cap` omissions, in the given rank
+    /// order. Moves them out of the unlisted count, so `omitted_count` is
+    /// unchanged; paths beyond the unlisted count are ignored.
+    pub fn list_beyond_cap(mut self, paths: &[String]) -> Self {
+        for path in paths.iter().take(self.cap_unlisted) {
+            self.cap_omissions.push(CapOmission {
+                path: path.clone(),
+                symbol: None,
+                kind: "evidence",
+                reason: "below_cap",
+            });
+        }
+        self.cap_unlisted = self.cap_unlisted.saturating_sub(paths.len());
+        self
+    }
 }
 
 fn evidence_minimal(v: &Value, _anchors: &[String]) -> Option<Value> {
@@ -540,37 +564,31 @@ impl Packer {
             return self.finish(layout, None);
         };
         self.set_all(Form::Omitted);
-        let limit = (budget / BUDGET_TOKENS_PER_LISTED_OMISSION).min(MAX_OMITTED_LISTED);
+        let limit = (budget / BUDGET_TOKENS_PER_LISTED_OMISSION)
+            .clamp(MIN_OMITTED_LISTED, MAX_OMITTED_LISTED);
         // Richest layout that holds the pack with every unit still omitted.
-        // Each step down gives up something before the budget is exceeded.
-        let ladder = [
-            Layout {
-                rung: 0,
-                list_limit: limit,
-            },
-            Layout {
-                rung: 1,
-                list_limit: limit,
-            },
-            Layout {
+        // Each step down gives up something before the budget is exceeded: the
+        // fields around the pack first, then entries of the omitted list one by
+        // one (down to none, which is the bare pack).
+        let rich = |rung| Layout {
+            rung,
+            list_limit: limit,
+        };
+        let bare_pack: Vec<Layout> = (0..=limit)
+            .rev()
+            .map(|list_limit| Layout {
                 rung: 2,
-                list_limit: limit,
-            },
-            Layout {
-                rung: 2,
-                list_limit: limit / 2,
-            },
-            Layout {
-                rung: 2,
-                list_limit: 0,
-            },
-        ];
+                list_limit,
+            })
+            .collect();
+        let ladder: Vec<Layout> = [rich(0), rich(1)].into_iter().chain(bare_pack).collect();
         let fallback = Layout {
             rung: 2,
             list_limit: 0,
         };
         let mut layout = ladder
-            .into_iter()
+            .iter()
+            .copied()
             .find(|l| self.fits(*l, budget))
             .unwrap_or(fallback);
         if layout.rung == 0 {
@@ -583,7 +601,8 @@ impl Packer {
             let kept_any = self.forms.iter().flatten().any(|f| *f != Form::Omitted);
             if has_units && !kept_any {
                 layout = ladder
-                    .into_iter()
+                    .iter()
+                    .copied()
                     .filter(|l| l.rung > 0)
                     .find(|l| self.fits(*l, budget))
                     .unwrap_or(fallback);
@@ -703,6 +722,13 @@ impl Packer {
 
     /// Safety net: the greedy pass measures every step, so this is expected to
     /// do nothing, but the contract is the final measurement, so check it.
+    ///
+    /// Disclosure never depends on spare room: the list limit is at least
+    /// [`MIN_OMITTED_LISTED`] and the omitted list is part of the pack the
+    /// greedy pass measures at every step, so a unit is only kept while the
+    /// result *with* its list of omissions still fits. Giving up one more unit
+    /// (the lowest-ranked kept one; it then joins the list in rank order) is
+    /// therefore always what makes room for the entries, never the other way.
     fn trim_until_fits(&mut self, layout: Layout, budget: usize) {
         while !self.fits(layout, budget) {
             let last = (0..self.sections.len()).rev().find_map(|s| {
@@ -992,6 +1018,185 @@ mod tests {
         assert_eq!(impossible.as_object().unwrap().len(), 1);
         assert_eq!(impossible["pack"]["within_budget"], false);
         assert_eq!(impossible["pack"]["omitted_count"], 5);
+    }
+
+    fn listed(packed: &Value) -> usize {
+        packed["pack"]["omitted"].as_array().unwrap().len()
+    }
+
+    fn beyond_paths(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("src/far{i:02}.rs")).collect()
+    }
+
+    fn kept_paths(packed: &Value) -> Vec<String> {
+        packed["evidence"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|e| e["path"].as_str().unwrap().to_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The promises about disclosure that hold at every budget, whatever the
+    /// sizes involved: the result is deterministic and fits, `omitted_count` is
+    /// exact, and while the result still carries evidence the pack names at
+    /// least `min(MIN_OMITTED_LISTED, enumerable omissions)` of what it omitted.
+    fn check_disclosure(result: &Value, total_units: usize, budget: usize, beyond: usize) -> Value {
+        let make = || {
+            search_plan(Some(budget), &[], beyond)
+                .list_beyond_cap(&beyond_paths(MAX_OMITTED_LISTED))
+        };
+        let packed = apply(result.clone(), make());
+        let again = apply(result.clone(), make());
+        assert_eq!(
+            render(&packed),
+            render(&again),
+            "budget {budget}: not deterministic"
+        );
+        let pack = &packed["pack"];
+        if pack["within_budget"] == true {
+            assert!(measure(&packed) <= budget, "budget {budget}");
+        }
+        let omitted_units = total_units - kept_paths(&packed).len();
+        assert_eq!(
+            pack["omitted_count"].as_u64().unwrap() as usize,
+            omitted_units + beyond,
+            "budget {budget}: omitted_count is exact"
+        );
+        if packed.get("evidence").is_some() {
+            let enumerable = omitted_units + beyond.min(MAX_OMITTED_LISTED);
+            assert!(
+                listed(&packed) >= MIN_OMITTED_LISTED.min(enumerable),
+                "budget {budget}: {} listed of {enumerable} enumerable",
+                listed(&packed)
+            );
+        }
+        assert!(listed(&packed) <= MAX_OMITTED_LISTED);
+        packed
+    }
+
+    #[test]
+    fn disclosure_does_not_depend_on_spare_room() {
+        // Sweep the budget through every kind of remaining room, including
+        // "less than one omitted entry": the sizes involved do not matter.
+        let result = many_units(12);
+        let mut saw_tight_fit = false;
+        for budget in (100..=3200).step_by(7) {
+            let packed = check_disclosure(&result, 12, budget, 0);
+            if packed.get("evidence").is_some() && packed["pack"]["omitted_count"] != 0 {
+                if budget - measure(&packed) < 25 {
+                    saw_tight_fit = true;
+                }
+                assert!(listed(&packed) >= 1, "budget {budget}");
+            }
+        }
+        assert!(saw_tight_fit, "no budget left under one entry of room");
+        for budget in (700..=3200).step_by(13) {
+            check_disclosure(&result, 12, budget, 32);
+        }
+    }
+
+    #[test]
+    fn a_nearly_full_budget_gives_up_units_to_name_what_it_omitted() {
+        // A budget that holds three whole units with only a few tokens to
+        // spare cannot also hold the entries for the other nine: the
+        // lowest-ranked units are given up until three entries fit.
+        let three = measure(&apply(many_units(3), search_plan(None, &[], 0)));
+        for budget in three..three + 40 {
+            let packed = apply(many_units(12), search_plan(Some(budget), &[], 0));
+            let pack = &packed["pack"];
+            assert!(measure(&packed) <= budget, "budget {budget}");
+            assert_eq!(pack["within_budget"], true);
+            let kept = kept_paths(&packed);
+            assert!(!kept.is_empty() && kept.len() < 12, "budget {budget}");
+            assert_eq!(
+                pack["omitted_count"].as_u64().unwrap() as usize,
+                12 - kept.len()
+            );
+            assert_eq!(listed(&packed), MIN_OMITTED_LISTED, "budget {budget}");
+            for entry in pack["omitted"].as_array().unwrap() {
+                assert_eq!(entry["reason"], "over_budget");
+                assert!(!kept.contains(&entry["path"].as_str().unwrap().to_owned()));
+            }
+        }
+    }
+
+    #[test]
+    fn with_plenty_of_room_the_list_is_bounded_by_one_entry_per_250_tokens() {
+        let packed = apply(many_units(40), search_plan(Some(1500), &[], 0));
+        assert!(measure(&packed) <= 1500);
+        assert_eq!(listed(&packed), 1500 / BUDGET_TOKENS_PER_LISTED_OMISSION);
+        let kept = kept_paths(&packed).len();
+        assert_eq!(
+            packed["pack"]["omitted_count"].as_u64().unwrap() as usize,
+            40 - kept
+        );
+    }
+
+    #[test]
+    fn a_first_unit_that_is_too_big_does_not_cost_the_disclosure() {
+        let mut result = many_units(6);
+        result["evidence"][0]["snippet"] = json!("x".repeat(6000));
+        for budget in (300..=900).step_by(11) {
+            let packed = check_disclosure(&result, 6, budget, 0);
+            for item in packed["evidence"].as_array().into_iter().flatten() {
+                let snippet = item["snippet"].as_str().map_or(0, str::len);
+                assert!(snippet < 6000, "budget {budget}: the giant was kept whole");
+            }
+        }
+    }
+
+    #[test]
+    fn when_only_the_pack_fits_it_still_lists_as_many_entries_as_fit() {
+        let mut counts = Vec::new();
+        for budget in 60..400 {
+            let packed = apply(many_units(5), search_plan(Some(budget), &[], 0));
+            let pack = &packed["pack"];
+            if packed.get("evidence").is_some() || pack["within_budget"] == false {
+                continue;
+            }
+            assert!(measure(&packed) <= budget, "budget {budget}");
+            assert_eq!(pack["omitted_count"], 5);
+            counts.push(listed(&packed));
+        }
+        assert!(counts.windows(2).all(|w| w[0] <= w[1]), "{counts:?}");
+        assert!(
+            counts.iter().any(|n| (1..MIN_OMITTED_LISTED).contains(n)),
+            "{counts:?}"
+        );
+        assert_eq!(counts.last(), Some(&MIN_OMITTED_LISTED));
+    }
+
+    #[test]
+    fn candidates_cut_by_the_search_cap_are_named_even_when_every_unit_fits() {
+        // The shape of the CI failure: every evidence unit is kept, the only
+        // omissions are candidates the first cap cut, and nothing was listed.
+        let paths = beyond_paths(20);
+        let make = || search_plan(Some(2000), &[], 32).list_beyond_cap(&paths);
+        let packed = apply(many_units(3), make());
+        assert_eq!(kept_paths(&packed).len(), 3);
+        let pack = &packed["pack"];
+        assert_eq!(pack["omitted_count"], 32);
+        assert_eq!(pack["truncated"], true);
+        assert_eq!(listed(&packed), 8, "2000 tokens allow 8 entries");
+        assert_eq!(pack["omitted"][0]["path"], "src/far00.rs");
+        assert_eq!(pack["omitted"][0]["reason"], "below_cap");
+        assert!(measure(&packed) <= 2000);
+        assert_eq!(render(&packed), render(&apply(many_units(3), make())));
+    }
+
+    #[test]
+    fn naming_candidates_never_changes_the_count() {
+        let named = search_plan(None, &[], 32).list_beyond_cap(&beyond_paths(5));
+        assert_eq!((named.cap_omissions.len(), named.cap_unlisted), (5, 27));
+        let all = search_plan(None, &[], 3).list_beyond_cap(&beyond_paths(5));
+        assert_eq!((all.cap_omissions.len(), all.cap_unlisted), (3, 0));
+        let packed = apply(many_units(2), named);
+        assert_eq!(packed["pack"]["omitted_count"], 32);
+        assert_eq!(listed(&packed), 5);
     }
 
     #[test]
