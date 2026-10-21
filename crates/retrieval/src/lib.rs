@@ -319,6 +319,10 @@ impl Engine {
             snapshot,
             graph,
         } = {
+            // The commit is asked of the repository (a subprocess) BEFORE the
+            // read view opens: a view is a read snapshot that pins the write-
+            // ahead log, and should be held for database reads only.
+            let head = engram_repo_map::head_commit(repo_root);
             let view = store.begin_read()?;
             let facts = StoreFacts {
                 generation: view.generation(),
@@ -327,7 +331,7 @@ impl Engine {
                 hashes: store.file_hashes()?,
                 recency: store.recency_map()?,
                 cached: store.load_chunk_vectors()?,
-                snapshot: engram_repo_map::snapshot_id(store, repo_root)?,
+                snapshot: store.snapshot_id(&head)?,
                 graph: CodeGraph::build(store, repo_root)?,
             };
             drop(view);
@@ -375,8 +379,15 @@ impl Engine {
             // replaced. A row with no recorded hash cannot be checked.
             if let Some(Some(stored)) = hashes.get(&f.path) {
                 if *stored != engram_repo_map::inventory::hash_bytes(src.as_bytes()) {
+                    // Only a file whose derived facts the pending refresh will
+                    // replace is "ahead": it has symbols extracted from the
+                    // older bytes, or a language that is extracted at all. A
+                    // Markdown or JSON file has no symbols or imports, so its
+                    // edit leaves nothing stale and says nothing.
+                    if !symbols.is_empty() || engram_repo_map::symbols::supports(f.language) {
+                        files_ahead_of_index += 1;
+                    }
                     symbols.clear();
-                    files_ahead_of_index += 1;
                 }
             }
             for (start_line, symbol, text) in plan_chunks(&src, &body, &symbols) {
@@ -1949,6 +1960,28 @@ mod lazy_extraction_tests {
         assert!(!engine.is_stale(), "everything was already extracted");
     }
 
+    #[test]
+    fn only_files_with_extractable_facts_count_as_ahead_of_the_index() {
+        let repo = TempRepo::new();
+        repo.write("app.py", "def frobnicate_widgets():\n    return 1\n");
+        repo.write("notes.md", "# notes\n");
+        repo.write("conf.json", "{}\n");
+        engram_repo_map::index_repo(&repo.0, 100).expect("index");
+        let mut store = Store::open(&repo.0).expect("open store");
+
+        // A prose and a data file edited after indexing: they have no symbols
+        // or imports, so nothing about them can be stale and nothing is said.
+        repo.write("notes.md", "# notes, edited\n");
+        repo.write("conf.json", "{\"a\": 1}\n");
+        let engine = Engine::build(&repo.0, &mut store).expect("build engine");
+        assert_eq!(engine.files_ahead_of_index(), 0);
+
+        // A source file edited after indexing is exactly what the warning is for.
+        repo.write("app.py", "def frobnicate_widgets():\n    return 2\n");
+        let engine = Engine::build(&repo.0, &mut store).expect("build engine");
+        assert_eq!(engine.files_ahead_of_index(), 1);
+    }
+
     fn batch_replacing_symbols(
         path: &str,
         symbol_name: &str,
@@ -1956,6 +1989,7 @@ mod lazy_extraction_tests {
         use engram_repo_map::store::{Extraction, ExtractionUpdate, IndexBatch};
         IndexBatch {
             extractions: vec![ExtractionUpdate {
+                expected_hash: None,
                 path: path.to_owned(),
                 extraction: Extraction::Extracted {
                     symbols: vec![SymbolRecord {

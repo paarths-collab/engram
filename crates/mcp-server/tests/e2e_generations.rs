@@ -38,10 +38,23 @@ fn run_once(fx: &Fixture) -> u64 {
 }
 
 /// A restart after offline edits (a rename, a removed import, a deleted file,
-/// a renamed file) reconciles the cache as ONE generation, and by the time the
-/// server answers, the stale facts are already gone from it.
+/// a renamed file) moves the generation forward, and by the time the server
+/// answers, the stale facts are already gone from the cache and the new ones
+/// are in.
+///
+/// This test deliberately does NOT assert "exactly one generation". The
+/// startup reconcile is one generation (that is pinned exactly, without a
+/// filesystem watcher in the way, by the repo-map unit tests
+/// `a_reconcile_of_edits_removals_and_additions_is_exactly_one_generation` and
+/// `a_reconcile_beyond_the_per_generation_limit_is_published_in_atomic_chunks`),
+/// but this binary also runs the live watcher, and on macOS FSEvents can replay
+/// events for edits made just BEFORE it was spawned. The watcher publishes those
+/// only after the reconcile (it is held back until the index is Ready), where
+/// they usually find nothing to change, but a replay may still split what the
+/// fixture wrote into more than one generation. What must hold regardless is
+/// that the generation went up and that the facts are right once Ready.
 #[test]
-fn restart_after_offline_edits_is_exactly_one_generation_and_the_old_facts_are_gone() {
+fn restart_after_offline_edits_moves_the_generation_and_the_old_facts_are_gone() {
     if skip_without_git() {
         return;
     }
@@ -74,14 +87,16 @@ fn restart_after_offline_edits_is_exactly_one_generation_and_the_old_facts_are_g
     let ready = wait_ready(&mut client);
     let payload = ready.output.payload();
 
-    // The reconcile of every edit, removal and addition above was one publish.
-    assert_eq!(
-        generation_of(payload),
-        before + 1,
-        "{}",
+    // The reconcile of every edit, removal and addition above was published:
+    // the generation moved forward (by exactly one, bar a watcher replay: see
+    // the comment on this test).
+    let served = generation_of(payload);
+    assert!(
+        served > before,
+        "no new generation after the offline edits (served {served}, was {before}); {}",
         client.stderr_text()
     );
-    assert_eq!(stored_generation(&fx), before + 1, "and nothing else did");
+    assert!(stored_generation(&fx) >= served);
 
     // The cache itself, read directly: the old facts are gone, the new are in.
     let store = Store::open(&fx.root).expect("open the cache");
@@ -112,12 +127,12 @@ fn restart_after_offline_edits_is_exactly_one_generation_and_the_old_facts_are_g
         "the removed api -> service import edge survived the restart"
     );
 
-    // And the answer is of that generation, plainly current.
+    // And the answer is of a generation that has all of it, plainly current.
     let explain = client.ok(
         "explain_connection",
         json!({ "source": API, "target": SERVICE }),
     );
-    assert_eq!(generation_of(&explain), before + 1);
+    assert!(generation_of(&explain) > before, "{explain}");
     assert!(explain.get("index_state").is_none(), "{explain}");
     client.stop();
 }

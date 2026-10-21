@@ -19,7 +19,9 @@ pub mod symbols;
 
 use anyhow::Result;
 use std::path::Path;
-use store::{Extraction, ExtractionUpdate, FileUpdate, HistoryUpdate, IndexBatch, Store};
+use store::{
+    Extraction, ExtractionUpdate, FileUpdate, HistoryUpdate, IndexBatch, ReconcileGuard, Store,
+};
 
 /// Most extractions one published generation carries. A full reconcile whose
 /// eager extraction fits in this many files is ONE generation, including every
@@ -52,6 +54,38 @@ fn index_repo_in_generations(
     per_generation: usize,
 ) -> Result<IndexStats> {
     let mut store = Store::open(repo_root)?;
+    let staged = stage_reconcile(repo_root, &store, eager_tier1_limit, per_generation)?;
+    publish_reconcile(&mut store, staged)
+}
+
+/// A whole-repository reconcile, staged and not yet published: the batches to
+/// publish in order, and what staging counted.
+struct StagedReconcile {
+    batches: Vec<IndexBatch>,
+    files: usize,
+    cochange_edges: usize,
+    tier1_files: usize,
+}
+
+/// Stage a full reconcile: scan, walk the commit history and parse up to
+/// `eager_tier1_limit` files into batches, holding no write transaction.
+///
+/// Staging takes seconds on a large repository, and the first batch also
+/// carries the prune of every file the scan did not see and a fingerprint for
+/// every file it did. Anything published meanwhile (the file watcher, another
+/// process) is newer than the scan, so the first batch is guarded
+/// ([`ReconcileGuard`]): at publish it keeps rows whose files still exist, and
+/// leaves alone any row whose content hash is no longer the one the staging
+/// started from.
+fn stage_reconcile(
+    repo_root: &Path,
+    store: &Store,
+    eager_tier1_limit: usize,
+    per_generation: usize,
+) -> Result<StagedReconcile> {
+    // Read BEFORE the scan, so a row that changes at any time after this point
+    // (including while the scan runs) is seen to have moved on at publish.
+    let prior_hashes = store.file_hashes()?;
 
     let files = inventory::scan(repo_root);
     // Every file is upserted with its (size, mtime, hash) fingerprint, which
@@ -100,7 +134,7 @@ fn index_repo_in_generations(
     } else {
         Vec::new()
     };
-    let first = IndexBatch {
+    let mut batches = vec![IndexBatch {
         retain_only: Some(present),
         removals: Vec::new(),
         files: files
@@ -112,25 +146,47 @@ fn index_repo_in_generations(
             .collect(),
         extractions,
         history: Some(HistoryUpdate::from(history)),
-    };
-    let published = store.publish_batch_detailed(first)?;
+        guard: Some(ReconcileGuard {
+            root: repo_root.to_path_buf(),
+            prior_hashes,
+        }),
+    }];
+    // The later batches hold only extractions, each of which carries the hash
+    // of the bytes it was parsed from and so cannot overwrite newer facts.
     while !later.is_empty() {
         let next = if later.len() > per_generation {
             later.split_off(per_generation)
         } else {
             Vec::new()
         };
-        store.publish_batch(IndexBatch {
+        batches.push(IndexBatch {
             extractions: std::mem::replace(&mut later, next),
             ..IndexBatch::default()
-        })?;
+        });
     }
-
-    Ok(IndexStats {
+    Ok(StagedReconcile {
+        batches,
         files: file_count,
         cochange_edges,
         tier1_files: extracted,
-        pruned_files: published.pruned_files,
+    })
+}
+
+/// Publish the batches of a staged reconcile, in order, one generation each.
+fn publish_reconcile(store: &mut Store, staged: StagedReconcile) -> Result<IndexStats> {
+    let mut pruned_files = 0;
+    let mut superseded = 0;
+    for batch in staged.batches {
+        let published = store.publish_batch_detailed(batch)?;
+        pruned_files += published.pruned_files;
+        superseded += published.superseded;
+    }
+    Ok(IndexStats {
+        files: staged.files,
+        cochange_edges: staged.cochange_edges,
+        tier1_files: staged.tier1_files,
+        pruned_files,
+        superseded,
     })
 }
 
@@ -153,16 +209,22 @@ fn stage_extraction(
     path: &str,
     lang: engram_domain::Language,
 ) -> ExtractionUpdate {
-    let extraction = match std::fs::read_to_string(repo_root.join(path)) {
-        Ok(src) => Extraction::Extracted {
-            symbols: symbols::extract_file(path, &src, lang),
-            imports: symbols::extract_imports(&src, lang),
-        },
-        Err(_) => Extraction::Unreadable,
+    let (extraction, expected_hash) = match std::fs::read_to_string(repo_root.join(path)) {
+        Ok(src) => (
+            Extraction::Extracted {
+                symbols: symbols::extract_file(path, &src, lang),
+                imports: symbols::extract_imports(&src, lang),
+            },
+            // Of the very bytes parsed, so the publish can tell whether the
+            // file was replaced by newer content in the meantime.
+            Some(inventory::hash_bytes(src.as_bytes())),
+        ),
+        Err(_) => (Extraction::Unreadable, None),
     };
     ExtractionUpdate {
         path: path.to_owned(),
         extraction,
+        expected_hash,
     }
 }
 
@@ -332,6 +394,9 @@ pub struct IndexStats {
     pub tier1_files: usize,
     /// Paths dropped because they no longer exist in the repository.
     pub pruned_files: usize,
+    /// Files whose staged update lost to a newer publish (see
+    /// [`store::Published::superseded`]); the next pass retries them.
+    pub superseded: usize,
 }
 
 #[cfg(test)]
@@ -953,5 +1018,130 @@ mod tests {
         assert_eq!(symbol_names(&store, "pkg/x.rs"), vec!["new_name_here"]);
         assert_eq!(symbol_names(&store, "pkg/w.rs"), vec!["new_name_here"]);
         assert_eq!(count(&store, "files", "pkg/y.rs"), 0);
+    }
+
+    // ----- a reconcile racing other publishers -----
+
+    const THIRD: &str = "use third_mod::x;\nfn third_name() {}\n";
+
+    /// What the file watcher does with a burst of paths: stage them from the
+    /// disk as it is, publish once, from a handle of its own.
+    fn watcher_publishes(repo: &TempRepo, paths: &[&str]) -> store::Published {
+        let mut batch = IndexBatch::default();
+        for path in paths {
+            stage_reindex_file(&mut batch, &repo.0, path);
+        }
+        repo.store().publish_batch_detailed(batch).unwrap()
+    }
+
+    #[test]
+    fn a_file_created_and_one_edited_after_the_scan_are_neither_pruned_nor_overwritten() {
+        let repo = TempRepo::new();
+        repo.write_at("a.rs", OLD, 1_000_000);
+        repo.write_at("keep.rs", "fn keeper() {}\n", 1_000_000);
+        index_repo(&repo.0, 100).unwrap();
+        let generation = generation_of(&repo);
+
+        // The reconcile has scanned: it saw a.rs as OLD and has never heard of
+        // new.rs. Its publish is still to come.
+        let mut store = repo.store();
+        let staged = stage_reconcile(&repo.0, &store, 100, MAX_EXTRACTIONS_PER_GENERATION).unwrap();
+
+        // Meanwhile the user edits a.rs and creates new.rs, and the watcher
+        // (running alongside) publishes both.
+        repo.write_at("a.rs", NEW, 2_000_000);
+        repo.write_at("new.rs", "fn fresh() {}\n", 2_000_000);
+        let watcher = watcher_publishes(&repo, &["a.rs", "new.rs"]);
+        assert!(watcher.changed);
+
+        // Then the stale reconcile publishes.
+        let stats = publish_reconcile(&mut store, staged).unwrap();
+        assert_eq!(stats.pruned_files, 0, "new.rs exists; it is not missing");
+        assert_eq!(stats.superseded, 1, "a.rs's stale fingerprint was dropped");
+
+        let store = repo.store();
+        assert_eq!(count(&store, "files", "new.rs"), 1, "new.rs was pruned");
+        assert_eq!(symbol_names(&store, "new.rs"), vec!["fresh"]);
+        assert_eq!(symbol_names(&store, "a.rs"), vec!["new_name_here"]);
+        assert_eq!(imports_of(&store, "a.rs"), vec!["other_mod/stuff"]);
+        assert!(store.is_tier1_done("a.rs") && store.is_tier1_done("new.rs"));
+        assert_eq!(
+            store.file_hashes().unwrap()["a.rs"],
+            Some(inventory::hash_bytes(NEW.as_bytes())),
+            "a.rs's row went back to the older fingerprint"
+        );
+        assert_eq!(symbol_names(&store, "keep.rs"), vec!["keeper"]);
+        assert_eq!(
+            store.generation().unwrap(),
+            watcher.generation,
+            "the stale publish changed nothing, so it is no generation"
+        );
+        assert!(store.generation().unwrap() > generation);
+        // And a fresh reconcile agrees: nothing is left to fix.
+        let again = index_repo(&repo.0, 100).unwrap();
+        assert_eq!((again.tier1_files, again.pruned_files), (0, 0));
+        assert_eq!(generation_of(&repo), watcher.generation);
+    }
+
+    #[test]
+    fn an_extraction_staged_before_a_newer_edit_cannot_replace_the_newer_symbols() {
+        let repo = TempRepo::new();
+        repo.write_at("a.rs", OLD, 1_000_000);
+        index_repo(&repo.0, 100).unwrap();
+
+        // Offline edit; the reconcile scans it and parses NEW...
+        repo.write_at("a.rs", NEW, 2_000_000);
+        let mut store = repo.store();
+        let staged = stage_reconcile(&repo.0, &store, 100, MAX_EXTRACTIONS_PER_GENERATION).unwrap();
+        // ...and the file is edited again before the publish, and published.
+        repo.write_at("a.rs", THIRD, 3_000_000);
+        watcher_publishes(&repo, &["a.rs"]);
+
+        let stats = publish_reconcile(&mut store, staged).unwrap();
+        assert_eq!(stats.superseded, 1);
+        let store = repo.store();
+        assert_eq!(symbol_names(&store, "a.rs"), vec!["third_name"]);
+        assert_eq!(imports_of(&store, "a.rs"), vec!["third_mod/x"]);
+        assert!(store.is_tier1_done("a.rs"));
+        assert_eq!(
+            store.file_hashes().unwrap()["a.rs"],
+            Some(inventory::hash_bytes(THIRD.as_bytes()))
+        );
+    }
+
+    #[test]
+    fn a_file_removed_after_the_scan_is_not_resurrected_by_the_stale_publish() {
+        let repo = TempRepo::new();
+        repo.write_at("a.rs", OLD, 1_000_000);
+        repo.write_at("b.rs", NEW, 1_000_000);
+        index_repo(&repo.0, 100).unwrap();
+        // b.rs changes on disk offline, so the reconcile has work for it.
+        repo.write_at("b.rs", THIRD, 2_000_000);
+        let mut store = repo.store();
+        let staged = stage_reconcile(&repo.0, &store, 100, MAX_EXTRACTIONS_PER_GENERATION).unwrap();
+
+        std::fs::remove_file(repo.0.join("b.rs")).unwrap();
+        watcher_publishes(&repo, &["b.rs"]);
+        assert_eq!(count(&repo.store(), "files", "b.rs"), 0);
+
+        publish_reconcile(&mut store, staged).unwrap();
+        let store = repo.store();
+        for table in ["files", "symbols", "file_imports"] {
+            assert_eq!(count(&store, table, "b.rs"), 0, "{table} resurrected b.rs");
+        }
+        assert_eq!(symbol_names(&store, "a.rs"), vec!["old_name"]);
+    }
+
+    #[test]
+    fn a_staged_extraction_carries_the_hash_of_the_bytes_it_parsed() {
+        let repo = TempRepo::new();
+        repo.write_at("a.rs", OLD, 1_000_000);
+        let update = stage_extraction(&repo.0, "a.rs", engram_domain::Language::Rust);
+        assert_eq!(
+            update.expected_hash,
+            Some(inventory::hash_bytes(OLD.as_bytes()))
+        );
+        let missing = stage_extraction(&repo.0, "gone.rs", engram_domain::Language::Rust);
+        assert_eq!(missing.expected_hash, None);
     }
 }

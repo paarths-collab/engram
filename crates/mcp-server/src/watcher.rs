@@ -4,6 +4,12 @@
 //! graph. Either way it flips a `dirty` flag; the server rebuilds the in-memory
 //! index lazily on the next tool call (cheap — only changed files re-embed).
 //!
+//! The watcher publishes nothing until the startup index job has ended (ready
+//! or failed). That job reconciles the whole repository from one scan and
+//! publishes it at the end; a watcher publish landing in the middle would race
+//! it. Events that arrive meanwhile are kept, and staged from the disk as it is
+//! once the job is done (see [`run_events`]).
+//!
 //! Events are coalesced: a burst is staged in memory and published as ONE
 //! generation (one transaction), so readers see a burst entirely or not at all.
 //! If a publish fails the previous generation stays intact and the failure is
@@ -20,6 +26,7 @@ use notify::{event::ModifyKind, EventKind, RecursiveMode, Watcher};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -35,6 +42,13 @@ const DEBOUNCE: Duration = Duration::from_millis(75);
 /// after its first one, however busy the stream stays.
 const MAX_BATCH_EVENTS: usize = 2000;
 const MAX_BATCH_WAIT: Duration = Duration::from_secs(1);
+
+/// How often a watcher whose index job is still running looks at it again.
+const GATE_POLL: Duration = Duration::from_millis(50);
+
+/// Answers "has the startup index job ended?" (successfully or not). Until it
+/// does, the watcher holds its events back.
+pub type Gate = Arc<dyn Fn() -> bool + Send + Sync>;
 
 /// What is currently wrong with live reindexing, if anything.
 #[derive(Debug, Default)]
@@ -109,11 +123,11 @@ pub fn warnings(health: &SharedHealth) -> Vec<String> {
 
 /// Spawn the watcher thread. The server stays fully functional if it fails
 /// (just without live reindex), and the failure is recorded in `health`.
-pub fn spawn(repo_root: PathBuf, dirty: Arc<AtomicBool>, health: SharedHealth) {
+pub fn spawn(repo_root: PathBuf, dirty: Arc<AtomicBool>, health: SharedHealth, gate: Gate) {
     let thread_health = health.clone();
     let spawned = std::thread::Builder::new()
         .name("engram-watcher".into())
-        .spawn(move || run_and_record(&repo_root, &dirty, &thread_health));
+        .spawn(move || run_and_record(&repo_root, &dirty, &thread_health, &gate));
     if let Err(e) = spawned {
         eprintln!("[engram] could not start the file watcher thread: {e}");
         lock(&health).mark_not_running(&format!("could not start its thread: {e}"));
@@ -122,9 +136,9 @@ pub fn spawn(repo_root: PathBuf, dirty: Arc<AtomicBool>, health: SharedHealth) {
 
 /// The watcher thread body: run to completion, and make sure that however it
 /// ends (an error, a clean stop, a panic) the health says it is not running.
-fn run_and_record(repo_root: &Path, dirty: &Arc<AtomicBool>, health: &SharedHealth) {
+fn run_and_record(repo_root: &Path, dirty: &Arc<AtomicBool>, health: &SharedHealth, gate: &Gate) {
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run(repo_root, dirty, health)
+        run(repo_root, dirty, health, gate)
     }));
     let reason = match outcome {
         Ok(Ok(())) => "its event stream ended".to_owned(),
@@ -138,7 +152,12 @@ fn run_and_record(repo_root: &Path, dirty: &Arc<AtomicBool>, health: &SharedHeal
     lock(health).mark_not_running(&reason);
 }
 
-fn run(repo_root: &Path, dirty: &Arc<AtomicBool>, health: &SharedHealth) -> notify::Result<()> {
+fn run(
+    repo_root: &Path,
+    dirty: &Arc<AtomicBool>,
+    health: &SharedHealth,
+    gate: &Gate,
+) -> notify::Result<()> {
     let (tx, rx) = std::sync::mpsc::channel();
     let mut watcher = notify::recommended_watcher(move |res| {
         let _ = tx.send(res);
@@ -148,13 +167,52 @@ fn run(repo_root: &Path, dirty: &Arc<AtomicBool>, health: &SharedHealth) -> noti
 
     // The watcher handle must stay alive for the lifetime of the loop.
     let mut store = Store::open(repo_root).map_err(|e| notify::Error::generic(&e.to_string()))?;
-    // One batch per burst of events: a save, a `git checkout` or a build step
-    // produces dozens of events within milliseconds, and each used to be its own
-    // transaction (and its own generation). Wait for the burst to go quiet, then
-    // stage everything it touched and publish it as ONE generation.
-    while let Ok(first) = rx.recv() {
+    run_events(&rx, repo_root, &mut store, dirty, health, &**gate);
+    drop(watcher);
+    Ok(())
+}
+
+/// The watcher's event loop: hold events back until `index_settled` says the
+/// startup index job has ended, then publish them in debounced bursts until the
+/// channel closes.
+///
+/// While the job runs, incoming events are only collected. The job stages the
+/// whole repository from one scan and publishes it at its end, so anything this
+/// loop published meanwhile would race that publish; instead the collected
+/// events are handled once the job is done, each path staged from the disk as
+/// it is THEN (which is why holding them is lossless: an event only names a
+/// path to look at). The gate is polled, not signalled: the wait is a
+/// `recv_timeout`, so a closed channel still ends the loop promptly.
+fn run_events(
+    rx: &Receiver<notify::Result<notify::Event>>,
+    repo_root: &Path,
+    store: &mut Store,
+    dirty: &Arc<AtomicBool>,
+    health: &SharedHealth,
+    index_settled: &dyn Fn() -> bool,
+) {
+    let mut backlog = Vec::new();
+    loop {
+        while !index_settled() {
+            match rx.recv_timeout(GATE_POLL) {
+                Ok(item) => backlog.push(item),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
+        }
+        // One batch per burst of events: a save, a branch checkout or a build
+        // step produces dozens of events within milliseconds, and each used to
+        // be its own transaction (and its own generation). Wait for the burst
+        // to go quiet, then stage everything it touched and publish it as ONE
+        // generation.
+        let mut burst = std::mem::take(&mut backlog);
+        if burst.is_empty() {
+            match rx.recv() {
+                Ok(first) => burst.push(first),
+                Err(_) => return,
+            }
+        }
         let started = Instant::now();
-        let mut burst = vec![first];
         while burst.len() < MAX_BATCH_EVENTS && started.elapsed() < MAX_BATCH_WAIT {
             match rx.recv_timeout(DEBOUNCE) {
                 Ok(next) => burst.push(next),
@@ -163,11 +221,10 @@ fn run(repo_root: &Path, dirty: &Arc<AtomicBool>, health: &SharedHealth) -> noti
                 Err(_) => break,
             }
         }
-        if process_burst(burst, repo_root, &mut store, health) {
+        if process_burst(burst, repo_root, store, health) {
             dirty.store(true, Ordering::SeqCst);
         }
     }
-    Ok(())
 }
 
 /// Handle one item from the watcher's channel. Returns whether the index
@@ -367,6 +424,20 @@ mod tests {
         }
     }
 
+    /// A gate for a test that is not about the startup job: already open.
+    fn open_gate() -> Gate {
+        Arc::new(|| true)
+    }
+
+    /// Poll `ready` until it holds or ten seconds pass; never an open-ended wait.
+    fn wait_until(what: &str, ready: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ready() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     fn modify_event(path: PathBuf) -> notify::Event {
         notify::Event::new(EventKind::Modify(ModifyKind::Any)).add_path(path)
     }
@@ -490,7 +561,7 @@ mod tests {
             std::process::id(),
             COUNTER.fetch_add(1, Ordering::SeqCst)
         ));
-        run_and_record(&missing, &dirty, &health);
+        run_and_record(&missing, &dirty, &health, &open_gate());
 
         let warnings = warnings(&health);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
@@ -508,7 +579,12 @@ mod tests {
         let repo = TempRepo::new();
         std::fs::write(repo.0.join(".engram"), "not a directory").unwrap();
         let health = SharedHealth::default();
-        run_and_record(&repo.0, &Arc::new(AtomicBool::new(false)), &health);
+        run_and_record(
+            &repo.0,
+            &Arc::new(AtomicBool::new(false)),
+            &health,
+            &open_gate(),
+        );
         assert_eq!(warnings(&health).len(), 1);
     }
 
@@ -577,5 +653,127 @@ mod tests {
         assert!(handle_event(&removed, &repo.0, &mut store, &health));
         assert!(store.all_files().unwrap().is_empty());
         assert!(store.symbols_matching("a", 5).unwrap().is_empty());
+    }
+
+    /// The event loop on its own thread, fed through a channel the test owns,
+    /// with a gate the test opens. Reports when the loop returns.
+    struct LoopFixture {
+        events: std::sync::mpsc::Sender<notify::Result<notify::Event>>,
+        settled: Arc<AtomicBool>,
+        gate_polls: Arc<std::sync::atomic::AtomicUsize>,
+        dirty: Arc<AtomicBool>,
+        ended: Receiver<()>,
+    }
+
+    impl LoopFixture {
+        fn start(repo: &TempRepo) -> Self {
+            let (events, rx) = std::sync::mpsc::channel();
+            let settled = Arc::new(AtomicBool::new(false));
+            let gate_polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let dirty = Arc::new(AtomicBool::new(false));
+            let (ended_tx, ended) = std::sync::mpsc::channel();
+            let (root, health) = (repo.0.clone(), SharedHealth::default());
+            let (gate_settled, gate_count, loop_dirty) =
+                (settled.clone(), gate_polls.clone(), dirty.clone());
+            std::thread::spawn(move || {
+                let mut store = Store::open(&root).unwrap();
+                let gate = move || {
+                    gate_count.fetch_add(1, Ordering::SeqCst);
+                    gate_settled.load(Ordering::SeqCst)
+                };
+                run_events(&rx, &root, &mut store, &loop_dirty, &health, &gate);
+                let _ = ended_tx.send(());
+            });
+            LoopFixture {
+                events,
+                settled,
+                gate_polls,
+                dirty,
+                ended,
+            }
+        }
+    }
+
+    #[test]
+    fn nothing_is_published_while_the_index_job_runs_and_the_backlog_is_published_after() {
+        let repo = TempRepo::new();
+        std::fs::write(repo.0.join("a.rs"), "fn first() {}\n").unwrap();
+        let fixture = LoopFixture::start(&repo);
+        let observer = Store::open(&repo.0).unwrap();
+
+        fixture
+            .events
+            .send(Ok(modify_event(repo.0.join("a.rs"))))
+            .unwrap();
+        // The loop has looked at the closed gate several times with the event
+        // queued, and has published nothing.
+        let polled = fixture.gate_polls.load(Ordering::SeqCst);
+        wait_until("the loop to keep waiting on the gate", || {
+            fixture.gate_polls.load(Ordering::SeqCst) >= polled + 3
+        });
+        assert!(observer.all_files().unwrap().is_empty());
+        assert_eq!(observer.generation().unwrap(), 0);
+        assert!(!fixture.dirty.load(Ordering::SeqCst));
+
+        // The file moves on while the job is still running: the held event is
+        // staged from the disk as it is when the job ends, not as it was.
+        std::fs::write(repo.0.join("a.rs"), "fn second() {}\n").unwrap();
+        fixture.settled.store(true, Ordering::SeqCst);
+        wait_until("the backlog to be published", || {
+            !observer.symbols_matching("second", 5).unwrap().is_empty()
+        });
+        assert!(observer.symbols_matching("first", 5).unwrap().is_empty());
+        assert!(fixture.dirty.load(Ordering::SeqCst));
+
+        // And it keeps working live afterwards.
+        std::fs::write(repo.0.join("b.rs"), "fn third() {}\n").unwrap();
+        fixture
+            .events
+            .send(Ok(modify_event(repo.0.join("b.rs"))))
+            .unwrap();
+        wait_until("a live event to be published", || {
+            !observer.symbols_matching("third", 5).unwrap().is_empty()
+        });
+        drop(fixture.events);
+        assert!(fixture.ended.recv_timeout(Duration::from_secs(10)).is_ok());
+    }
+
+    #[test]
+    fn the_loop_ends_when_its_channel_closes_even_though_the_index_job_never_ended() {
+        let repo = TempRepo::new();
+        let fixture = LoopFixture::start(&repo);
+        fixture
+            .events
+            .send(Ok(modify_event(repo.0.join("a.rs"))))
+            .unwrap();
+        let polled = fixture.gate_polls.load(Ordering::SeqCst);
+        wait_until("the loop to be waiting on the gate", || {
+            fixture.gate_polls.load(Ordering::SeqCst) > polled
+        });
+        let LoopFixture { events, ended, .. } = fixture;
+        drop(events);
+        assert!(
+            ended.recv_timeout(Duration::from_secs(10)).is_ok(),
+            "the loop did not notice the channel closing while gated"
+        );
+    }
+
+    #[test]
+    fn a_gate_that_is_already_open_publishes_straight_away() {
+        let repo = TempRepo::new();
+        std::fs::write(repo.0.join("a.rs"), "fn now() {}\n").unwrap();
+        let fixture = LoopFixture::start(&repo);
+        fixture.settled.store(true, Ordering::SeqCst);
+        fixture
+            .events
+            .send(Ok(modify_event(repo.0.join("a.rs"))))
+            .unwrap();
+        let observer = Store::open(&repo.0).unwrap();
+        wait_until("the event to be published", || {
+            !observer.symbols_matching("now", 5).unwrap().is_empty()
+        });
+        let LoopFixture { events, ended, .. } = fixture;
+        drop(events);
+        assert!(ended.recv_timeout(Duration::from_secs(10)).is_ok());
     }
 }

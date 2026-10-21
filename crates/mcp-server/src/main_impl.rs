@@ -2,7 +2,7 @@
 //! Usage: engram --repo /path/to/repo   (defaults to cwd)
 
 use crate::mcp::{serve, ToolHandler};
-use crate::watcher::SharedHealth;
+use crate::watcher::{Gate, SharedHealth};
 use engram_repo_map::store::Store;
 use engram_retrieval::budget::{self, PackPlan};
 use engram_retrieval::{Engine, GraphCaps, GraphKinds, GRAPH_MAX_EDGES, GRAPH_MAX_NODES};
@@ -35,6 +35,16 @@ fn lock_state(state: &SharedIndexState) -> MutexGuard<'_, IndexState> {
     state
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The watcher's gate on this state: closed while the startup index job runs,
+/// open once it has ended either way (`Ready` or `Failed`; the job records one
+/// of the two even when it panics, see [`run_index_job`]). The watcher holds
+/// its events back until then, so it never publishes into the middle of the
+/// job's own staged publish.
+fn index_settled_gate(state: &SharedIndexState) -> Gate {
+    let state = state.clone();
+    Arc::new(move || !matches!(*lock_state(&state), IndexState::Indexing { .. }))
 }
 
 /// What a client is told while the first index is still being built.
@@ -107,8 +117,13 @@ fn default_index_job(root: PathBuf) -> impl FnOnce() -> anyhow::Result<()> + Sen
     move || {
         let stats = engram_repo_map::index_repo(&root, EAGER_TIER1_LIMIT)?;
         eprintln!(
-            "[engram] indexed: {} files, {} cochange edges, {} tier1 files, {} pruned",
-            stats.files, stats.cochange_edges, stats.tier1_files, stats.pruned_files
+            "[engram] indexed: {} files, {} cochange edges, {} tier1 files, {} pruned, \
+             {} superseded by newer edits",
+            stats.files,
+            stats.cochange_edges,
+            stats.tier1_files,
+            stats.pruned_files,
+            stats.superseded
         );
         Ok(())
     }
@@ -150,6 +165,21 @@ const INDEXED_TOOLS: &[&str] = &[
     "explain_connection",
     "get_graph",
 ];
+
+/// What to tell a client when the cache database could not be put in WAL mode
+/// (a network or otherwise unusual filesystem). Readers and the writer then
+/// block one another: a rebuild that reads the database holds off the watcher's
+/// publishes, and a publish holds off reads, until the busy timeout. Results
+/// are still consistent, but live refreshes may lag or fail.
+fn journal_mode_warning(mode: &str) -> Option<String> {
+    (mode != "wal").then(|| {
+        format!(
+            "the index cache runs in journal mode `{mode}`, not `wal` (typical of a network \
+             filesystem): reads and index updates block one another, so live refreshes may \
+             lag or fail"
+        )
+    })
+}
 
 /// The `index_state` object attached to a response when the index is not
 /// plainly Ready and current.
@@ -278,7 +308,12 @@ impl Engram {
         let dirty = Arc::new(AtomicBool::new(false));
         let watcher_health = SharedHealth::default();
         if watch {
-            crate::watcher::spawn(repo_root.clone(), dirty.clone(), watcher_health.clone());
+            crate::watcher::spawn(
+                repo_root.clone(),
+                dirty.clone(),
+                watcher_health.clone(),
+                index_settled_gate(&index_state),
+            );
         }
         Engram {
             repo_root,
@@ -380,6 +415,13 @@ impl Engram {
     /// changed on disk before the refresh was published.
     fn index_warnings(&self) -> Vec<String> {
         let mut warnings = crate::watcher::warnings(&self.watcher_health);
+        if let Some(warning) = self
+            .store
+            .as_ref()
+            .and_then(|store| journal_mode_warning(store.journal_mode()))
+        {
+            warnings.push(warning);
+        }
         if let Some(err) = &self.rebuild_error {
             warnings.push(format!(
                 "rebuilding the index failed ({err}); results come from the previous snapshot \
@@ -1107,6 +1149,52 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn the_watcher_gate_opens_exactly_when_the_index_job_has_ended_however_it_ended() {
+        use std::sync::mpsc;
+        for outcome in ["ready", "failed", "panicked"] {
+            let state: SharedIndexState = Arc::new(Mutex::new(IndexState::Indexing {
+                started: Instant::now(),
+            }));
+            let gate = index_settled_gate(&state);
+            assert!(!gate(), "{outcome}: closed before the job starts");
+
+            let (running_tx, running_rx) = mpsc::channel::<()>();
+            let (finish_tx, finish_rx) = mpsc::channel::<()>();
+            let job_state = state.clone();
+            let job = std::thread::spawn(move || {
+                run_index_job(&job_state, move || {
+                    let _ = running_tx.send(());
+                    // Bounded: a test that failed elsewhere must not hang here.
+                    let _ = finish_rx.recv_timeout(Duration::from_secs(10));
+                    match outcome {
+                        "ready" => Ok(()),
+                        "failed" => Err(anyhow::anyhow!("boom")),
+                        _ => panic!("boom"),
+                    }
+                });
+            });
+            running_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the job started");
+            assert!(!gate(), "{outcome}: closed while the job runs");
+
+            finish_tx.send(()).unwrap();
+            job.join().unwrap();
+            assert!(gate(), "{outcome}: open once the job has ended");
+        }
+    }
+
+    #[test]
+    fn a_cache_that_is_not_in_wal_mode_is_said_so_and_wal_says_nothing() {
+        assert_eq!(journal_mode_warning("wal"), None);
+        let warning = journal_mode_warning("delete").expect("a warning");
+        assert!(
+            warning.contains("`delete`") && warning.contains("`wal`"),
+            "{warning}"
+        );
     }
 
     /// One call to every tool that needs the index.

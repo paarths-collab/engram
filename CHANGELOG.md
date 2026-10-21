@@ -32,11 +32,22 @@ release tags.
   response stale rather than mixing generations; a search served by an out-of-date
   engine skips its lazy extraction and live symbol lookups. See `docs/CONTRACT.md`,
   "Index generations".
+- **A staged update never overwrites a newer publish.** Every extraction now
+  carries the content hash of the bytes it was parsed from, and the publish
+  skips it (counted as `superseded`, left to be redone) when the file's row
+  already holds different content, so a lazy extraction that waited for the
+  write lock can no longer put old symbols on a row that has new content. The
+  startup reconcile re-checks inside its transaction that it is not
+  overwriting a row that changed since it began, not re-adding a file that
+  vanished, and not pruning a file that exists; the file watcher now holds its
+  events until the startup index job has ended and publishes them after.
 - **Spans never come from a different version of a file.** When an engine is
   built, a file whose bytes no longer match the hash its symbols were extracted
   from (an edit the watcher has not published yet) has its symbols left out
   instead of cutting old line spans out of new text, and `index_warnings` says
-  how many files.
+  how many files. Only files that have symbols or a language with a parser are
+  counted, so editing a Markdown or JSON file no longer marks every response
+  stale. If the cache cannot run in WAL mode, `index_warnings` says so.
 - **Citable graph facts.** Every import and co-change edge has a content-derived
   `edge_id` (`e_` plus 16 hex digits: a 64-bit FNV-1a over the snapshot id, the
   edge kind, its endpoints, and the full import chain or the co-change

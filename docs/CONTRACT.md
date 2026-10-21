@@ -717,7 +717,10 @@ Guarantees:
   yet is not a generation. While building an engine, a file whose content no
   longer matches the hash its symbols were extracted from has its symbols left
   out (their line spans would point at the wrong lines), and a warning says how
-  many files; the watcher's publish replaces the engine and clears it.
+  many files; the watcher's publish replaces the engine and clears it. Only a
+  file the pending refresh would re-extract counts: one whose language has a
+  parser, or that has symbols stored. An edited Markdown, JSON or other
+  parser-less file has no symbols or imports to be stale and is not counted.
 
 Limits, stated plainly:
 
@@ -726,9 +729,26 @@ Limits, stated plainly:
   in further generations of up to 5000 each, to bound memory. The first carries
   the inventory, the removals and the history; every one is atomic by itself,
   but the reconcile as a whole is then not.
-- Two writers publish one after the other, never merged. A staged extraction is
-  a snapshot of the disk when it was read: if the same file changes between
-  staging and publish, the next scan or watcher event corrects it, as before.
+- Two writers publish one after the other, never merged. What a writer stages
+  is a snapshot of the disk when it was read, and a newer publish may land
+  before it commits (the file watcher, another process, a lazy extraction that
+  waited for the write lock). A staged update never overwrites newer facts:
+  - Every extraction carries the content hash of the exact bytes it was parsed
+    from. If the file's row already holds a different hash, the extraction is
+    **superseded**: it is skipped, the row is left as the newer publish left it
+    (a row with no extraction yet stays `tier1_done = 0`, so the next pass
+    redoes it), and it is counted in the publish's `superseded` result.
+  - A whole-repository reconcile (the startup index) takes seconds to stage. At
+    publish it re-checks, inside the transaction, that a row it would overwrite
+    still holds the content hash it started from (otherwise that file's update
+    is superseded too), that a file it would add still exists, and it prunes a
+    row it did not see only if the file is really gone from the disk (or no
+    longer indexable): a file created while it ran is kept.
+  - The file watcher publishes nothing until the startup index job has ended
+    (ready or failed). Events that arrive meanwhile are held and staged from the
+    disk as it is once the job is done, so the two never publish concurrently
+    within one server. The reconcile's publish-time checks above are the
+    defence for a second process.
 - Rebuilding the in-memory engine after a publish still costs a pass over the
   indexed files (cached embeddings make it cheap, not free); a publish does not
   patch the engine in place.
@@ -759,6 +779,22 @@ transaction (see [Index generations](#index-generations)). Readers never take
 it. An engine is built from a single read transaction, which in WAL mode is a
 snapshot, so a publish by the watcher while an engine is being built can neither
 block the build nor leak into it half-way.
+
+**This non-blocking behaviour holds only in WAL mode.** Engram asks SQLite for
+WAL when it opens the cache and checks the mode it got back. On a filesystem
+that cannot do WAL (some network and virtual filesystems) the cache stays in a
+rollback-journal mode: readers still see one consistent generation, but a read
+transaction and a write transaction exclude each other, so a long engine build
+can make the watcher's publish wait out the 10 second lock timeout (it is then
+reported as a failed refresh) and the reverse. In that case every index-backed
+response carries an `index_warnings` entry: `the index cache runs in journal mode
+`{mode}`, not `wal` (typical of a network filesystem): reads and index updates
+block one another, so live refreshes may lag or fail`.
+
+While an engine is built, the read transaction stays open across the reads of
+the store and of a few repository manifest files that resolve import targets (a
+handful of small reads); it is not held across the `git` subprocess that names
+the checked-out commit, which runs first.
 
 A failed history walk (the directory is not a git repository, it has no commits
 yet, or `git` cannot be run) stores no co-change rows and leaves the
@@ -791,6 +827,10 @@ Watcher problems are reported the same way, as `index_warnings` entries:
 - `file watcher reported an error ({err}); some file changes may have been missed`
 - `file watcher could not refresh {what} ({err}); results for it may be stale`
 - `file watcher could not refresh {n} more paths`
+- `{n} indexed file(s) changed on disk before their refresh was published; their symbols are left out of these results until it is`
+  (an edit the watcher has not published yet; see [Index generations](#index-generations))
+- `the index cache runs in journal mode `{mode}`, not `wal` ...` (see
+  [Local cache and concurrency](#local-cache-and-concurrency))
 
 `index_warnings` and `index_state` are absent when the answer is current. On a
 restart, files edited while the server was stopped are re-fingerprinted before
