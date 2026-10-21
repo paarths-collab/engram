@@ -13,12 +13,42 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// How long a connection waits for another writer's lock before giving up with
 /// "database is locked". Indexing, the file watcher and request handlers each
 /// open their own connection to the same file, so brief contention is normal.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Whether `e` is SQLite saying another connection holds a lock it needs
+/// (`SQLITE_BUSY` / `SQLITE_LOCKED`).
+fn is_lock_contention(e: &anyhow::Error) -> bool {
+    matches!(
+        e.downcast_ref::<rusqlite::Error>(),
+        Some(rusqlite::Error::SqliteFailure(f, _))
+            if matches!(
+                f.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+    )
+}
+
+/// Run `attempt` until it succeeds, fails for a reason other than lock
+/// contention, or `deadline` passes. The busy timeout does not cover every
+/// case (a journal-mode switch, or a lock upgrade that would deadlock, is
+/// refused at once), so those are retried here with a short, growing sleep.
+fn retry_while_busy<T>(deadline: Instant, mut attempt: impl FnMut() -> Result<T>) -> Result<T> {
+    let mut pause = Duration::from_millis(1);
+    loop {
+        match attempt() {
+            Err(e) if is_lock_contention(&e) && Instant::now() < deadline => {
+                std::thread::sleep(pause);
+                pause = (pause * 2).min(Duration::from_millis(50));
+            }
+            other => return other,
+        }
+    }
+}
 
 /// Identity of one embedded chunk: the file, and the one-based line its span
 /// starts at. `0` is reserved for the whole-file fallback used when a file has
@@ -307,13 +337,40 @@ impl Store {
         // First, before any statement: switching to WAL and creating the schema
         // both need a lock another connection may hold at this very moment.
         conn.busy_timeout(BUSY_TIMEOUT)?;
+        // Several connections open a brand-new cache at the same moment (the
+        // index thread, the watcher, the request handler). SQLite reports
+        // SQLITE_BUSY at once, without consulting the busy timeout, when two of
+        // them race to switch the journal mode or when a lock upgrade could
+        // deadlock, so both steps below are retried until this deadline.
+        let deadline = Instant::now() + BUSY_TIMEOUT;
         // The pragma answers with the mode now in force, which is not the one
         // asked for when the filesystem cannot do WAL: it must be looked at.
-        let journal_mode: String = conn
-            .query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))
-            .map(|mode: String| mode.to_ascii_lowercase())?;
-        conn.execute_batch(
-            r#"
+        let journal_mode: String = retry_while_busy(deadline, || {
+            conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))
+                .map(|mode: String| mode.to_ascii_lowercase())
+                .map_err(anyhow::Error::from)
+        })?;
+        // Schema, migrations and the fingerprint check are one write
+        // transaction: an opener that loses the race waits on the busy handler
+        // for the winner's commit and then finds everything already in place.
+        retry_while_busy(deadline, || Self::initialise(&conn, fingerprint))?;
+        Ok(Store {
+            conn,
+            journal_mode,
+            #[cfg(test)]
+            between_extraction_writes: None,
+        })
+    }
+
+    /// Create the schema, migrate an older database, and reconcile the rules
+    /// fingerprint, all inside one `BEGIN IMMEDIATE` transaction. Everything
+    /// here is idempotent, and the stored version/fingerprint is re-read
+    /// inside the transaction, so concurrent first-opens initialise exactly
+    /// once and none of them repeats or undoes another's work.
+    fn initialise(conn: &Connection, fingerprint: &str) -> Result<()> {
+        Self::in_immediate_tx(conn, |conn| {
+            conn.execute_batch(
+                r#"
             CREATE TABLE IF NOT EXISTS files (
                 path TEXT PRIMARY KEY,
                 language TEXT NOT NULL,
@@ -427,15 +484,27 @@ impl Store {
             CREATE INDEX IF NOT EXISTS idx_review_comments_path ON review_comments(path);
             CREATE INDEX IF NOT EXISTS idx_review_comments_pr ON review_comments(pr_number);
             "#,
-        )?;
-        Self::migrate(&conn);
-        Self::reconcile_parser_version(&conn, fingerprint)?;
-        Ok(Store {
-            conn,
-            journal_mode,
-            #[cfg(test)]
-            between_extraction_writes: None,
+            )?;
+            Self::migrate(conn);
+            Self::reset_derived_data_on_mismatch(conn, fingerprint)
         })
+    }
+
+    /// Run `body` inside `BEGIN IMMEDIATE ... COMMIT`, rolling back when it (or
+    /// the commit) fails. Taking the write lock up front makes a contended
+    /// opener wait on the busy handler instead of failing at a lock upgrade.
+    fn in_immediate_tx(
+        conn: &Connection,
+        body: impl FnOnce(&Connection) -> Result<()>,
+    ) -> Result<()> {
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        match body(conn).and_then(|()| conn.execute_batch("COMMIT").map_err(Into::into)) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
     }
 
     /// The journal mode the database runs in (`wal` normally).
@@ -453,17 +522,37 @@ impl Store {
     /// rules fingerprint (see [`PARSER_CONFIG_VERSION`]). A brand-new database
     /// has nothing to discard and just records the fingerprint.
     ///
-    /// The check and the wipe happen under one `BEGIN IMMEDIATE` transaction,
-    /// and the stored value is read again inside it: of several connections
-    /// that opened at the same moment and all saw the mismatch, only the first
-    /// to take the write lock wipes; the rest find the fingerprint already
-    /// updated and must not discard what the first has since written.
-    fn reconcile_parser_version(conn: &Connection, version: &str) -> Result<()> {
-        // Cheap path with no write lock: the common case is a match.
-        if Self::stored_parser_version(conn)?.as_deref() == Some(version) {
+    /// Runs inside the open-time `BEGIN IMMEDIATE` transaction (see
+    /// [`Store::initialise`]), and the stored value is read inside it: of
+    /// several connections that opened at the same moment and all saw the
+    /// mismatch, only the first to take the write lock wipes; the rest find the
+    /// fingerprint already updated and must not discard what the first has
+    /// since written. The wipe and the version bump commit together, so a crash
+    /// midway cannot leave the derived data wiped but the old version recorded.
+    fn reset_derived_data_on_mismatch(conn: &Connection, version: &str) -> Result<()> {
+        let stored = Self::stored_parser_version(conn)?;
+        if stored.as_deref() == Some(version) {
             return Ok(());
         }
-        Self::reset_if_still_mismatched(conn, version)
+        // Discarding derived data changes what readers see, so it is a
+        // generation of its own. A brand-new database (nothing recorded
+        // yet) has nothing to discard and stays at generation 0.
+        if stored.is_some() {
+            Self::bump_generation(conn)?;
+        }
+        conn.execute_batch(
+            "DELETE FROM symbols;
+             DELETE FROM file_imports;
+             DELETE FROM vectors;
+             DELETE FROM chunk_vectors;
+             UPDATE files SET tier1_done = 0;",
+        )?;
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = ?2",
+            params![PARSER_VERSION_KEY, version],
+        )?;
+        Ok(())
     }
 
     fn stored_parser_version(conn: &Connection) -> Result<Option<String>> {
@@ -476,48 +565,13 @@ impl Store {
             .optional()?)
     }
 
-    /// The locked half of [`Store::reconcile_parser_version`]: the caller has
-    /// seen a mismatch, but that may be stale by the time the write lock is
-    /// held, so the stored value is read again inside the transaction.
+    /// [`Store::reset_derived_data_on_mismatch`] in a transaction of its own,
+    /// for tests that drive it on a connection that is not being opened.
+    #[cfg(test)]
     fn reset_if_still_mismatched(conn: &Connection, version: &str) -> Result<()> {
-        // One transaction: a crash midway must not leave the derived data
-        // wiped but the old version recorded, which would trust the empty tables.
-        conn.execute_batch("BEGIN IMMEDIATE")?;
-        let result = (|| -> Result<()> {
-            let stored = Self::stored_parser_version(conn)?;
-            if stored.as_deref() == Some(version) {
-                return Ok(());
-            }
-            // Discarding derived data changes what readers see, so it is a
-            // generation of its own. A brand-new database (nothing recorded
-            // yet) has nothing to discard and stays at generation 0.
-            if stored.is_some() {
-                Self::bump_generation(conn)?;
-            }
-            conn.execute_batch(
-                "DELETE FROM symbols;
-                 DELETE FROM file_imports;
-                 DELETE FROM vectors;
-                 DELETE FROM chunk_vectors;
-                 UPDATE files SET tier1_done = 0;",
-            )?;
-            conn.execute(
-                "INSERT INTO meta (key, value) VALUES (?1, ?2)
-                 ON CONFLICT(key) DO UPDATE SET value = ?2",
-                params![PARSER_VERSION_KEY, version],
-            )?;
-            Ok(())
-        })();
-        match result {
-            Ok(()) => {
-                conn.execute_batch("COMMIT")?;
-                Ok(())
-            }
-            Err(e) => {
-                let _ = conn.execute_batch("ROLLBACK");
-                Err(e)
-            }
-        }
+        Self::in_immediate_tx(conn, |conn| {
+            Self::reset_derived_data_on_mismatch(conn, version)
+        })
     }
 
     /// A write transaction that takes the write lock up front. A deferred one
@@ -2777,7 +2831,7 @@ mod tests {
         let conn = Connection::open(repo.0.join(".engram").join("engram.db")).unwrap();
         // The symbols wipe runs before the statement that fails.
         conn.execute_batch("DROP TABLE vectors;").unwrap();
-        assert!(Store::reconcile_parser_version(&conn, "another-fingerprint").is_err());
+        assert!(Store::reset_if_still_mismatched(&conn, "another-fingerprint").is_err());
         let symbols: i64 = conn
             .query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))
             .unwrap();
@@ -2929,6 +2983,119 @@ mod tests {
         }
         let store = repo.store();
         assert_eq!(store.all_files().unwrap().len(), THREADS * 40);
+    }
+
+    #[test]
+    fn many_threads_opening_one_fresh_cache_all_succeed_and_initialise_it_once() {
+        use std::sync::{Arc, Barrier};
+        const THREADS: usize = 8;
+        const ITERATIONS: usize = 30;
+        let expected = crate::inventory::inventory_rules_fingerprint();
+        for iteration in 0..ITERATIONS {
+            // A new directory each time: the race is over a cache that does not
+            // exist yet (journal-mode switch, schema creation, fingerprint).
+            let repo = TempRepo::new();
+            let root = Arc::new(repo.0.clone());
+            let barrier = Arc::new(Barrier::new(THREADS));
+            let handles: Vec<_> = (0..THREADS)
+                .map(|_| {
+                    let root = Arc::clone(&root);
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || -> Result<(u64, String, String)> {
+                        barrier.wait();
+                        let store = Store::open(&root)?;
+                        let stored = Store::stored_parser_version(&store.conn)?
+                            .expect("an opened cache records its fingerprint");
+                        Ok((
+                            store.generation()?,
+                            stored,
+                            store.journal_mode().to_string(),
+                        ))
+                    })
+                })
+                .collect();
+            for h in handles {
+                let (generation, stored, mode) = h
+                    .join()
+                    .expect("thread panicked")
+                    .unwrap_or_else(|e| panic!("iteration {iteration}: open failed: {e:#}"));
+                // Generation 0: nobody wiped (a wipe of a recorded fingerprint
+                // bumps it), so the cache was initialised exactly once.
+                assert_eq!(generation, 0, "iteration {iteration}");
+                assert_eq!(stored, expected, "iteration {iteration}");
+                assert_eq!(mode, "wal", "iteration {iteration}");
+            }
+        }
+    }
+
+    #[test]
+    fn opens_wait_for_a_writer_holding_the_lock_and_then_succeed() {
+        use std::sync::{Arc, Barrier};
+        const THREADS: usize = 4;
+        const HOLD: Duration = Duration::from_millis(400);
+        let repo = TempRepo::new();
+        drop(repo.store());
+        // Another handle takes the write lock and keeps it for a moment.
+        let writer = Connection::open(repo.0.join(".engram").join("engram.db")).unwrap();
+        writer.busy_timeout(BUSY_TIMEOUT).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let root = Arc::new(repo.0.clone());
+        let barrier = Arc::new(Barrier::new(THREADS + 1));
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let root = Arc::clone(&root);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || -> Result<Duration> {
+                    barrier.wait();
+                    let started = Instant::now();
+                    Store::open(&root)?;
+                    Ok(started.elapsed())
+                })
+            })
+            .collect();
+        barrier.wait();
+        std::thread::sleep(HOLD);
+        writer.execute_batch("COMMIT").unwrap();
+        for h in handles {
+            let waited = h
+                .join()
+                .expect("thread panicked")
+                .expect("an open waits for the writer instead of failing");
+            assert!(waited < BUSY_TIMEOUT, "bounded wait, took {waited:?}");
+        }
+    }
+
+    #[test]
+    fn opens_racing_a_writer_on_a_fresh_cache_succeed() {
+        use std::sync::{Arc, Barrier};
+        const THREADS: usize = 4;
+        for _ in 0..10 {
+            let repo = TempRepo::new();
+            let root = Arc::new(repo.0.clone());
+            let barrier = Arc::new(Barrier::new(THREADS + 1));
+            let openers: Vec<_> = (0..THREADS)
+                .map(|_| {
+                    let root = Arc::clone(&root);
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || -> Result<()> {
+                        barrier.wait();
+                        Store::open(&root)?;
+                        Ok(())
+                    })
+                })
+                .collect();
+            // The first handle initialises the cache and writes to it while the
+            // others are still opening.
+            barrier.wait();
+            let mut first = Store::open(&repo.0).expect("first open");
+            for i in 0..20 {
+                first.upsert_files(&[file(&format!("f{i}.rs"))]).unwrap();
+            }
+            for h in openers {
+                h.join().expect("thread panicked").expect("open succeeds");
+            }
+            assert_eq!(repo.store().all_files().unwrap().len(), 20);
+        }
     }
 
     #[test]

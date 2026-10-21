@@ -184,6 +184,13 @@ release tags.
 - Two connections opening the store at the same moment can no longer both wipe
   derived data on a rules-fingerprint mismatch: the reset runs under
   `BEGIN IMMEDIATE` and re-reads the stored fingerprint inside the transaction.
+- **Concurrent first opens of a new cache no longer fail with `database is locked`.**
+  `Store::open` retries the journal-mode switch (which SQLite refuses at once,
+  without the busy timeout, when two connections race to make it) for up to the
+  busy timeout, and creates the schema, runs migrations and reconciles the
+  rules fingerprint in a single `BEGIN IMMEDIATE` transaction, so the losing
+  opener waits for the winner and finds the cache initialised. An open now
+  waits for a writer that currently holds the write lock, as any other write does.
 - A clippy lint in the cached-vector decoder (`chunks_exact`) is fixed, so the
   code passes newer clippy with `-D warnings`.
 
