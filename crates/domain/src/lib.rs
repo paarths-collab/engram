@@ -363,7 +363,10 @@ pub struct EvidencePacket {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub end_line: Option<usize>,
     pub score: f32,
-    /// Which signals contributed (bm25, vector, symbol, path, cochange).
+    /// Which signals contributed. The server emits exactly these names:
+    /// `bm25`, `vector`, `path`, `recent`, `symbol_exact`, `symbol`,
+    /// `changelog_demoted`, `doc_demoted`.
+    /// `vector` is a hashed n-gram embedding, not a learned semantic model.
     pub signals: Vec<String>,
 }
 
