@@ -25,6 +25,11 @@
 //! would let a response overrun, over-counting merely returns slightly less.
 //! The function is deterministic and monotonic in the byte length. Changing the
 //! divisor means a new estimator id (`bytes3-v2`), never a silent edit.
+//!
+//! The budget bounds the *decoded* text of the MCP `content[0].text` field, i.e.
+//! exactly [`render`]'s output. The JSON-RPC envelope around it (string
+//! escaping of quotes and newlines, the `result`/`content` wrapper) is not
+//! counted.
 
 use engram_domain::EvidencePacket;
 use serde_json::{json, Map, Value};
@@ -40,7 +45,10 @@ pub const MAX_OMITTED_LISTED: usize = 20;
 /// per this many budget tokens (at most [`MAX_OMITTED_LISTED`]), so the list
 /// that apologises for omissions cannot eat the room the evidence needed.
 const BUDGET_TOKENS_PER_LISTED_OMISSION: usize = 250;
-/// `pack.ordering` for search results.
+/// `pack.ordering` for search results: evidence by score descending, then path,
+/// then line; `past_reviews` follow the evidence they annotate and are ordered
+/// by `pr_number, path, line, created_at` (the store query's ORDER BY, so they
+/// never depend on insertion order).
 pub const SEARCH_ORDERING: &str = "score_desc,path_asc,line_asc";
 /// `pack.ordering` for connection expansions.
 pub const EXPANSION_ORDERING: &str = "confidence_desc,path_asc";
@@ -81,8 +89,10 @@ pub struct SectionSpec {
     pub kind: &'static str,
     /// Builds the reduced form of a unit that does not fit whole: identity and
     /// score only, plus an `expansion_handle` to fetch the rest. `None` when
-    /// the unit has no useful reduced form.
-    pub minimal: fn(&Value) -> Option<Value>,
+    /// the unit has no useful reduced form. The second argument is the anchor
+    /// paths of the result (the paths in its `likely_files` section, in order;
+    /// empty when it has none), for handles that need a source file.
+    pub minimal: fn(&Value, &[String]) -> Option<Value>,
     /// Index of an earlier section; a unit here is only eligible while a unit
     /// with the same path from that section is included (reviews follow the
     /// evidence they annotate).
@@ -111,7 +121,7 @@ pub struct PackPlan {
     pub cap_unlisted: usize,
 }
 
-fn evidence_minimal(v: &Value) -> Option<Value> {
+fn evidence_minimal(v: &Value, _anchors: &[String]) -> Option<Value> {
     let path = v.get("path")?.as_str()?;
     let mut out = Map::new();
     for key in [
@@ -137,17 +147,30 @@ fn evidence_minimal(v: &Value) -> Option<Value> {
     Some(Value::Object(out))
 }
 
-fn scored_path_minimal(v: &Value) -> Option<Value> {
+/// Reduced form of an expansion entry. Its handle must be callable as is:
+/// `explain_connection` needs a `source` and a different `target`, so the
+/// source is the first anchor that is not the entry itself. An entry that is
+/// the only anchor has nothing to be explained against, so its handle is
+/// `expand_connections` on that path instead.
+fn scored_path_minimal(v: &Value, anchors: &[String]) -> Option<Value> {
     let path = v.get("path")?.as_str()?;
+    let handle = match anchors.iter().find(|a| a.as_str() != path) {
+        Some(source) => json!({
+            "tool": "explain_connection",
+            "source": source,
+            "target": path,
+        }),
+        None => json!({ "tool": "expand_connections", "paths": [path] }),
+    };
     Some(json!({
         "path": path,
         "confidence": v.get("confidence").cloned().unwrap_or(Value::Null),
         "minimal": true,
-        "expansion_handle": { "tool": "explain_connection", "target": path },
+        "expansion_handle": handle,
     }))
 }
 
-fn review_minimal(v: &Value) -> Option<Value> {
+fn review_minimal(v: &Value, _anchors: &[String]) -> Option<Value> {
     let path = v.get("path")?.as_str()?;
     let mut out = Map::new();
     for key in ["pr_number", "path", "line", "pr_merged"] {
@@ -163,7 +186,7 @@ fn review_minimal(v: &Value) -> Option<Value> {
     Some(Value::Object(out))
 }
 
-fn no_minimal(_: &Value) -> Option<Value> {
+fn no_minimal(_: &Value, _: &[String]) -> Option<Value> {
     None
 }
 
@@ -171,6 +194,12 @@ fn no_minimal(_: &Value) -> Option<Value> {
 /// the evidence that was kept. `cap_dropped` are packets the search's own cap
 /// cut (in rank order); `beyond_first_cap` further fused candidates it cut
 /// before building packets.
+///
+/// Note for readers of `pack.truncated` / `pack.omitted_count` on a search:
+/// `beyond_first_cap` counts every fused candidate past `top_k`, not only
+/// evidence that would otherwise have been shown, so `truncated: true` is
+/// common even with no budget. It means "more candidates existed than the
+/// result caps return", not "the budget cut something".
 pub fn search_plan(
     budget: Option<usize>,
     cap_dropped: &[EvidencePacket],
@@ -258,6 +287,61 @@ struct Unit {
     minimal: Option<Value>,
 }
 
+/// Indentation of an item of a section array in the rendered result.
+const ITEM_INDENT: usize = 4;
+/// Indentation of an entry of `pack.omitted` in the rendered result.
+const OMITTED_INDENT: usize = 6;
+/// Bytes of slack for the small things that change when a unit moves between
+/// omitted and kept: brackets and separators of an array going from empty to
+/// non-empty, the digits of `omitted_count`, `true`/`false`.
+const SIZE_SLACK: usize = 32;
+
+/// Rendered-size bounds of one JSON value placed inside the result.
+struct FormCost {
+    /// Never more than its rendered size: the compact serialization.
+    lo: usize,
+    /// Never less than the bytes it adds as a section item (pretty-printed,
+    /// indented, with separators).
+    hi: usize,
+    pretty_len: usize,
+    lines: usize,
+}
+
+impl FormCost {
+    fn of(v: &Value) -> Self {
+        let pretty = render(v);
+        let lines = pretty.matches('\n').count() + 1;
+        let mut cost = FormCost {
+            lo: serde_json::to_string(v).map_or(0, |s| s.len()),
+            hi: 0,
+            pretty_len: pretty.len(),
+            lines,
+        };
+        cost.hi = cost.nested_hi(ITEM_INDENT);
+        cost
+    }
+
+    /// Upper bound on the bytes this value occupies when nested at `indent`.
+    fn nested_hi(&self, indent: usize) -> usize {
+        self.pretty_len + indent * self.lines + SIZE_SLACK
+    }
+}
+
+/// What the greedy fill knows about a unit without composing the result.
+/// Moving a unit from omitted to kept adds at least `lo` of its form and
+/// removes at most `saved` (its entry in `pack.omitted`), and adds at most `hi`
+/// plus the longest omitted entry another unit's omission could be replaced by.
+struct UnitCost {
+    section: usize,
+    unit: usize,
+    full: FormCost,
+    minimal: Option<FormCost>,
+    saved: usize,
+    /// The least that this unit or any later one can add to the size
+    /// (cheapest form minus `saved`); negative when keeping can shrink it.
+    floor: i128,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Form {
     Omitted,
@@ -266,7 +350,8 @@ enum Form {
 }
 
 /// Fields that survive the degraded layouts: they identify the snapshot the
-/// answer (or its absence) refers to.
+/// answer (or its absence) refers to. The pack-only layout drops all of them,
+/// so `Packer::pack` mirrors the mismatch/staleness/warnings as flags.
 const ESSENTIAL_KEYS: [&str; 4] = [
     "snapshot",
     "snapshot_mismatch",
@@ -378,7 +463,7 @@ impl Packer {
             }
         }
         count += self.plan.cap_unlisted;
-        json!({
+        let mut pack = json!({
             "estimator": TOKEN_ESTIMATOR,
             "budget_tokens": self.plan.budget,
             "used_tokens": used,
@@ -387,7 +472,42 @@ impl Packer {
             "omitted": omitted,
             "ordering": self.plan.ordering,
             "within_budget": within_budget,
-        })
+        });
+        // Tiny flags that mirror the snapshot fields the degraded layouts drop,
+        // so a `within_budget: true` pack never hides a snapshot mismatch or a
+        // possibly stale index. Present only when they apply; counted in the
+        // measurement like everything else in the pack.
+        if let Some(obj) = pack.as_object_mut() {
+            for (flag, applies) in self.disclosed_flags() {
+                if applies {
+                    obj.insert(flag.to_owned(), json!(true));
+                }
+            }
+        }
+        pack
+    }
+
+    /// `(pack key, applies)` for the flags that survive every layout rung.
+    fn disclosed_flags(&self) -> [(&'static str, bool); 3] {
+        let stale = self
+            .base
+            .get("index_state")
+            .and_then(|s| s.get("stale"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let has_warnings = self
+            .base
+            .get("index_warnings")
+            .and_then(Value::as_array)
+            .is_some_and(|w| !w.is_empty());
+        [
+            (
+                "snapshot_mismatch",
+                self.base.contains_key("snapshot_mismatch"),
+            ),
+            ("stale", stale),
+            ("has_warnings", has_warnings),
+        ]
     }
 
     /// Whether the selection fits. Placeholders are the worst case for their
@@ -395,6 +515,12 @@ impl Packer {
     /// so the real, final values can only be shorter.
     fn fits(&self, layout: Layout, budget: usize) -> bool {
         measure(&self.compose(layout, budget, false)) <= budget
+    }
+
+    /// Exact rendered size in bytes of the selection, with the same
+    /// placeholders as [`Packer::fits`].
+    fn rendered_len(&self, layout: Layout, budget: usize) -> usize {
+        render(&self.compose(layout, budget, false)).len()
     }
 
     fn set_all(&mut self, form: Form) {
@@ -469,30 +595,109 @@ impl Packer {
     /// result still fits; otherwise in its reduced form if that fits;
     /// otherwise it is skipped, and the walk goes on, since a later unit may
     /// be smaller.
+    ///
+    /// Measuring a candidate by composing and rendering the whole result is
+    /// O(result), so doing it for every unit is O(n^2). Instead the walk keeps
+    /// `[lo, hi]` bounds on the byte size of the current selection and only
+    /// composes when a candidate cannot be decided from the bounds (see
+    /// [`UnitCost`]). The bounds are conservative in both directions, so every
+    /// decision equals the one an exact measurement would have made; once no
+    /// remaining unit can possibly fit, the walk stops early.
     fn fill_greedily(&mut self, layout: Layout, budget: usize) {
-        for s in 0..self.sections.len() {
-            for u in 0..self.sections[s].len() {
-                if let Some(parent) = self.plan.sections[s].requires_path_from {
-                    if !self
-                        .included_paths(parent)
-                        .contains(self.sections[s][u].path.as_str())
-                    {
-                        continue;
-                    }
-                }
-                self.forms[s][u] = Form::Full;
-                if self.fits(layout, budget) {
+        let limit = budget.saturating_mul(BYTES_PER_TOKEN);
+        let costs = self.unit_costs();
+        let pull_in = self.largest_omitted_entry();
+        let mut lo = self.rendered_len(layout, budget);
+        let mut hi = lo;
+        for cost in &costs {
+            if lo as i128 + cost.floor > limit as i128 {
+                break;
+            }
+            let (s, u) = (cost.section, cost.unit);
+            if let Some(parent) = self.plan.sections[s].requires_path_from {
+                if !self
+                    .included_paths(parent)
+                    .contains(self.sections[s][u].path.as_str())
+                {
                     continue;
                 }
-                if self.sections[s][u].minimal.is_some() {
-                    self.forms[s][u] = Form::Minimal;
-                    if self.fits(layout, budget) {
-                        continue;
-                    }
+            }
+            let mut candidates = vec![(Form::Full, &cost.full)];
+            if let Some(minimal) = &cost.minimal {
+                candidates.push((Form::Minimal, minimal));
+            }
+            for (form, form_cost) in candidates {
+                let lo_after = (lo + form_cost.lo).saturating_sub(cost.saved);
+                if lo_after > limit {
+                    continue; // cannot fit, whatever the pack looks like
+                }
+                self.forms[s][u] = form;
+                let hi_after = hi + form_cost.hi + pull_in;
+                if hi_after <= limit {
+                    // Certainly fits.
+                    (lo, hi) = (lo_after, hi_after);
+                    break;
+                }
+                let exact = self.rendered_len(layout, budget);
+                if exact <= limit {
+                    (lo, hi) = (exact, exact);
+                    break;
                 }
                 self.forms[s][u] = Form::Omitted;
             }
         }
+    }
+
+    /// Size bounds for every unit in priority order. See [`UnitCost`].
+    fn unit_costs(&self) -> Vec<UnitCost> {
+        let mut costs = Vec::new();
+        for (s, units) in self.sections.iter().enumerate() {
+            for (u, unit) in units.iter().enumerate() {
+                let entry = omitted_entry(
+                    &unit.path,
+                    unit.symbol.as_deref(),
+                    self.plan.sections[s].kind,
+                    "over_budget",
+                );
+                let full = FormCost::of(&unit.full);
+                let minimal = unit.minimal.as_ref().map(FormCost::of);
+                let cheapest = minimal.as_ref().map_or(full.lo, |m| m.lo.min(full.lo));
+                let saved = FormCost::of(&entry).nested_hi(OMITTED_INDENT);
+                costs.push(UnitCost {
+                    section: s,
+                    unit: u,
+                    full,
+                    minimal,
+                    saved,
+                    floor: cheapest as i128 - saved as i128,
+                });
+            }
+        }
+        // Suffix minimum: the least any unit from here on can add to the size.
+        let mut running = i128::MAX;
+        for cost in costs.iter_mut().rev() {
+            running = running.min(cost.floor);
+            cost.floor = running;
+        }
+        costs
+    }
+
+    /// Upper bound on the size of the longest entry that could be listed in
+    /// `pack.omitted`. Omitting one fewer unit can list a different entry in
+    /// its place, which may be longer than the one it replaces.
+    fn largest_omitted_entry(&self) -> usize {
+        let from_units = self.sections.iter().enumerate().flat_map(|(s, units)| {
+            let kind = self.plan.sections[s].kind;
+            units.iter().map(move |unit| {
+                let entry = omitted_entry(&unit.path, unit.symbol.as_deref(), kind, "over_budget");
+                FormCost::of(&entry).nested_hi(OMITTED_INDENT)
+            })
+        });
+        let from_caps = self.plan.cap_omissions.iter().map(|cap| {
+            let entry = omitted_entry(&cap.path, cap.symbol.as_deref(), cap.kind, cap.reason);
+            FormCost::of(&entry).nested_hi(OMITTED_INDENT)
+        });
+        from_units.chain(from_caps).max().unwrap_or(0)
     }
 
     /// Safety net: the greedy pass measures every step, so this is expected to
@@ -567,10 +772,36 @@ fn unit_path(item: &Value) -> String {
 /// `budget` estimated tokens, unless even a bare `pack` object cannot fit, in
 /// which case it is returned alone with `pack.within_budget` false rather than
 /// pretending. Without a budget every unit is kept and the pack only reports.
+///
+/// The pack carries tiny flags that survive every layout rung, present only
+/// when they apply: `snapshot_mismatch: true` (the result had a
+/// `snapshot_mismatch`), `stale: true` (`index_state.stale`) and
+/// `has_warnings: true` (non-empty `index_warnings`). They are counted in the
+/// measurement, so a pack-only answer still cannot hide a mismatch or
+/// staleness.
+///
+/// Determinism: for a given index, query, budget and clock the output is
+/// byte-identical, independent of insertion order (every source of ordering has
+/// a total tie-break; see `pack.ordering`). The clock matters: search ranking
+/// adds a `recency_boost` computed from the current time, so byte-identity
+/// across calls holds only while that clock is fixed (or the boost is
+/// negligible); it is not a guarantee across days.
 pub fn apply(result: Value, plan: PackPlan) -> Value {
-    let Value::Object(mut base) = result else {
+    let Value::Object(base) = result else {
         return result;
     };
+    new_packer(base, plan).run()
+}
+
+/// Split the sections off `base` into units, everything omitted to start with.
+fn new_packer(mut base: Map<String, Value>, plan: PackPlan) -> Packer {
+    // Anchor files (the `likely_files` of an expansion), for handles that need
+    // a source file. Taken before the sections are split off the result.
+    let anchors: Vec<String> = base
+        .get("likely_files")
+        .and_then(Value::as_array)
+        .map(|items| items.iter().map(unit_path).collect())
+        .unwrap_or_default();
     let mut sections = Vec::new();
     for spec in &plan.sections {
         let items = match base.remove(spec.key) {
@@ -586,7 +817,7 @@ pub fn apply(result: Value, plan: PackPlan) -> Value {
                         .get("symbol")
                         .and_then(Value::as_str)
                         .map(str::to_owned),
-                    minimal: (spec.minimal)(&item),
+                    minimal: (spec.minimal)(&item, &anchors),
                     full: item,
                 })
                 .collect::<Vec<_>>(),
@@ -602,7 +833,6 @@ pub fn apply(result: Value, plan: PackPlan) -> Value {
         sections,
         forms,
     }
-    .run()
 }
 
 #[cfg(test)]
@@ -811,5 +1041,261 @@ mod tests {
         let a = render(&apply(many_units(12), search_plan(Some(900), &[], 0)));
         let b = render(&apply(many_units(12), search_plan(Some(900), &[], 0)));
         assert_eq!(a, b);
+    }
+
+    fn flagged_result() -> Value {
+        let mut result = many_units(5);
+        result["snapshot_mismatch"] = json!({ "requested": "old", "current": "abc" });
+        result["index_warnings"] = json!(["the file watcher stopped"]);
+        result["index_state"] = json!({ "status": "ready", "generation": 3, "stale": true });
+        result
+    }
+
+    #[test]
+    fn mismatch_staleness_and_warnings_survive_every_layout_rung() {
+        let mut layouts = HashSet::new();
+        for budget in 1..=1500 {
+            let packed = apply(flagged_result(), search_plan(Some(budget), &[], 0));
+            let pack = &packed["pack"];
+            if pack["within_budget"] != true {
+                continue;
+            }
+            assert!(measure(&packed) <= budget, "budget {budget}");
+            for flag in ["snapshot_mismatch", "stale", "has_warnings"] {
+                assert_eq!(
+                    pack[flag], true,
+                    "budget {budget}: {flag} missing in {pack}"
+                );
+            }
+            let layout = if packed.get("evidence").is_some() {
+                "full"
+            } else if packed.get("snapshot").is_some() {
+                "snapshot_fields"
+            } else {
+                assert_eq!(packed.as_object().unwrap().len(), 1, "pack only");
+                "pack_only"
+            };
+            layouts.insert(layout);
+        }
+        assert_eq!(
+            layouts,
+            HashSet::from(["full", "snapshot_fields", "pack_only"]),
+            "the sweep should visit every rung that can be within budget"
+        );
+
+        // No budget: the flags are reported next to the untouched fields.
+        let unbounded = apply(flagged_result(), search_plan(None, &[], 0));
+        assert_eq!(unbounded["pack"]["snapshot_mismatch"], true);
+        assert_eq!(unbounded["pack"]["stale"], true);
+        assert_eq!(unbounded["pack"]["has_warnings"], true);
+        assert!(unbounded.get("snapshot_mismatch").is_some());
+
+        // Nothing to report: no flags at all, so a healthy pack is unchanged.
+        for result in [many_units(5), {
+            let mut r = many_units(5);
+            r["index_warnings"] = json!([]);
+            r["index_state"] = json!({ "status": "ready", "stale": false });
+            r
+        }] {
+            let pack = apply(result, search_plan(Some(900), &[], 0))["pack"].clone();
+            for flag in ["snapshot_mismatch", "stale", "has_warnings"] {
+                assert!(pack.get(flag).is_none(), "{flag} in {pack}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_minimal_expansion_handle_names_a_source_so_it_is_callable() {
+        let anchors = vec!["app/a.py".to_owned(), "app/b.py".to_owned()];
+        let entry = |path: &str| json!({ "path": path, "confidence": 0.5, "reason": "r" });
+        let handle = |path: &str, anchors: &[String]| {
+            scored_path_minimal(&entry(path), anchors).unwrap()["expansion_handle"].clone()
+        };
+        assert_eq!(
+            handle("app/c.py", &anchors),
+            json!({ "tool": "explain_connection", "source": "app/a.py", "target": "app/c.py" })
+        );
+        // The first anchor is not its own source: the next one is used.
+        assert_eq!(handle("app/a.py", &anchors)["source"], "app/b.py");
+        // A lone anchor has nothing to be explained against.
+        assert_eq!(
+            handle("app/a.py", &anchors[..1]),
+            json!({ "tool": "expand_connections", "paths": ["app/a.py"] })
+        );
+
+        // Through the real packer: a squeezed expansion entry gets such a handle.
+        let reason = "x".repeat(600);
+        let result = json!({
+            "likely_files": [{ "path": "app/a.py", "confidence": 1.0, "reason": "anchor" }],
+            "likely_tests": [],
+            "cochange_expansions": [
+                { "path": "app/b.py", "confidence": 0.9, "reason": reason }
+            ],
+            "import_expansions": [],
+        });
+        let mut seen = false;
+        for budget in 100..1500 {
+            let packed = apply(result.clone(), expansion_plan(Some(budget), &[]));
+            for entry in packed["cochange_expansions"]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
+                if entry["minimal"] == true {
+                    seen = true;
+                    let handle = &entry["expansion_handle"];
+                    assert_eq!(handle["tool"], "explain_connection");
+                    assert_eq!(handle["source"], "app/a.py");
+                    assert_eq!(handle["target"], "app/b.py");
+                }
+            }
+        }
+        assert!(seen, "some budget should have produced a minimal record");
+    }
+
+    fn anchors_result(n: usize) -> Value {
+        let likely: Vec<Value> = (0..n)
+            .map(|i| {
+                json!({
+                    "path": format!("src/anchor_{i:05}.rs"),
+                    "confidence": 1.0,
+                    "reason": "given as an anchor file",
+                })
+            })
+            .collect();
+        json!({
+            "likely_files": likely,
+            "likely_tests": [],
+            "cochange_expansions": [],
+            "import_expansions": [],
+        })
+    }
+
+    #[test]
+    fn thousands_of_anchors_are_packed_without_quadratic_work() {
+        // Sanity, not a benchmark: this used to re-render the whole result for
+        // every unit. The assertions that matter are about the output; the
+        // generous time limit only guards against a hang.
+        let started = std::time::Instant::now();
+        let small = apply(anchors_result(2000), expansion_plan(Some(900), &[]));
+        let large = apply(anchors_result(2000), expansion_plan(Some(10_000_000), &[]));
+        assert!(started.elapsed() < std::time::Duration::from_secs(60));
+
+        assert!(measure(&small) <= 900, "{}", measure(&small));
+        assert_eq!(small["pack"]["within_budget"], true);
+        let kept = small["likely_files"].as_array().unwrap().len();
+        assert!(kept > 0 && kept < 2000, "kept {kept}");
+        assert_eq!(
+            small["pack"]["omitted_count"].as_u64().unwrap() as usize + kept,
+            2000
+        );
+
+        assert_eq!(large["likely_files"].as_array().unwrap().len(), 2000);
+        assert_eq!(large["pack"]["omitted_count"], 0);
+        assert_eq!(large["pack"]["truncated"], false);
+        assert!(measure(&large) <= 10_000_000);
+    }
+
+    /// The greedy fill as it was before the size bounds: measure every
+    /// candidate by composing and rendering the whole result.
+    fn reference_fill(packer: &mut Packer, layout: Layout, budget: usize) {
+        for s in 0..packer.sections.len() {
+            for u in 0..packer.sections[s].len() {
+                if let Some(parent) = packer.plan.sections[s].requires_path_from {
+                    if !packer
+                        .included_paths(parent)
+                        .contains(packer.sections[s][u].path.as_str())
+                    {
+                        continue;
+                    }
+                }
+                packer.forms[s][u] = Form::Full;
+                if packer.fits(layout, budget) {
+                    continue;
+                }
+                if packer.sections[s][u].minimal.is_some() {
+                    packer.forms[s][u] = Form::Minimal;
+                    if packer.fits(layout, budget) {
+                        continue;
+                    }
+                }
+                packer.forms[s][u] = Form::Omitted;
+            }
+        }
+    }
+
+    #[test]
+    fn the_bounded_fill_decides_exactly_like_measuring_every_candidate() {
+        let mut search = many_units(14);
+        search["past_reviews"] = json!([
+            { "pr_number": 1, "path": "src/m0.rs", "body": "x".repeat(300), "pr_merged": true },
+            { "pr_number": 2, "path": "src/m3.rs", "body": "y".repeat(40), "pr_merged": true },
+            { "pr_number": 3, "path": "src/m9.rs", "body": "z".repeat(900), "pr_merged": false },
+        ]);
+        let scored = |prefix: &str, n: usize| -> Vec<Value> {
+            (0..n)
+                .map(|i| {
+                    json!({
+                        "path": format!("{prefix}/file_{i:02}_{}.py", "n".repeat(i % 7)),
+                        "confidence": 1.0 - (i as f64) / 100.0,
+                        "reason": "r".repeat(20 + (i * 53) % 400),
+                    })
+                })
+                .collect()
+        };
+        let expansion = json!({
+            "likely_files": scored("app", 12),
+            "cochange_expansions": scored("co", 9),
+            "import_expansions": scored("imp", 9),
+            "likely_tests": (0..6).map(|i| format!("tests/test_{i}.py")).collect::<Vec<_>>(),
+        });
+        let dropped = vec![
+            (
+                "cochange",
+                "co/a_dropped_candidate_with_a_long_path.py".to_owned(),
+            ),
+            ("import", "imp/short.py".to_owned()),
+        ];
+        type PlanFor = Box<dyn Fn(usize) -> PackPlan>;
+        let cases: Vec<(&str, Value, PlanFor)> = vec![
+            ("search", search, Box::new(|b| search_plan(Some(b), &[], 3))),
+            (
+                "expansion",
+                expansion,
+                Box::new(move |b| expansion_plan(Some(b), &dropped)),
+            ),
+        ];
+        for (name, result, plan) in &cases {
+            let Value::Object(base) = result.clone() else {
+                unreachable!()
+            };
+            let mut checked_partial = false;
+            for budget in (150..=9000).step_by(37) {
+                let layout = Layout {
+                    rung: 0,
+                    list_limit: (budget / BUDGET_TOKENS_PER_LISTED_OMISSION)
+                        .min(MAX_OMITTED_LISTED),
+                };
+                let mut fast = new_packer(base.clone(), plan(budget));
+                let mut slow = new_packer(base.clone(), plan(budget));
+                fast.set_all(Form::Omitted);
+                slow.set_all(Form::Omitted);
+                fast.fill_greedily(layout, budget);
+                reference_fill(&mut slow, layout, budget);
+                assert!(
+                    fast.forms == slow.forms,
+                    "{name}, budget {budget}: bounded fill differs from the exact one"
+                );
+                let kept = fast
+                    .forms
+                    .iter()
+                    .flatten()
+                    .filter(|f| **f != Form::Omitted)
+                    .count();
+                let all = fast.forms.iter().flatten().count();
+                checked_partial |= kept > 0 && kept < all;
+            }
+            assert!(checked_partial, "{name}: no budget produced a partial pack");
+        }
     }
 }

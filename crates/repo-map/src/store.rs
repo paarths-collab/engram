@@ -650,6 +650,8 @@ impl Store {
     }
 
     /// All ingested review comments, joined with their PR's title/merged status.
+    /// Ordered by `pr_number, path, line, created_at` (then body, author, id as
+    /// final tie-breaks), never by insertion order.
     pub fn all_review_comments(&self) -> Result<Vec<ReviewComment>> {
         self.query_review_comments("1=1", params![])
     }
@@ -668,7 +670,8 @@ impl Store {
             "SELECT rc.pr_number, pr.title, pr.merged, rc.path, rc.line, rc.body, rc.author,
                     rc.created_at, rc.diff_hunk
              FROM review_comments rc JOIN pull_requests pr ON pr.number = rc.pr_number
-             WHERE {where_clause}"
+             WHERE {where_clause}
+             ORDER BY rc.pr_number, rc.path, rc.line, rc.created_at, rc.body, rc.author, rc.id"
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(p, |r| {
@@ -924,10 +927,11 @@ impl Store {
             .unwrap_or(false)
     }
 
+    /// Every indexed file, ordered by path so callers never depend on insertion order.
     pub fn all_files(&self) -> Result<Vec<FileRecord>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT path, language, size_bytes, is_test FROM files")?;
+            .prepare("SELECT path, language, size_bytes, is_test FROM files ORDER BY path")?;
         let rows = stmt.query_map([], |r| {
             Ok(FileRecord {
                 path: r.get(0)?,
@@ -1305,6 +1309,77 @@ mod tests {
         assert_eq!(store.prune_missing_files(&HashSet::new()).unwrap(), 1);
         assert_eq!(store.count_review_comments().unwrap(), 1);
         assert_eq!(store.review_comments_for_path("gone.rs").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn all_files_and_review_comments_ignore_insertion_order() {
+        let comment = |path: &str, line: Option<i64>, created_at: &str| IngestedComment {
+            path: path.to_owned(),
+            line,
+            body: format!("{path}:{line:?}:{created_at}"),
+            author: "bob".to_owned(),
+            created_at: created_at.to_owned(),
+            ..Default::default()
+        };
+        let build = |files: &[&str], prs: &[i64]| {
+            let repo = TempRepo::new();
+            let mut store = repo.store();
+            let records: Vec<_> = files.iter().map(|f| file(f)).collect();
+            store.upsert_files(&records).unwrap();
+            for &pr in prs {
+                store
+                    .upsert_pull_request(pr, "t", "", true, "alice", "", "", "", "")
+                    .unwrap();
+                store
+                    .replace_review_comments_for_pr(
+                        pr,
+                        &[
+                            comment("b.rs", Some(9), "2026-01-02"),
+                            comment("a.rs", Some(30), "2026-01-01"),
+                            comment("a.rs", Some(4), "2026-01-03"),
+                            comment("a.rs", Some(4), "2026-01-01"),
+                        ],
+                    )
+                    .unwrap();
+            }
+            let paths: Vec<String> = store
+                .all_files()
+                .unwrap()
+                .into_iter()
+                .map(|f| f.path)
+                .collect();
+            let comments: Vec<(i64, String, Option<i64>, String)> = store
+                .all_review_comments()
+                .unwrap()
+                .into_iter()
+                .map(|c| (c.pr_number, c.path, c.line, c.created_at))
+                .collect();
+            let for_path: Vec<String> = store
+                .review_comments_for_path("a.rs")
+                .unwrap()
+                .into_iter()
+                .map(|c| c.body)
+                .collect();
+            (paths, comments, for_path)
+        };
+        let forward = build(&["a.rs", "b.rs", "c.rs"], &[1, 2, 3]);
+        let reverse = build(&["c.rs", "b.rs", "a.rs"], &[3, 2, 1]);
+        assert_eq!(forward, reverse);
+        assert_eq!(forward.0, ["a.rs", "b.rs", "c.rs"]);
+        // pr_number, then path, then line, then created_at.
+        let first_pr: Vec<_> = forward.1.iter().take(4).collect();
+        assert!(first_pr.iter().all(|c| c.0 == 1));
+        assert_eq!(first_pr[0].1, "a.rs");
+        assert_eq!(
+            (first_pr[0].2, first_pr[0].3.as_str()),
+            (Some(4), "2026-01-01")
+        );
+        assert_eq!(
+            (first_pr[1].2, first_pr[1].3.as_str()),
+            (Some(4), "2026-01-03")
+        );
+        assert_eq!(first_pr[2].2, Some(30));
+        assert_eq!(first_pr[3].1, "b.rs");
     }
 
     #[test]

@@ -356,7 +356,8 @@ pub struct PrCommit {
 }
 
 /// Output of get_verification_plan: the merged checklist for a set of changed
-/// files, plus repo-detected test commands and historically co-failing tests.
+/// files, plus repo-detected test commands and tests that historically changed
+/// together with the changed files (co-changed test paths).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VerificationPlan {
     /// Domain profiles whose detection rules matched the changed files.
@@ -365,6 +366,9 @@ pub struct VerificationPlan {
     pub checklist: Vec<String>,
     /// Test/verify commands detected from the repo's manifests.
     pub test_commands: Vec<String>,
-    /// Tests that historically change together with the changed files.
+    /// Test paths that historically changed together (co-changed) with the
+    /// changed files. The key name is legacy: it says "co-failing", but the
+    /// data is co-change history, not test-failure history. It is kept so
+    /// existing clients keep working.
     pub historically_co_failing_tests: Vec<String>,
 }

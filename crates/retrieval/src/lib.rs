@@ -106,6 +106,10 @@ const COCHANGE_PER_SEED: usize = 5;
 const EXPANSION_CAP: usize = 8;
 /// Rows read per anchor so the ones past the per-anchor cap can be counted.
 /// Far above any real fan-out; SQLite's LIMIT is applied in the query.
+/// A hub with more rows than this is undercounted: the rows past the limit are
+/// neither ranked nor counted in `pack.omitted_count`. The rows that are read
+/// are the strongest ones (`cochange_for` orders by strength), but ties at the
+/// cutoff are not tie-broken by the query.
 const COCHANGE_SCAN_LIMIT: usize = 100_000;
 /// Import edges come from matching module names against file paths, not from a
 /// compiler, so every import fact is labelled with how it was resolved.
@@ -205,7 +209,12 @@ impl Engine {
         let f_body = schema_builder.add_text_field("body", TEXT);
         let schema = schema_builder.build();
         let index = Index::create_in_ram(schema);
-        let mut writer = index.writer(64_000_000)?;
+        // One indexing thread, so the index is a single segment whose documents
+        // are in the order added (path order, see `Store::all_files`). Tantivy
+        // breaks score ties by document address, so with several writer threads
+        // the address of a document, and with it the BM25 top-k cut among equal
+        // scores, would depend on thread scheduling.
+        let mut writer = index.writer_with_num_threads(1, 64_000_000)?;
 
         let stopwords = std::sync::Arc::new(stopwords::load(repo_root));
         let embedder = HashedNgramEmbedder::new(stopwords.clone());
@@ -416,9 +425,19 @@ impl Engine {
             .into_iter()
             .map(|(doc, (score, chunk))| (doc, score, chunk))
             .collect();
-        // Total order: equal scores fall back to the doc index (files are
-        // indexed in a fixed order), never to HashMap iteration order.
-        scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        // Total order for the top-k cut: score desc, then path, then the best
+        // chunk's start line and index. Never the doc index or HashMap order,
+        // so the cut does not depend on the order files were indexed in.
+        scored.sort_by(|a, b| {
+            b.1.total_cmp(&a.1)
+                .then_with(|| self.docs[a.0].path.cmp(&self.docs[b.0].path))
+                .then_with(|| {
+                    self.chunks[a.2]
+                        .start_line
+                        .cmp(&self.chunks[b.2].start_line)
+                })
+                .then_with(|| a.2.cmp(&b.2))
+        });
         scored.truncate(k);
         scored
     }
@@ -531,6 +550,7 @@ impl Engine {
             fused.into_iter().map(|(i, (s, sig))| (i, s, sig)).collect();
         // Total order, so the top_k cut and the packet ids never depend on
         // HashMap iteration order: score desc, then path asc, then doc index.
+        // (Paths are unique, so the doc index never actually decides.)
         ranked.sort_by(|a, b| {
             b.1.total_cmp(&a.1)
                 .then_with(|| self.docs[a.0].path.cmp(&self.docs[b.0].path))
@@ -699,7 +719,8 @@ impl Engine {
 
     /// Deterministic impact analysis from known anchor files — no text search,
     /// no ranking heuristics, no guessing. Given files the agent already knows
-    /// it is touching (e.g. the current diff, per `engram impact --diff current`),
+    /// it is touching (e.g. the current diff's changed files, passed as `paths` to
+    /// the `expand_connections` tool),
     /// return everything *connected* to them by hard facts already recorded in
     /// the store: the co-change graph (git history) and the import graph
     /// (static analysis). Every result traces to a concrete edge, so this is
@@ -1075,7 +1096,10 @@ pub struct SearchOutcome {
     /// (`top_k + 3`), in rank order.
     pub cap_dropped: Vec<EvidencePacket>,
     /// Fused candidates cut by the first cap (`top_k`) before any packet was
-    /// built. Counted, not enumerated.
+    /// built. Counted, not enumerated. This counts every fused candidate past
+    /// `top_k` (BM25 and vector hits are each fetched 50 deep), so a search
+    /// usually has some, and `pack.truncated`/`omitted_count` read `true` / `> 0`
+    /// even with no budget.
     pub beyond_first_cap: usize,
 }
 
@@ -2097,5 +2121,92 @@ fn second() {
             first.packets.iter().map(|p| &p.id).collect::<Vec<_>>()
         );
         assert!(first.packets.len() > 1);
+    }
+
+    /// `n` near-identical files written to disk and registered in `store` in the
+    /// order `order` gives them (a permutation of `0..n`).
+    fn twin_corpus(
+        tag: &str,
+        n: usize,
+        order: impl Fn(Vec<usize>) -> Vec<usize>,
+    ) -> (TempRepo, Store, Engine) {
+        use engram_domain::{FileRecord, Language};
+        let repo = TempRepo::new(tag);
+        std::fs::create_dir_all(repo.0.join("src")).unwrap();
+        let files: Vec<FileRecord> = order((0..n).collect())
+            .into_iter()
+            .map(|i| FileRecord {
+                path: format!("src/twin{i:03}.py"),
+                language: Language::Python,
+                size_bytes: 10,
+                is_test: false,
+            })
+            .collect();
+        for f in &files {
+            std::fs::write(
+                repo.0.join(&f.path),
+                "def retry_handler():\n    return 'retry the webhook'\n",
+            )
+            .unwrap();
+        }
+        let mut store = Store::open(&repo.0).expect("open store");
+        store.upsert_files(&files).expect("upsert files");
+        let engine = Engine::build(&repo.0, &mut store).expect("build engine");
+        (repo, store, engine)
+    }
+
+    #[test]
+    fn indexing_the_same_files_in_different_orders_gives_identical_search_bytes() {
+        // More files than the 50-deep BM25 and vector cuts, so the cut itself is
+        // exercised, not just the final sort. The corpus is indexed in natural,
+        // reversed and hash-shuffled order.
+        type Order = fn(Vec<usize>) -> Vec<usize>;
+        let orders: [(&str, Order); 3] = [
+            ("natural", |v| v),
+            ("reversed", |mut v| {
+                v.reverse();
+                v
+            }),
+            ("shuffled", |mut v| {
+                v.sort_by_key(|i| embed::content_hash(&format!("shuffle{i}")));
+                v
+            }),
+        ];
+        let mut outputs = Vec::new();
+        for (tag, order) in orders {
+            let (_repo, mut store, mut engine) = twin_corpus(&format!("order-{tag}"), 70, order);
+            // The store itself reports files in path order, whatever went in.
+            let paths: Vec<String> = store
+                .all_files()
+                .unwrap()
+                .into_iter()
+                .map(|f| f.path)
+                .collect();
+            let mut sorted = paths.clone();
+            sorted.sort();
+            assert_eq!(paths, sorted, "{tag}: all_files is path-ordered");
+
+            let outcome = engine
+                .search_with_outcome(&mut store, "retry webhook handler", 8)
+                .unwrap();
+            assert!(
+                outcome.beyond_first_cap > 0,
+                "{tag}: the first cap should bite"
+            );
+            let bytes = serde_json::to_string(&(
+                &outcome.packets,
+                &outcome.cap_dropped,
+                outcome.beyond_first_cap,
+            ))
+            .unwrap();
+            let ranked = engine
+                .rank(&mut store, "retry webhook handler", RankMode::Vector, 50)
+                .unwrap();
+            outputs.push((tag, bytes, ranked));
+        }
+        for (tag, bytes, ranked) in &outputs[1..] {
+            assert_eq!(bytes, &outputs[0].1, "{tag} differs from natural order");
+            assert_eq!(ranked, &outputs[0].2, "{tag}: vector top-k differs");
+        }
     }
 }

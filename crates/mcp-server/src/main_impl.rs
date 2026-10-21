@@ -390,12 +390,12 @@ impl ToolHandler for Engram {
         json!({ "tools": [
             {
                 "name": "search_context",
-                "description": "ALWAYS call this FIRST, before planning or implementing any coding task. Returns ranked, evidence-backed context about this repository: existing code relevant to the query, symbols to reuse instead of reimplementing, related tests, and matched files (hybrid BM25+vector+symbol retrieval), plus any past reviewer comments on the matched files. Using this prevents duplicate implementations and wrong assumptions about the codebase. The result carries a `pack` object: the token estimator used (`pack.estimator`, an estimate from serialized bytes, not a real tokenizer), `used_tokens`, whether anything was left out (`truncated`, `omitted_count`, and a budget-dependent number of `omitted` entries naming path/symbol/reason: `over_budget` or `below_cap`), and the fixed `ordering`. With `budget_tokens`, whole evidence units are kept in rank order so the serialized result, pack included, stays within the budget (estimated); a unit too large to include whole may come back as a `minimal` record (path, symbol, line range, score, `expansion_handle`, no snippet). A budget below the size of a bare `pack` cannot be honoured: the pack is returned alone with `pack.within_budget: false`. Results are always ordered by score, then path, then line.",
+                "description": "ALWAYS call this FIRST, before planning or implementing any coding task. Returns ranked, evidence-backed context about this repository: existing code relevant to the query, symbols to reuse instead of reimplementing, related tests, and matched files (hybrid BM25+vector+symbol retrieval), plus any past reviewer comments on the matched files. Using this prevents duplicate implementations and wrong assumptions about the codebase. The result carries a `pack` object: the token estimator used (`pack.estimator`, an estimate from serialized bytes, not a real tokenizer), `used_tokens`, whether anything was left out (`truncated`, `omitted_count`, and a budget-dependent number of `omitted` entries naming path/symbol/reason: `over_budget` or `below_cap`), and the fixed `ordering`. With `budget_tokens`, whole evidence units are kept in rank order so the serialized result, pack included, stays within the budget (estimated); a unit too large to include whole may come back as a `minimal` record (path, symbol, line range, score, `expansion_handle`, no snippet). A budget below the size of a bare `pack` cannot be honoured: the pack is returned alone with `pack.within_budget: false`. When the answer comes from a different snapshot than requested, or the index may be stale or degraded, `pack` says so itself (`snapshot_mismatch`, `stale`, `has_warnings`, each `true` only when it applies), even when the other fields were dropped to fit the budget. Results are always ordered by score, then path, then line.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "query": { "type": "string", "description": "What you are looking for, in natural language, e.g. 'add retry logic to billing webhooks'" },
-                        "budget_tokens": { "type": "integer", "minimum": 1, "description": "Upper bound on the estimated tokens (ceil(bytes/3), see `pack.estimator`) of the whole serialized result, `pack` included. Omit for the default result with no budget truncation (existing result caps still apply and are reported in `pack`)." },
+                        "budget_tokens": { "type": "integer", "minimum": 1, "description": "Upper bound on the estimated tokens (ceil(bytes/3), see `pack.estimator`) of the whole serialized result, `pack` included. The budget bounds the decoded `content[0].text` the tool returns; the JSON-RPC envelope around it (string escaping, wrapper fields) is not counted. Omit for the default result with no budget truncation (existing result caps still apply and are reported in `pack`)." },
                         "snapshot": { "type": "string", "description": "A `snapshot` id from an earlier response. If it differs from the current index snapshot the answer still comes from the current snapshot and says so in `snapshot_mismatch`." }
                     },
                     "required": ["query"]
@@ -427,7 +427,7 @@ impl ToolHandler for Engram {
             },
             {
                 "name": "expand_connections",
-                "description": "Call this when you already know which file(s) you are changing (e.g. the current diff) and want everything CONNECTED to them, with zero guessing. Takes exact file paths as anchors and returns only files linked by hard, deterministic facts already recorded in the store: the co-change graph (files that historically changed together in the same commits) and the import graph (files that statically import an anchor, up to `max_hops` hops, default 2). Every result traces to a concrete recorded edge — this is fact-finding, not prediction. Prefer this over predict_impact whenever you have concrete anchor files. Results are capped (top 5 co-change rows per anchor, 8 entries per kind); the result's `pack` object discloses what the caps cut (`omitted` entries with reason `recommendation_cap`, and `omitted_count`) and what `budget_tokens` cut (`over_budget`), names the estimator (an estimate from serialized bytes, not a real tokenizer) and reports `used_tokens`. Ordering is confidence descending, then path.",
+                "description": "Call this when you already know which file(s) you are changing (e.g. the current diff) and want everything CONNECTED to them, with zero guessing. Takes exact file paths as anchors and returns only files linked by hard, deterministic facts already recorded in the store: the co-change graph (files that historically changed together in the same commits) and the import graph (files that statically import an anchor, up to `max_hops` hops, default 2). Every result traces to a concrete recorded edge — this is fact-finding, not prediction. Prefer this over predict_impact whenever you have concrete anchor files. Results are capped (top 5 co-change rows per anchor, 8 entries per kind); the result's `pack` object discloses what the caps cut (`omitted` entries with reason `recommendation_cap`, and `omitted_count`) and what `budget_tokens` cut (`over_budget`), names the estimator (an estimate from serialized bytes, not a real tokenizer) and reports `used_tokens`. As with search_context, `pack` itself flags `snapshot_mismatch`, `stale` and `has_warnings` (each `true` only when it applies), so they survive any budget. Ordering is confidence descending, then path.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -436,7 +436,7 @@ impl ToolHandler for Engram {
                             "items": { "type": "string" },
                             "description": "Repo-relative paths of files you are changing or about to change, e.g. ['src/billing/cancel.rs']"
                         },
-                        "budget_tokens": { "type": "integer", "minimum": 1, "description": "Upper bound on the estimated tokens (ceil(bytes/3), see `pack.estimator`) of the whole serialized result, `pack` included. Whole entries are kept in priority order (anchors, co-change, imports, tests); an entry too large to include whole may come back as a `minimal` record with an `expansion_handle`. Omit for no budget truncation." },
+                        "budget_tokens": { "type": "integer", "minimum": 1, "description": "Upper bound on the estimated tokens (ceil(bytes/3), see `pack.estimator`) of the whole serialized result, `pack` included. The budget bounds the decoded `content[0].text` the tool returns; the JSON-RPC envelope around it (string escaping, wrapper fields) is not counted. Whole entries are kept in priority order (anchors, co-change, imports, tests); an entry too large to include whole may come back as a `minimal` record with an `expansion_handle`. Omit for no budget truncation." },
                         "max_hops": { "type": "integer", "minimum": 1, "maximum": 2, "default": 2, "description": "How many import hops to follow from each anchor to find dependents (1 = direct importers only). Values outside 1..=2 are an error." },
                         "snapshot": { "type": "string", "description": "A `snapshot` id from an earlier response. If it differs from the current index snapshot the answer still comes from the current snapshot and says so in `snapshot_mismatch`." }
                     },
@@ -695,7 +695,8 @@ impl Engram {
                 let m = engram_verify::match_profiles(&profiles, &changed);
                 let test_commands = engram_verify::detect_test_commands(&self.repo_root);
 
-                // Historically co-failing tests: tests in the co-change set of changed files.
+                // Co-changed test paths: tests in the co-change set of the changed files
+                // (emitted under the legacy key `historically_co_failing_tests`).
                 let store = self.store.as_ref().unwrap();
                 let mut co_failing: Vec<String> = Vec::new();
                 for f in &changed {
@@ -761,7 +762,11 @@ fn budget_arg(args: &Value) -> Result<Option<usize>, String> {
     match args.get("budget_tokens") {
         None | Some(Value::Null) => Ok(None),
         Some(v) => match v.as_u64() {
-            Some(n) if n >= 1 => Ok(Some(n as usize)),
+            Some(n) if n >= 1 => usize::try_from(n).map(Some).map_err(|_| {
+                format!(
+                    "budget_tokens {n} is too large for this platform (usize); use a smaller value"
+                )
+            }),
             _ => Err(format!("budget_tokens must be an integer >= 1, got {v}")),
         },
     }
@@ -772,7 +777,9 @@ fn max_hops_arg(args: &Value) -> Result<Option<usize>, String> {
     match args.get("max_hops") {
         None | Some(Value::Null) => Ok(None),
         Some(v) => match v.as_u64() {
-            Some(n) if (1..=2).contains(&n) => Ok(Some(n as usize)),
+            Some(n) if (1..=2).contains(&n) => usize::try_from(n)
+                .map(Some)
+                .map_err(|_| format!("max_hops {n} does not fit in usize")),
             _ => Err(format!(
                 "max_hops must be an integer between 1 and 2, got {v}"
             )),
@@ -1881,5 +1888,73 @@ mod tests {
             assert_eq!(p["max_hops"]["default"], 2, "{tool}");
             assert_eq!(p["snapshot"]["type"], "string", "{tool}");
         }
+    }
+
+    #[test]
+    fn the_mcp_content_text_is_exactly_the_rendered_result_and_within_the_budget() {
+        // Through the real protocol loop, not just `call_tool`: the budget is a
+        // promise about the decoded `content[0].text` the client receives.
+        let repo = billing_repo(&(0..30).collect::<Vec<_>>());
+        let mut engram = ready_engram(&repo);
+        for budget_tokens in [700usize, 2000] {
+            let args = json!({ "query": BILLING_QUERY, "budget_tokens": budget_tokens });
+            let direct = engram.call_tool("search_context", &args).unwrap();
+            let request = json!({
+                "jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                "params": { "name": "search_context", "arguments": args },
+            });
+            let mut out = Vec::new();
+            crate::mcp::serve_io(
+                &mut engram,
+                std::io::Cursor::new(format!("{request}\n")),
+                &mut out,
+            );
+            let out = String::from_utf8(out).unwrap();
+            let reply: Value = serde_json::from_str(out.lines().next().unwrap()).unwrap();
+            assert_eq!(reply["id"], 7);
+            assert_eq!(reply["result"]["isError"], false, "{reply}");
+            let text = reply["result"]["content"][0]["text"].as_str().unwrap();
+            assert_eq!(text, budget::render(&direct), "budget {budget_tokens}");
+            assert!(
+                budget::estimate_tokens(text) <= budget_tokens,
+                "budget {budget_tokens}: {} tokens",
+                budget::estimate_tokens(text)
+            );
+            let decoded: Value = serde_json::from_str(text).unwrap();
+            assert_eq!(decoded["pack"]["within_budget"], true);
+        }
+    }
+
+    #[test]
+    fn a_snapshot_mismatch_is_still_disclosed_when_the_budget_leaves_only_the_pack() {
+        let repo = billing_repo(&(0..6).collect::<Vec<_>>());
+        let mut engram = ready_engram(&repo);
+        let mut flagged_pack_only = 0;
+        for budget_tokens in 1..=400 {
+            let r = engram
+                .call_tool(
+                    "search_context",
+                    &json!({
+                        "query": BILLING_QUERY,
+                        "budget_tokens": budget_tokens,
+                        "snapshot": "not-the-current-snapshot",
+                    }),
+                )
+                .unwrap();
+            if r["pack"]["within_budget"] != true {
+                continue;
+            }
+            assert_eq!(
+                r["pack"]["snapshot_mismatch"], true,
+                "budget {budget_tokens}: {r}"
+            );
+            if r.as_object().unwrap().len() == 1 {
+                flagged_pack_only += 1;
+            }
+        }
+        assert!(
+            flagged_pack_only > 0,
+            "the sweep never reached the pack-only layout"
+        );
     }
 }
