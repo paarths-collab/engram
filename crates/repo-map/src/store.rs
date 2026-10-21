@@ -9,7 +9,7 @@ use engram_domain::{
     SymbolKind, SymbolRecord,
 };
 use rusqlite::{params, Connection, OptionalExtension};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 
@@ -33,6 +33,139 @@ pub struct CoChangeNeighbors {
     pub total: usize,
 }
 
+/// One file's new place in the index: its fingerprint, and whether its cached
+/// embeddings must be dropped even when the fingerprint did not change.
+#[derive(Debug, Clone)]
+pub struct FileUpdate {
+    pub scanned: ScannedFile,
+    /// Drop the file's cached vectors regardless of whether it changed. The
+    /// watcher sets this on every save; a full reconcile leaves it off because
+    /// a changed fingerprint already drops them.
+    pub invalidate_vectors: bool,
+}
+
+/// What reading a file for Tier-1 produced.
+#[derive(Debug, Clone)]
+pub enum Extraction {
+    /// Symbols and (raw, not yet normalized) import targets of the file as it
+    /// was read. Either may be empty: a file can legitimately hold neither.
+    Extracted {
+        symbols: Vec<SymbolRecord>,
+        imports: Vec<String>,
+    },
+    /// The file could not be read. Whatever is stored for it describes text
+    /// that is gone, so it is cleared; the file stays un-extracted and a later
+    /// pass retries it.
+    Unreadable,
+}
+
+/// One file's extraction, applied together with everything else in a batch.
+#[derive(Debug, Clone)]
+pub struct ExtractionUpdate {
+    pub path: String,
+    pub extraction: Extraction,
+}
+
+/// A replacement of the git-history facts (co-change rows, their completeness
+/// facts, per-file recency), applied as one unit.
+#[derive(Debug, Clone, Default)]
+pub struct HistoryUpdate {
+    pub edges: Vec<CoChange>,
+    /// `None` for a walk that failed: the facts then read back as unknown.
+    pub facts: Option<CoChangeFacts>,
+    pub recency: HashMap<String, i64>,
+}
+
+/// A staged set of index changes, built entirely in memory (reading and parsing
+/// files, walking git history) with NO write transaction open, and then made
+/// visible at once by [`Store::publish_batch`].
+///
+/// Application order inside the publish transaction is fixed, because later
+/// steps rely on earlier ones: (1) the `retain_only` prune, (2) `removals`,
+/// (3) `files` (fingerprint upserts, which also drop the derived rows of a
+/// changed file), (4) `extractions` (symbols + imports + `tier1_done`, written
+/// only for a path that has a `files` row by then), (5) `history`.
+#[derive(Debug, Clone, Default)]
+pub struct IndexBatch {
+    /// Full reconcile: every `files` row whose path is not in this set is
+    /// removed with everything derived from it.
+    pub retain_only: Option<HashSet<String>>,
+    /// Paths (or directories, which take everything beneath them) to forget.
+    pub removals: Vec<String>,
+    pub files: Vec<FileUpdate>,
+    pub extractions: Vec<ExtractionUpdate>,
+    pub history: Option<HistoryUpdate>,
+}
+
+impl IndexBatch {
+    pub fn is_empty(&self) -> bool {
+        self.retain_only.is_none()
+            && self.removals.is_empty()
+            && self.files.is_empty()
+            && self.extractions.is_empty()
+            && self.history.is_none()
+    }
+}
+
+/// The outcome of one [`Store::publish_batch_detailed`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Published {
+    /// The generation after this publish (unchanged when nothing changed).
+    pub generation: u64,
+    /// Whether the batch changed any fact and therefore bumped the generation.
+    pub changed: bool,
+    /// Files dropped by the batch's `retain_only` prune.
+    pub pruned_files: usize,
+}
+
+/// A consistent view of the database: one read transaction, which in WAL mode
+/// is a snapshot. Every read made through the same [`Store`] while it is alive
+/// sees the facts of exactly one generation, however many batches other
+/// connections publish meanwhile. Ends (read-only, so rollback) on drop.
+///
+/// It borrows the store immutably, so a write through the same handle cannot
+/// happen while a view is open: the compiler enforces "read, then write".
+pub struct ReadView<'a> {
+    conn: &'a Connection,
+    generation: u64,
+    owns_tx: bool,
+}
+
+impl ReadView<'_> {
+    /// The generation every read in this view sees.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+impl Drop for ReadView<'_> {
+    fn drop(&mut self) {
+        if self.owns_tx {
+            let _ = self.conn.execute_batch("ROLLBACK");
+        }
+    }
+}
+
+/// Stored fingerprint of one file, as far as change detection is concerned.
+struct StoredFingerprint {
+    size: i64,
+    mtime_ns: Option<i64>,
+    content_hash: Option<String>,
+}
+
+impl StoredFingerprint {
+    /// A file is *changed* when its size differs from what is stored, or the
+    /// new mtime differs, or the new content hash differs. Unknown values on
+    /// the new side (`None`) never count as a change on their own, but a
+    /// stored NULL against a known value does: a row from before a
+    /// fingerprint existed has never been verified.
+    fn differs_from(&self, scanned: &ScannedFile) -> bool {
+        self.size != scanned.record.size_bytes as i64
+            || (scanned.mtime_ns.is_some() && self.mtime_ns != scanned.mtime_ns)
+            || (scanned.content_hash.is_some() && self.content_hash != scanned.content_hash)
+    }
+}
+
 pub struct Store {
     pub conn: Connection,
 }
@@ -53,6 +186,8 @@ pub const PARSER_CONFIG_VERSION: u32 = 1;
 const PARSER_VERSION_KEY: &str = "parser_config_version";
 const COCHANGE_SCANNED_KEY: &str = "cochange_commits_scanned";
 const COCHANGE_BULK_KEY: &str = "cochange_bulk_commits_excluded";
+/// Meta key of the publish counter; see [`Store::generation`].
+const GENERATION_KEY: &str = "generation";
 
 impl Store {
     pub fn open(repo_root: &Path) -> Result<Self> {
@@ -229,8 +364,15 @@ impl Store {
         // wiped but the old version recorded, which would trust the empty tables.
         conn.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| -> Result<()> {
-            if Self::stored_parser_version(conn)?.as_deref() == Some(version) {
+            let stored = Self::stored_parser_version(conn)?;
+            if stored.as_deref() == Some(version) {
                 return Ok(());
+            }
+            // Discarding derived data changes what readers see, so it is a
+            // generation of its own. A brand-new database (nothing recorded
+            // yet) has nothing to discard and stays at generation 0.
+            if stored.is_some() {
+                Self::bump_generation(conn)?;
             }
             conn.execute_batch(
                 "DELETE FROM symbols;
@@ -266,6 +408,186 @@ impl Store {
         Ok(self
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?)
+    }
+
+    /// The publish counter: how many batches of changes to the indexed facts
+    /// (files, symbols, imports, co-change, recency) have been committed to
+    /// this database, `0` for one that has never published.
+    ///
+    /// It is a counter of *publishes*, not an identity of content (that is
+    /// [`Store::snapshot_id`]): it only goes up, it is bumped inside the same
+    /// transaction that changes the facts (so a reader sees the new number
+    /// exactly when it sees the new facts), and a batch that changes nothing
+    /// does not move it. A cheap single-row read, so callers can poll it.
+    pub fn generation(&self) -> Result<u64> {
+        Self::read_generation(&self.conn)
+    }
+
+    fn read_generation(conn: &Connection) -> Result<u64> {
+        let value: Option<String> = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                params![GENERATION_KEY],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(value.and_then(|v| v.parse().ok()).unwrap_or(0))
+    }
+
+    /// Add one to the counter and return the new value. Only ever called
+    /// inside the transaction that wrote the facts it accounts for.
+    fn bump_generation(conn: &Connection) -> Result<u64> {
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?1, '1')
+             ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)",
+            params![GENERATION_KEY],
+        )?;
+        Self::read_generation(conn)
+    }
+
+    /// Start a consistent read: every read made through this store until the
+    /// returned view is dropped sees one generation, whatever other connections
+    /// publish meanwhile (SQLite WAL snapshot isolation). The generation is
+    /// read first, which is what pins the snapshot, so [`ReadView::generation`]
+    /// is exactly the generation of all the facts read inside it.
+    ///
+    /// If the connection is already inside a transaction, that transaction is
+    /// the snapshot: nothing new is started, and nothing is ended on drop.
+    pub fn begin_read(&self) -> Result<ReadView<'_>> {
+        let owns_tx = self.conn.is_autocommit();
+        if owns_tx {
+            self.conn.execute_batch("BEGIN")?;
+        }
+        match Self::read_generation(&self.conn) {
+            Ok(generation) => Ok(ReadView {
+                conn: &self.conn,
+                generation,
+                owns_tx,
+            }),
+            Err(e) => {
+                if owns_tx {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Apply a staged [`IndexBatch`] as ONE generation: a single `IMMEDIATE`
+    /// transaction holds every fingerprint upsert, derived-row invalidation,
+    /// symbol and import replacement, removal and co-change replacement, and
+    /// bumps the generation by one inside that same transaction when anything
+    /// changed. Returns the generation after the publish.
+    ///
+    /// All-or-nothing: an error (or a panic, or a crash) before the commit
+    /// leaves the previous generation fully intact, with none of the batch
+    /// applied. A batch that changes nothing does not bump. Concurrent readers
+    /// using [`Store::begin_read`] see either all of the batch or none of it.
+    pub fn publish_batch(&mut self, batch: IndexBatch) -> Result<u64> {
+        Ok(self.publish_batch_detailed(batch)?.generation)
+    }
+
+    /// [`Store::publish_batch`], also saying whether anything changed and how
+    /// many files the batch's prune dropped.
+    pub fn publish_batch_detailed(&mut self, batch: IndexBatch) -> Result<Published> {
+        let tx = self.write_tx()?;
+        let mut changed = false;
+        let mut pruned_files = 0;
+
+        if let Some(keep) = &batch.retain_only {
+            pruned_files = Self::prune_missing_tx(&tx, keep)?;
+            changed |= pruned_files > 0;
+        }
+        for path in &batch.removals {
+            changed |= Self::remove_path_tx(&tx, path)? > 0;
+        }
+        for update in &batch.files {
+            changed |= Self::upsert_one_tx(&tx, &update.scanned)?;
+            if update.invalidate_vectors {
+                // Cache rows: dropping them is not a change to the facts.
+                Self::delete_vectors_tx(&tx, &update.scanned.record.path)?;
+            }
+        }
+        for update in &batch.extractions {
+            changed |= Self::apply_extraction_tx(&tx, update)?;
+        }
+        if let Some(history) = &batch.history {
+            changed |= Self::apply_history_tx(&tx, history)?;
+        }
+
+        let generation = if changed {
+            Self::bump_generation(&tx)?
+        } else {
+            Self::read_generation(&tx)?
+        };
+        tx.commit()?;
+        Ok(Published {
+            generation,
+            changed,
+            pruned_files,
+        })
+    }
+
+    /// Of `files` (about to be upserted), the paths that will have no usable
+    /// extraction afterwards: not stored yet, changed since, or never
+    /// extracted. Read-only, so staging can decide what to parse without
+    /// holding a write transaction. The answer is a snapshot; if another
+    /// connection extracts one meanwhile, re-extracting it is harmless.
+    pub fn pending_extraction(&self, files: &[ScannedFile]) -> Result<HashSet<String>> {
+        let mut stored: HashMap<String, (StoredFingerprint, bool)> = HashMap::new();
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT path, size_bytes, mtime_ns, content_hash, tier1_done FROM files",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    StoredFingerprint {
+                        size: r.get(1)?,
+                        mtime_ns: r.get(2)?,
+                        content_hash: r.get(3)?,
+                    },
+                    r.get::<_, i64>(4)? == 1,
+                ))
+            })?;
+            for row in rows {
+                let (path, fingerprint, done) = row?;
+                stored.insert(path, (fingerprint, done));
+            }
+        }
+        Ok(files
+            .iter()
+            .filter(|f| match stored.get(&f.record.path) {
+                None => true,
+                Some((fingerprint, done)) => !done || fingerprint.differs_from(f),
+            })
+            .map(|f| f.record.path.clone())
+            .collect())
+    }
+
+    /// Content hash recorded for every indexed file (`None` where a row never
+    /// had one).
+    pub fn file_hashes(&self) -> Result<HashMap<String, Option<String>>> {
+        let mut stmt = self.conn.prepare("SELECT path, content_hash FROM files")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Every extracted symbol, grouped by file and in source order within one.
+    pub fn all_symbols_by_path(&self) -> Result<HashMap<String, Vec<SymbolRecord>>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT name, kind, path, start_line, end_line, signature FROM symbols
+             ORDER BY path, start_line, id",
+        )?;
+        let rows = stmt.query_map([], row_to_symbol)?;
+        let mut out: HashMap<String, Vec<SymbolRecord>> = HashMap::new();
+        for symbol in rows {
+            let symbol = symbol?;
+            out.entry(symbol.path.clone()).or_default().push(symbol);
+        }
+        Ok(out)
     }
 
     /// Bring a database created by an older Engram up to the current schema.
@@ -338,14 +660,28 @@ impl Store {
     /// Paths not present in the files table are silently skipped.
     pub fn update_recency(&mut self, recency: &HashMap<String, i64>) -> Result<()> {
         let tx = self.write_tx()?;
-        for (path, ts) in recency {
-            tx.execute(
-                "UPDATE files SET last_commit_ts = ?2 WHERE path = ?1",
-                params![path, ts],
-            )?;
+        if Self::apply_recency_tx(&tx, recency)? {
+            Self::bump_generation(&tx)?;
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Set the recency of the listed paths that are indexed; true when any
+    /// value actually changed.
+    fn apply_recency_tx(
+        tx: &rusqlite::Transaction<'_>,
+        recency: &HashMap<String, i64>,
+    ) -> Result<bool> {
+        let mut changed = 0;
+        for (path, ts) in recency {
+            changed += tx.execute(
+                "UPDATE files SET last_commit_ts = ?2
+                 WHERE path = ?1 AND (last_commit_ts IS NULL OR last_commit_ts <> ?2)",
+                params![path, ts],
+            )?;
+        }
+        Ok(changed > 0)
     }
 
     /// Map of path -> last-commit unix timestamp for files that have one.
@@ -484,21 +820,30 @@ impl Store {
         &mut self,
         keep: &std::collections::HashSet<String>,
     ) -> Result<usize> {
+        let tx = self.write_tx()?;
+        let pruned = Self::prune_missing_tx(&tx, keep)?;
+        if pruned > 0 {
+            Self::bump_generation(&tx)?;
+        }
+        tx.commit()?;
+        Ok(pruned)
+    }
+
+    fn prune_missing_tx(
+        tx: &rusqlite::Transaction<'_>,
+        keep: &std::collections::HashSet<String>,
+    ) -> Result<usize> {
         let stale: Vec<String> = {
-            let mut stmt = self.conn.prepare("SELECT path FROM files")?;
+            let mut stmt = tx.prepare("SELECT path FROM files")?;
             let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-            rows.filter_map(Result::ok)
+            rows.collect::<rusqlite::Result<Vec<String>>>()?
+                .into_iter()
                 .filter(|path| !keep.contains(path))
                 .collect()
         };
-        if stale.is_empty() {
-            return Ok(0);
-        }
-        let tx = self.write_tx()?;
         for path in &stale {
-            Self::delete_file_rows(&tx, path)?;
+            Self::delete_file_rows(tx, path)?;
         }
-        tx.commit()?;
         Ok(stale.len())
     }
 
@@ -507,6 +852,11 @@ impl Store {
     fn delete_derived_rows(tx: &rusqlite::Transaction<'_>, path: &str) -> Result<()> {
         tx.execute("DELETE FROM symbols WHERE path = ?1", params![path])?;
         tx.execute("DELETE FROM file_imports WHERE path = ?1", params![path])?;
+        Self::delete_vectors_tx(tx, path)
+    }
+
+    /// Delete a file's cached embeddings (a cache, not part of the facts).
+    fn delete_vectors_tx(tx: &rusqlite::Transaction<'_>, path: &str) -> Result<()> {
         tx.execute("DELETE FROM vectors WHERE path = ?1", params![path])?;
         tx.execute("DELETE FROM chunk_vectors WHERE path = ?1", params![path])?;
         Ok(())
@@ -531,10 +881,19 @@ impl Store {
     /// Returns the number of rows deleted across all tables; zero means the
     /// index did not change.
     pub fn remove_path(&mut self, path: &str) -> Result<usize> {
+        let tx = self.write_tx()?;
+        let removed = Self::remove_path_tx(&tx, path)?;
+        if removed > 0 {
+            Self::bump_generation(&tx)?;
+        }
+        tx.commit()?;
+        Ok(removed)
+    }
+
+    fn remove_path_tx(tx: &rusqlite::Transaction<'_>, path: &str) -> Result<usize> {
         let dir = path.trim_end_matches('/');
         let range_start = format!("{dir}/");
         let range_end = format!("{dir}0");
-        let tx = self.write_tx()?;
         let mut removed = 0;
         for table in [
             "files",
@@ -548,7 +907,6 @@ impl Store {
                 params![dir, range_start, range_end],
             )?;
         }
-        tx.commit()?;
         Ok(removed)
     }
 
@@ -771,19 +1129,41 @@ impl Store {
     /// (see [`crate::imports::normalize_target`]) before storage; empties dropped.
     pub fn replace_imports_for_file(&mut self, path: &str, targets: &[String]) -> Result<()> {
         let tx = self.write_tx()?;
-        tx.execute("DELETE FROM file_imports WHERE path = ?1", params![path])?;
-        for raw in targets {
-            let target = crate::imports::normalize_target(raw);
-            if target.is_empty() {
-                continue;
-            }
-            tx.execute(
-                "INSERT INTO file_imports (path, target) VALUES (?1, ?2)",
-                params![path, target],
-            )?;
+        if Self::replace_imports_tx(&tx, path, targets)? {
+            Self::bump_generation(&tx)?;
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Replace a file's import rows; true when they differ from what was
+    /// stored (an identical re-extraction writes nothing).
+    fn replace_imports_tx(
+        tx: &rusqlite::Transaction<'_>,
+        path: &str,
+        targets: &[String],
+    ) -> Result<bool> {
+        let new: Vec<String> = targets
+            .iter()
+            .map(|raw| crate::imports::normalize_target(raw))
+            .filter(|target| !target.is_empty())
+            .collect();
+        let old: Vec<String> = {
+            let mut stmt =
+                tx.prepare("SELECT target FROM file_imports WHERE path = ?1 ORDER BY rowid")?;
+            let rows = stmt.query_map(params![path], |r| r.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        if old == new {
+            return Ok(false);
+        }
+        tx.execute("DELETE FROM file_imports WHERE path = ?1", params![path])?;
+        let mut insert =
+            tx.prepare_cached("INSERT INTO file_imports (path, target) VALUES (?1, ?2)")?;
+        for target in &new {
+            insert.execute(params![path, target])?;
+        }
+        Ok(true)
     }
 
     /// All `(importer_path, normalized_target)` import rows. Used to build the
@@ -856,48 +1236,74 @@ impl Store {
     /// vectors) is deleted and `tier1_done` reset, so the old contents can
     /// neither be served nor mistaken for current.
     pub fn upsert_fingerprinted(&mut self, files: &[ScannedFile]) -> Result<()> {
-        use rusqlite::OptionalExtension;
         let tx = self.write_tx()?;
+        let mut changed = false;
         for scanned in files {
-            let f = &scanned.record;
-            let old: Option<(i64, Option<i64>, Option<String>)> = tx
-                .query_row(
-                    "SELECT size_bytes, mtime_ns, content_hash FROM files WHERE path = ?1",
-                    params![f.path],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-                )
-                .optional()?;
-            let changed = old.is_some_and(|(size, mtime, hash)| {
-                size != f.size_bytes as i64
-                    || (scanned.mtime_ns.is_some() && mtime != scanned.mtime_ns)
-                    || (scanned.content_hash.is_some() && hash != scanned.content_hash)
-            });
-            if changed {
-                Self::delete_derived_rows(&tx, &f.path)?;
-            }
-            tx.execute(
-                "INSERT INTO files (path, language, size_bytes, is_test, mtime_ns, content_hash)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                 ON CONFLICT(path) DO UPDATE SET
-                   language=?2,
-                   is_test=?4,
-                   tier1_done = CASE WHEN ?7 THEN 0 ELSE tier1_done END,
-                   size_bytes=?3,
-                   mtime_ns=COALESCE(?5, mtime_ns),
-                   content_hash=COALESCE(?6, content_hash)",
-                params![
-                    f.path,
-                    f.language.as_str(),
-                    f.size_bytes as i64,
-                    f.is_test as i64,
-                    scanned.mtime_ns,
-                    scanned.content_hash,
-                    changed
-                ],
-            )?;
+            changed |= Self::upsert_one_tx(&tx, scanned)?;
+        }
+        if changed {
+            Self::bump_generation(&tx)?;
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Upsert one inventoried file inside a transaction. True when the file is
+    /// new or anything the index shows about it changed (fingerprint, language,
+    /// test flag).
+    fn upsert_one_tx(tx: &rusqlite::Transaction<'_>, scanned: &ScannedFile) -> Result<bool> {
+        let f = &scanned.record;
+        let old: Option<(StoredFingerprint, String, bool)> = tx
+            .query_row(
+                "SELECT size_bytes, mtime_ns, content_hash, language, is_test
+                 FROM files WHERE path = ?1",
+                params![f.path],
+                |r| {
+                    Ok((
+                        StoredFingerprint {
+                            size: r.get(0)?,
+                            mtime_ns: r.get(1)?,
+                            content_hash: r.get(2)?,
+                        },
+                        r.get::<_, String>(3)?,
+                        r.get::<_, i64>(4)? == 1,
+                    ))
+                },
+            )
+            .optional()?;
+        let changed = old
+            .as_ref()
+            .is_some_and(|(fingerprint, _, _)| fingerprint.differs_from(scanned));
+        let visible_change = match &old {
+            None => true,
+            Some((_, language, is_test)) => {
+                changed || language != f.language.as_str() || *is_test != f.is_test
+            }
+        };
+        if changed {
+            Self::delete_derived_rows(tx, &f.path)?;
+        }
+        tx.execute(
+            "INSERT INTO files (path, language, size_bytes, is_test, mtime_ns, content_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(path) DO UPDATE SET
+               language=?2,
+               is_test=?4,
+               tier1_done = CASE WHEN ?7 THEN 0 ELSE tier1_done END,
+               size_bytes=?3,
+               mtime_ns=COALESCE(?5, mtime_ns),
+               content_hash=COALESCE(?6, content_hash)",
+            params![
+                f.path,
+                f.language.as_str(),
+                f.size_bytes as i64,
+                f.is_test as i64,
+                scanned.mtime_ns,
+                scanned.content_hash,
+                changed
+            ],
+        )?;
+        Ok(visible_change)
     }
 
     /// A stable id for exactly what is indexed: the checked-out commit (`head`),
@@ -943,39 +1349,118 @@ impl Store {
     /// that is gone, and the file should be retried rather than trusted empty.
     pub fn clear_extracted(&mut self, path: &str) -> Result<()> {
         let tx = self.write_tx()?;
-        tx.execute("DELETE FROM symbols WHERE path = ?1", params![path])?;
-        tx.execute("DELETE FROM file_imports WHERE path = ?1", params![path])?;
-        tx.execute(
-            "UPDATE files SET tier1_done = 0 WHERE path = ?1",
-            params![path],
-        )?;
+        if Self::clear_extracted_tx(&tx, path)? {
+            Self::bump_generation(&tx)?;
+        }
         tx.commit()?;
         Ok(())
     }
 
+    /// True when a symbol or import row was removed.
+    fn clear_extracted_tx(tx: &rusqlite::Transaction<'_>, path: &str) -> Result<bool> {
+        let removed = tx.execute("DELETE FROM symbols WHERE path = ?1", params![path])?
+            + tx.execute("DELETE FROM file_imports WHERE path = ?1", params![path])?;
+        tx.execute(
+            "UPDATE files SET tier1_done = 0 WHERE path = ?1",
+            params![path],
+        )?;
+        Ok(removed > 0)
+    }
+
     pub fn replace_symbols_for_file(&mut self, path: &str, symbols: &[SymbolRecord]) -> Result<()> {
         let tx = self.write_tx()?;
-        tx.execute("DELETE FROM symbols WHERE path = ?1", params![path])?;
-        for s in symbols {
-            tx.execute(
-                "INSERT INTO symbols (name, kind, path, start_line, end_line, signature)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    s.name,
+        if Self::replace_symbols_tx(&tx, path, symbols)? {
+            Self::bump_generation(&tx)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Replace a file's symbols and mark it extracted. True when the symbols
+    /// differ from what was stored (an identical re-extraction writes nothing,
+    /// and flipping `tier1_done` alone is bookkeeping, not a change of facts).
+    fn replace_symbols_tx(
+        tx: &rusqlite::Transaction<'_>,
+        path: &str,
+        symbols: &[SymbolRecord],
+    ) -> Result<bool> {
+        type Row = (String, String, String, i64, i64, String);
+        let new: Vec<Row> = symbols
+            .iter()
+            .map(|s| {
+                (
+                    s.name.clone(),
                     format!("{:?}", s.kind).to_lowercase(),
-                    s.path,
+                    s.path.clone(),
                     s.start_line as i64,
                     s.end_line as i64,
-                    s.signature
-                ],
+                    s.signature.clone(),
+                )
+            })
+            .collect();
+        let old: Vec<Row> = {
+            let mut stmt = tx.prepare(
+                "SELECT name, kind, path, start_line, end_line, signature
+                 FROM symbols WHERE path = ?1 ORDER BY id",
             )?;
+            let rows = stmt.query_map(params![path], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            })?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        let changed = old != new;
+        if changed {
+            tx.execute("DELETE FROM symbols WHERE path = ?1", params![path])?;
+            let mut insert = tx.prepare_cached(
+                "INSERT INTO symbols (name, kind, path, start_line, end_line, signature)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )?;
+            for row in &new {
+                insert.execute(params![row.0, row.1, row.2, row.3, row.4, row.5])?;
+            }
         }
         tx.execute(
             "UPDATE files SET tier1_done = 1 WHERE path = ?1",
             params![path],
         )?;
-        tx.commit()?;
-        Ok(())
+        Ok(changed)
+    }
+
+    /// Apply one staged extraction. Skipped (false) for a path with no `files`
+    /// row, which was removed between staging and publishing: writing symbols
+    /// for it would resurrect a ghost.
+    fn apply_extraction_tx(
+        tx: &rusqlite::Transaction<'_>,
+        update: &ExtractionUpdate,
+    ) -> Result<bool> {
+        let known: bool = tx
+            .query_row(
+                "SELECT 1 FROM files WHERE path = ?1",
+                params![update.path],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if !known {
+            return Ok(false);
+        }
+        match &update.extraction {
+            Extraction::Extracted { symbols, imports } => {
+                // Imports first: replacing symbols is what marks the file
+                // extracted, so the order is the same as it always was.
+                let imports_changed = Self::replace_imports_tx(tx, &update.path, imports)?;
+                let symbols_changed = Self::replace_symbols_tx(tx, &update.path, symbols)?;
+                Ok(imports_changed || symbols_changed)
+            }
+            Extraction::Unreadable => Self::clear_extracted_tx(tx, &update.path),
+        }
     }
 
     /// Replace the co-change rows only. The completeness facts that described
@@ -1002,13 +1487,31 @@ impl Store {
         facts: Option<&CoChangeFacts>,
     ) -> Result<()> {
         let tx = self.write_tx()?;
+        if Self::replace_cochange_tx(&tx, edges, facts)? {
+            Self::bump_generation(&tx)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Replace the co-change rows and their completeness facts. True when the
+    /// stored result differs from what was there (compared by digest, so a
+    /// history walk that found the same history changes nothing).
+    fn replace_cochange_tx(
+        tx: &rusqlite::Transaction<'_>,
+        edges: &[CoChange],
+        facts: Option<&CoChangeFacts>,
+    ) -> Result<bool> {
+        let before = Self::cochange_digest(tx)?;
         tx.execute("DELETE FROM cochange", [])?;
-        for e in edges {
-            tx.execute(
+        {
+            let mut insert = tx.prepare_cached(
                 "INSERT OR REPLACE INTO cochange (path_a, path_b, count, strength)
                  VALUES (?1, ?2, ?3, ?4)",
-                params![e.path_a, e.path_b, e.count as i64, e.strength],
             )?;
+            for e in edges {
+                insert.execute(params![e.path_a, e.path_b, e.count as i64, e.strength])?;
+            }
         }
         tx.execute("DELETE FROM cochange_file_commits", [])?;
         tx.execute(
@@ -1033,8 +1536,56 @@ impl Store {
                 )?;
             }
         }
-        tx.commit()?;
-        Ok(())
+        Ok(before != Self::cochange_digest(tx)?)
+    }
+
+    /// Replace the git-history facts of a staged batch: co-change rows (with
+    /// their completeness facts) and per-file recency. True when anything
+    /// differs afterwards.
+    fn apply_history_tx(tx: &rusqlite::Transaction<'_>, history: &HistoryUpdate) -> Result<bool> {
+        let cochange = Self::replace_cochange_tx(tx, &history.edges, history.facts.as_ref())?;
+        let recency = Self::apply_recency_tx(tx, &history.recency)?;
+        Ok(cochange || recency)
+    }
+
+    /// Digest of everything [`Store::replace_cochange_tx`] rewrites, in a
+    /// canonical order, so before and after can be compared without keeping a
+    /// copy of the rows.
+    fn cochange_digest(conn: &Connection) -> Result<String> {
+        use crate::inventory::Fnv64;
+        let mut hasher = Fnv64::default();
+        let mut field = |bytes: &[u8]| {
+            hasher.write(bytes);
+            hasher.write(&[0xff]);
+        };
+        let mut stmt = conn.prepare(
+            "SELECT path_a, path_b, count, strength FROM cochange ORDER BY path_a, path_b",
+        )?;
+        let mut rows = stmt.query([])?;
+        while let Some(r) = rows.next()? {
+            field(r.get::<_, String>(0)?.as_bytes());
+            field(r.get::<_, String>(1)?.as_bytes());
+            field(&r.get::<_, i64>(2)?.to_le_bytes());
+            field(&r.get::<_, f64>(3)?.to_bits().to_le_bytes());
+        }
+        field(b"file-commits");
+        let mut stmt =
+            conn.prepare("SELECT path, commits FROM cochange_file_commits ORDER BY path")?;
+        let mut rows = stmt.query([])?;
+        while let Some(r) = rows.next()? {
+            field(r.get::<_, String>(0)?.as_bytes());
+            field(&r.get::<_, i64>(1)?.to_le_bytes());
+        }
+        field(b"totals");
+        for key in [COCHANGE_SCANNED_KEY, COCHANGE_BULK_KEY] {
+            let value: Option<String> = conn
+                .query_row("SELECT value FROM meta WHERE key = ?1", params![key], |r| {
+                    r.get(0)
+                })
+                .optional()?;
+            field(value.as_deref().unwrap_or("-").as_bytes());
+        }
+        Ok(hasher.finish_hex())
     }
 
     /// `(commits_scanned, bulk_commits_excluded)` of the walk that built the
@@ -2376,5 +2927,575 @@ mod tests {
             .unwrap();
         store.prune_missing_files(&HashSet::new()).unwrap();
         assert!(store.load_vectors().unwrap().is_empty());
+    }
+
+    // ----- generations: staged batches published atomically -----
+
+    /// Every row of every table that publish touches, in a canonical order, as
+    /// text. Two dumps are equal exactly when the tables are identical.
+    fn dump(store: &Store) -> Vec<String> {
+        let mut out = Vec::new();
+        for table in [
+            "files",
+            "symbols",
+            "file_imports",
+            "cochange",
+            "cochange_file_commits",
+            "meta",
+            "vectors",
+            "chunk_vectors",
+        ] {
+            let mut stmt = store
+                .conn
+                .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
+                .unwrap();
+            let columns = stmt.column_count();
+            let rows = stmt
+                .query_map([], |r| {
+                    let mut cells = Vec::new();
+                    for i in 0..columns {
+                        let value: rusqlite::types::Value = r.get(i)?;
+                        cells.push(format!("{value:?}"));
+                    }
+                    Ok(cells.join("|"))
+                })
+                .unwrap();
+            for row in rows {
+                out.push(format!("{table}: {}", row.unwrap()));
+            }
+        }
+        out
+    }
+
+    fn extraction(path: &str, symbol_name: &str, import: &str) -> ExtractionUpdate {
+        ExtractionUpdate {
+            path: path.to_owned(),
+            extraction: Extraction::Extracted {
+                symbols: vec![symbol(path, symbol_name)],
+                imports: vec![import.to_owned()],
+            },
+        }
+    }
+
+    fn history(partner_edge: bool) -> HistoryUpdate {
+        let mut facts = CoChangeFacts {
+            commits_scanned: 12,
+            bulk_commits_excluded: 1,
+            ..Default::default()
+        };
+        facts.file_commits.insert("a.rs".to_owned(), 4);
+        HistoryUpdate {
+            edges: if partner_edge {
+                vec![CoChange {
+                    path_a: "a.rs".to_owned(),
+                    path_b: "b.rs".to_owned(),
+                    count: 3,
+                    strength: 0.75,
+                }]
+            } else {
+                Vec::new()
+            },
+            facts: Some(facts),
+            recency: HashMap::from([("a.rs".to_owned(), 1_700_000_000)]),
+        }
+    }
+
+    /// Generation 1 of the tests below: a.rs and old.rs, both extracted.
+    fn seeded(repo: &TempRepo) -> Store {
+        let mut store = repo.store();
+        let published = store
+            .publish_batch_detailed(IndexBatch {
+                files: vec![
+                    FileUpdate {
+                        scanned: hashed("a.rs", 1, "ha1"),
+                        invalidate_vectors: false,
+                    },
+                    FileUpdate {
+                        scanned: hashed("old.rs", 1, "ho1"),
+                        invalidate_vectors: false,
+                    },
+                ],
+                extractions: vec![
+                    extraction("a.rs", "alpha_old", "dep_old"),
+                    extraction("old.rs", "legacy", "dep_legacy"),
+                ],
+                ..IndexBatch::default()
+            })
+            .unwrap();
+        assert!(published.changed);
+        assert_eq!(published.generation, 1);
+        store
+    }
+
+    #[test]
+    fn a_fresh_database_is_generation_zero() {
+        let repo = TempRepo::new();
+        assert_eq!(repo.store().generation().unwrap(), 0);
+        // An empty batch is not a change.
+        let mut store = repo.store();
+        assert_eq!(store.publish_batch(IndexBatch::default()).unwrap(), 0);
+    }
+
+    #[test]
+    fn one_batch_applies_every_kind_of_change_and_bumps_the_generation_once() {
+        let repo = TempRepo::new();
+        let mut store = seeded(&repo);
+        store
+            .upsert_chunk_vectors(&[("a.rs".to_owned(), 1, "h".to_owned(), vec![1])])
+            .unwrap();
+
+        let published = store
+            .publish_batch_detailed(IndexBatch {
+                // old.rs is gone from the repository, a.rs was edited, b.rs is new.
+                retain_only: Some(HashSet::from(["a.rs".to_owned(), "b.rs".to_owned()])),
+                removals: vec!["ghost/".to_owned()],
+                files: vec![
+                    FileUpdate {
+                        scanned: hashed("a.rs", 2, "ha2"),
+                        invalidate_vectors: false,
+                    },
+                    FileUpdate {
+                        scanned: hashed("b.rs", 2, "hb2"),
+                        invalidate_vectors: false,
+                    },
+                ],
+                extractions: vec![
+                    extraction("a.rs", "alpha_new", "dep_new"),
+                    extraction("b.rs", "beta", "dep_beta"),
+                ],
+                history: Some(history(true)),
+            })
+            .unwrap();
+
+        assert_eq!(published.generation, 2, "one batch is one generation");
+        assert!(published.changed);
+        assert_eq!(published.pruned_files, 1);
+        assert_eq!(store.generation().unwrap(), 2);
+
+        let paths: Vec<String> = store
+            .all_files()
+            .unwrap()
+            .into_iter()
+            .map(|f| f.path)
+            .collect();
+        assert_eq!(paths, ["a.rs", "b.rs"]);
+        let names = |path: &str| -> Vec<String> {
+            store
+                .symbols_for_path(path)
+                .unwrap()
+                .into_iter()
+                .map(|s| s.name)
+                .collect()
+        };
+        assert_eq!(
+            names("a.rs"),
+            ["alpha_new"],
+            "the edit replaced the symbols"
+        );
+        assert_eq!(names("b.rs"), ["beta"]);
+        assert!(
+            names("old.rs").is_empty(),
+            "the removed file left no symbols"
+        );
+        let mut imports = store.all_imports().unwrap();
+        imports.sort();
+        assert_eq!(
+            imports,
+            [
+                ("a.rs".to_owned(), "dep_new".to_owned()),
+                ("b.rs".to_owned(), "dep_beta".to_owned())
+            ],
+            "stale import edges are gone with the batch, new ones are in"
+        );
+        assert!(store.is_tier1_done("a.rs") && store.is_tier1_done("b.rs"));
+        assert!(
+            store.load_chunk_vectors().unwrap().is_empty(),
+            "the edit dropped the old spans' cached vectors"
+        );
+        assert_eq!(store.cochange_totals().unwrap(), Some((12, 1)));
+        assert_eq!(
+            store.cochange_pair("a.rs", "b.rs").unwrap().unwrap().count,
+            3
+        );
+        assert_eq!(
+            store.recency_map().unwrap().get("a.rs"),
+            Some(&1_700_000_000)
+        );
+    }
+
+    #[test]
+    fn a_batch_that_changes_nothing_does_not_move_the_generation() {
+        let repo = TempRepo::new();
+        let mut store = seeded(&repo);
+        store
+            .publish_batch(IndexBatch {
+                history: Some(history(true)),
+                ..IndexBatch::default()
+            })
+            .unwrap();
+        let generation = store.generation().unwrap();
+        let before = dump(&store);
+
+        let again = IndexBatch {
+            retain_only: Some(HashSet::from(["a.rs".to_owned(), "old.rs".to_owned()])),
+            removals: vec!["never/there.rs".to_owned()],
+            files: vec![
+                FileUpdate {
+                    scanned: hashed("a.rs", 1, "ha1"),
+                    invalidate_vectors: false,
+                },
+                FileUpdate {
+                    scanned: hashed("old.rs", 1, "ho1"),
+                    invalidate_vectors: false,
+                },
+            ],
+            // The very same facts again: an identical re-extraction is no change.
+            extractions: vec![
+                extraction("a.rs", "alpha_old", "dep_old"),
+                extraction("old.rs", "legacy", "dep_legacy"),
+            ],
+            history: Some(history(true)),
+        };
+        let published = store.publish_batch_detailed(again).unwrap();
+        assert!(!published.changed);
+        assert_eq!(published.generation, generation);
+        assert_eq!(store.generation().unwrap(), generation);
+        assert_eq!(dump(&store), before, "nothing was rewritten either");
+    }
+
+    #[test]
+    fn extracting_a_file_with_nothing_in_it_is_bookkeeping_not_a_new_generation() {
+        let repo = TempRepo::new();
+        let mut store = repo.store();
+        store.upsert_files(&[file("empty.rs")]).unwrap();
+        let generation = store.generation().unwrap();
+        let published = store
+            .publish_batch_detailed(IndexBatch {
+                extractions: vec![ExtractionUpdate {
+                    path: "empty.rs".to_owned(),
+                    extraction: Extraction::Extracted {
+                        symbols: Vec::new(),
+                        imports: Vec::new(),
+                    },
+                }],
+                ..IndexBatch::default()
+            })
+            .unwrap();
+        assert!(!published.changed);
+        assert_eq!(published.generation, generation);
+        assert!(
+            store.is_tier1_done("empty.rs"),
+            "but it is marked extracted"
+        );
+    }
+
+    #[test]
+    fn an_extraction_for_a_file_removed_meanwhile_does_not_resurrect_it() {
+        let repo = TempRepo::new();
+        let mut store = repo.store();
+        // Staged against a file that no longer has a row when published.
+        let published = store
+            .publish_batch_detailed(IndexBatch {
+                extractions: vec![extraction("gone.rs", "ghost", "dep_ghost")],
+                ..IndexBatch::default()
+            })
+            .unwrap();
+        assert!(!published.changed);
+        assert!(store.symbols_matching("ghost", 5).unwrap().is_empty());
+        assert!(store.all_imports().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_batch_that_fails_midway_leaves_the_previous_generation_exactly_as_it_was() {
+        let repo = TempRepo::new();
+        let mut store = seeded(&repo);
+        store
+            .publish_batch(IndexBatch {
+                history: Some(history(true)),
+                ..IndexBatch::default()
+            })
+            .unwrap();
+        store
+            .upsert_chunk_vectors(&[("a.rs".to_owned(), 1, "h".to_owned(), vec![1])])
+            .unwrap();
+        let generation = store.generation().unwrap();
+        let before = dump(&store);
+
+        // The LAST thing a batch writes is the co-change completeness facts;
+        // make that insert fail, after every other part has been applied.
+        store
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER fail_the_last_step BEFORE INSERT ON cochange_file_commits
+                 BEGIN SELECT RAISE(ABORT, 'injected failure'); END;",
+            )
+            .unwrap();
+        let batch = IndexBatch {
+            retain_only: Some(HashSet::from(["a.rs".to_owned(), "b.rs".to_owned()])),
+            removals: vec!["x/".to_owned()],
+            files: vec![
+                FileUpdate {
+                    scanned: hashed("a.rs", 2, "ha2"),
+                    invalidate_vectors: true,
+                },
+                FileUpdate {
+                    scanned: hashed("b.rs", 2, "hb2"),
+                    invalidate_vectors: false,
+                },
+            ],
+            extractions: vec![
+                extraction("a.rs", "alpha_new", "dep_new"),
+                extraction("b.rs", "beta", "dep_beta"),
+            ],
+            history: Some(history(false)),
+        };
+        let err = store.publish_batch(batch.clone()).unwrap_err();
+        assert!(err.to_string().contains("injected failure"), "{err:#}");
+
+        assert_eq!(store.generation().unwrap(), generation);
+        assert_eq!(
+            dump(&store),
+            before,
+            "files, symbols, imports, co-change and meta must all be untouched"
+        );
+
+        // The same batch is fine once the fault is gone: it was the fault, not
+        // the batch, and the connection is usable afterwards.
+        store
+            .conn
+            .execute_batch("DROP TRIGGER fail_the_last_step;")
+            .unwrap();
+        assert_eq!(store.publish_batch(batch).unwrap(), generation + 1);
+    }
+
+    #[test]
+    fn a_reader_in_a_read_view_sees_one_generation_until_it_ends() {
+        let repo = TempRepo::new();
+        let mut publisher = seeded(&repo);
+        let reader = repo.store();
+
+        let view = reader.begin_read().unwrap();
+        assert_eq!(view.generation(), 1);
+
+        publisher
+            .publish_batch(IndexBatch {
+                retain_only: Some(HashSet::from(["a.rs".to_owned()])),
+                files: vec![FileUpdate {
+                    scanned: hashed("a.rs", 2, "ha2"),
+                    invalidate_vectors: false,
+                }],
+                extractions: vec![extraction("a.rs", "alpha_new", "dep_new")],
+                ..IndexBatch::default()
+            })
+            .unwrap();
+        assert_eq!(publisher.generation().unwrap(), 2);
+
+        // Inside the view: all old, none of the new, files included.
+        assert_eq!(reader.generation().unwrap(), 1);
+        let names: Vec<String> = reader
+            .symbols_for_path("a.rs")
+            .unwrap()
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(names, ["alpha_old"]);
+        let mut imports = reader.all_imports().unwrap();
+        imports.sort();
+        assert_eq!(
+            imports,
+            [
+                ("a.rs".to_owned(), "dep_old".to_owned()),
+                ("old.rs".to_owned(), "dep_legacy".to_owned())
+            ]
+        );
+        assert_eq!(reader.all_files().unwrap().len(), 2, "old.rs still exists");
+
+        // Ending the view ends the isolation: now it is all new.
+        drop(view);
+        assert_eq!(reader.generation().unwrap(), 2);
+        let names: Vec<String> = reader
+            .symbols_for_path("a.rs")
+            .unwrap()
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(names, ["alpha_new"]);
+        assert_eq!(
+            reader.all_imports().unwrap(),
+            [("a.rs".to_owned(), "dep_new".to_owned())]
+        );
+        assert_eq!(reader.all_files().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_reader_never_observes_new_symbols_with_old_imports() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let repo = TempRepo::new();
+        drop(seeded(&repo));
+        let root = repo.0.clone();
+        let done = Arc::new(AtomicBool::new(false));
+
+        let writer = {
+            let (root, done) = (root.clone(), done.clone());
+            std::thread::spawn(move || {
+                let mut store = Store::open(&root).unwrap();
+                for k in 2..=40_i64 {
+                    store
+                        .publish_batch(IndexBatch {
+                            files: vec![FileUpdate {
+                                scanned: hashed("a.rs", k, &format!("hash{k}")),
+                                invalidate_vectors: false,
+                            }],
+                            extractions: vec![extraction(
+                                "a.rs",
+                                &format!("sym_{k}"),
+                                &format!("dep_{k}"),
+                            )],
+                            ..IndexBatch::default()
+                        })
+                        .unwrap();
+                }
+                done.store(true, Ordering::SeqCst);
+            })
+        };
+
+        let reader = Store::open(&root).unwrap();
+        let mut observed = 0;
+        loop {
+            let finished = done.load(Ordering::SeqCst);
+            let view = reader.begin_read().unwrap();
+            let symbols = reader.symbols_for_path("a.rs").unwrap();
+            let imports: Vec<_> = reader
+                .all_imports()
+                .unwrap()
+                .into_iter()
+                .filter(|(p, _)| p == "a.rs")
+                .collect();
+            drop(view);
+            // Both halves of one extraction (`sym_7` with `dep_7`, or the
+            // seeded `alpha_old` with `dep_old`): never one of each.
+            assert_eq!(symbols.len(), 1, "{symbols:?}");
+            assert_eq!(imports.len(), 1, "{imports:?}");
+            let sym_tag = symbols[0].name.rsplit('_').next().unwrap();
+            let dep_tag = imports[0].1.rsplit('_').next().unwrap();
+            assert_eq!(
+                sym_tag, dep_tag,
+                "symbols {symbols:?} with imports {imports:?}"
+            );
+            observed += 1;
+            if finished {
+                break;
+            }
+        }
+        writer.join().unwrap();
+        assert!(observed > 0);
+        assert_eq!(reader.generation().unwrap(), 40);
+    }
+
+    #[test]
+    fn the_public_writers_keep_the_generation_honest() {
+        // The thin wrappers older callers (and tests) use bump when, and only
+        // when, they change something.
+        let repo = TempRepo::new();
+        let mut store = repo.store();
+        let mut expect = 0;
+        let mut step = |store: &Store, moved: bool, what: &str| {
+            if moved {
+                expect += 1;
+            }
+            assert_eq!(store.generation().unwrap(), expect, "{what}");
+        };
+        store.upsert_files(&[file("a.rs"), file("b.rs")]).unwrap();
+        step(&store, true, "new files");
+        store.upsert_files(&[file("a.rs"), file("b.rs")]).unwrap();
+        step(&store, false, "the same files again");
+        store
+            .replace_symbols_for_file("a.rs", &[symbol("a.rs", "x")])
+            .unwrap();
+        step(&store, true, "new symbols");
+        store
+            .replace_symbols_for_file("a.rs", &[symbol("a.rs", "x")])
+            .unwrap();
+        step(&store, false, "the same symbols again");
+        store
+            .replace_imports_for_file("a.rs", &["dep".to_owned()])
+            .unwrap();
+        step(&store, true, "new imports");
+        store
+            .replace_imports_for_file("a.rs", &["dep".to_owned()])
+            .unwrap();
+        step(&store, false, "the same imports again");
+        let edge = CoChange {
+            path_a: "a.rs".to_owned(),
+            path_b: "b.rs".to_owned(),
+            count: 2,
+            strength: 0.5,
+        };
+        store.replace_cochange(std::slice::from_ref(&edge)).unwrap();
+        step(&store, true, "new co-change rows");
+        store.replace_cochange(std::slice::from_ref(&edge)).unwrap();
+        step(&store, false, "the same co-change rows again");
+        store
+            .update_recency(&HashMap::from([("a.rs".to_owned(), 5)]))
+            .unwrap();
+        step(&store, true, "new recency");
+        store
+            .update_recency(&HashMap::from([("a.rs".to_owned(), 5)]))
+            .unwrap();
+        step(&store, false, "the same recency again");
+        store.remove_path("b.rs").unwrap();
+        step(&store, true, "a removal");
+        store.remove_path("b.rs").unwrap();
+        step(&store, false, "removing nothing");
+        store.invalidate_vector("a.rs").unwrap();
+        step(
+            &store,
+            false,
+            "dropping cache rows is not a change of facts",
+        );
+    }
+
+    #[test]
+    fn the_generation_is_durable_and_a_rules_change_is_a_generation_of_its_own() {
+        let repo = TempRepo::new();
+        drop(seeded(&repo));
+        assert_eq!(repo.store().generation().unwrap(), 1, "survives a reopen");
+
+        let next = crate::inventory::rules_fingerprint(&["other"], &[], 0, PARSER_CONFIG_VERSION);
+        let store = Store::open_with_rules_fingerprint(&repo.0, &next).unwrap();
+        assert_eq!(
+            store.generation().unwrap(),
+            2,
+            "discarding every symbol and import changes what readers see"
+        );
+        assert!(store.all_imports().unwrap().is_empty());
+        // Reopening under the same rules discards nothing and moves nothing.
+        drop(store);
+        let again = Store::open_with_rules_fingerprint(&repo.0, &next).unwrap();
+        assert_eq!(again.generation().unwrap(), 2);
+    }
+
+    #[test]
+    fn pending_extraction_names_exactly_what_a_publish_would_leave_unextracted() {
+        let repo = TempRepo::new();
+        let mut store = seeded(&repo);
+        let unchanged = hashed("a.rs", 1, "ha1");
+        let edited = hashed("old.rs", 9, "ho9");
+        let added = hashed("new.rs", 1, "hn1");
+        let pending = store
+            .pending_extraction(&[unchanged.clone(), edited, added])
+            .unwrap();
+        assert_eq!(
+            pending,
+            HashSet::from(["old.rs".to_owned(), "new.rs".to_owned()])
+        );
+        // A row that was never extracted is pending even when unchanged.
+        store.clear_extracted("a.rs").unwrap();
+        assert!(store
+            .pending_extraction(&[unchanged])
+            .unwrap()
+            .contains("a.rs"));
     }
 }

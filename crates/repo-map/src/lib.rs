@@ -1,4 +1,14 @@
 //! engram-repo-map: Tier-0 inventory, Tier-1 symbols, co-change graph, SQLite store.
+//!
+//! # Staged, atomically published index generations
+//!
+//! Every production path that changes the index works in two steps. First it
+//! STAGES: it reads and parses files and walks git history into an in-memory
+//! [`store::IndexBatch`], holding no write transaction while it does the slow
+//! work. Then it PUBLISHES with one [`Store::publish_batch`] call, which applies
+//! the whole batch in a single transaction and bumps the store's `generation`
+//! inside it. A reader therefore sees either all of a batch or none of it, and
+//! a failure before the commit leaves the previous generation untouched.
 
 pub mod cochange;
 pub mod graph;
@@ -9,33 +19,61 @@ pub mod symbols;
 
 use anyhow::Result;
 use std::path::Path;
-use store::Store;
+use store::{Extraction, ExtractionUpdate, FileUpdate, HistoryUpdate, IndexBatch, Store};
+
+/// Most extractions one published generation carries. A full reconcile whose
+/// eager extraction fits in this many files is ONE generation, including every
+/// removal, modification and addition. Beyond it the extractions are published
+/// in further generations of this size (the inventory, removals and history are
+/// always in the first), so memory stays bounded; each such generation is
+/// itself atomic, but the reconcile as a whole is not. Extraction results are
+/// small (symbols and import targets, never file contents), so the limit is
+/// generous: the server's own eager limit is 3000.
+pub const MAX_EXTRACTIONS_PER_GENERATION: usize = 5000;
 
 /// Run the full background indexing pass: Tier-0 inventory + co-change.
 /// Tier-1 symbol extraction is done lazily by retrieval, or eagerly here for small repos.
+///
+/// The whole pass is staged first (scan, git history, parsing up to
+/// `eager_tier1_limit` files) and then published as one generation containing
+/// every change: files edited or added while the server was stopped, files
+/// removed, the refreshed history, and the new symbols and imports. When the
+/// call returns, the stale facts are gone and the new ones are in, together;
+/// a call that finds nothing to change does not move the generation.
 pub fn index_repo(repo_root: &Path, eager_tier1_limit: usize) -> Result<IndexStats> {
+    index_repo_in_generations(repo_root, eager_tier1_limit, MAX_EXTRACTIONS_PER_GENERATION)
+}
+
+/// [`index_repo`] with the per-generation extraction limit spelled out, so the
+/// chunked case can be tested without thousands of files.
+fn index_repo_in_generations(
+    repo_root: &Path,
+    eager_tier1_limit: usize,
+    per_generation: usize,
+) -> Result<IndexStats> {
     let mut store = Store::open(repo_root)?;
 
     let files = inventory::scan(repo_root);
-    // Upserting records each file's (size, mtime) fingerprint and resets
-    // `tier1_done` for any file whose fingerprint changed, so a file edited
-    // while the server was stopped is re-extracted below instead of keeping
-    // the symbols and import edges of its previous contents.
-    store.upsert_fingerprinted(&files)?;
-    // `upsert_files` never deletes, so files removed from the repo since the
-    // last pass would otherwise keep their row, symbols, and import edges and
-    // go on being cited as evidence.
+    // Every file is upserted with its (size, mtime, hash) fingerprint, which
+    // resets `tier1_done` and drops the derived rows of any file whose
+    // fingerprint changed, so a file edited while the server was stopped is
+    // re-extracted below instead of keeping the symbols and import edges of its
+    // previous contents. `retain_only` removes the files that are gone since
+    // the last pass, which would otherwise keep their row, symbols, and import
+    // edges and go on being cited as evidence.
     let present: std::collections::HashSet<String> =
         files.iter().map(|f| f.record.path.clone()).collect();
-    let pruned_files = store.prune_missing_files(&present)?;
 
     let history = cochange::build(repo_root);
-    history.record_into(&mut store)?;
-    store.update_recency(&history.last_commit)?;
+    let cochange_edges = history.edges.len();
+    let file_count = files.len();
 
     // Eagerly extract symbols for up to N source files (small repos = instant full coverage).
     // Languages without a parser are skipped rather than "extracted" to nothing:
-    // see symbols::supports.
+    // see symbols::supports. A file already extracted at its current fingerprint
+    // is skipped, so an unchanged file is never parsed again.
+    let pending = store.pending_extraction(&files)?;
+    let mut extractions = Vec::new();
     let mut extracted = 0usize;
     for f in files
         .iter()
@@ -45,51 +83,95 @@ pub fn index_repo(repo_root: &Path, eager_tier1_limit: usize) -> Result<IndexSta
         if extracted >= eager_tier1_limit {
             break;
         }
-        if store.is_tier1_done(&f.path) {
+        if !pending.contains(&f.path) {
             continue;
         }
-        if extract_into_store(&mut store, repo_root, &f.path, f.language)?.is_some() {
+        let update = stage_extraction(repo_root, &f.path, f.language);
+        if matches!(update.extraction, Extraction::Extracted { .. }) {
             extracted += 1;
         }
+        extractions.push(update);
+    }
+
+    // Beyond the per-generation limit the surplus extractions go in later
+    // generations; the first always carries the inventory, removals, history.
+    let mut later = if extractions.len() > per_generation {
+        extractions.split_off(per_generation)
+    } else {
+        Vec::new()
+    };
+    let first = IndexBatch {
+        retain_only: Some(present),
+        removals: Vec::new(),
+        files: files
+            .into_iter()
+            .map(|scanned| FileUpdate {
+                scanned,
+                invalidate_vectors: false,
+            })
+            .collect(),
+        extractions,
+        history: Some(HistoryUpdate::from(history)),
+    };
+    let published = store.publish_batch_detailed(first)?;
+    while !later.is_empty() {
+        let next = if later.len() > per_generation {
+            later.split_off(per_generation)
+        } else {
+            Vec::new()
+        };
+        store.publish_batch(IndexBatch {
+            extractions: std::mem::replace(&mut later, next),
+            ..IndexBatch::default()
+        })?;
     }
 
     Ok(IndexStats {
-        files: files.len(),
-        cochange_edges: history.edges.len(),
+        files: file_count,
+        cochange_edges,
         tier1_files: extracted,
-        pruned_files,
+        pruned_files: published.pruned_files,
     })
 }
 
-/// Read a file and replace BOTH its stored symbols and its stored imports with
-/// what it contains now. Returns `Some(found_anything)` once recorded, or
-/// `None` when the file could not be read; in that case whatever was stored for
-/// it is cleared (it describes contents that are no longer there) but the file
-/// stays un-extracted so a later pass retries it.
-fn extract_into_store(
-    store: &mut Store,
+impl From<cochange::History> for HistoryUpdate {
+    fn from(history: cochange::History) -> Self {
+        HistoryUpdate {
+            edges: history.edges,
+            facts: history.facts,
+            recency: history.last_commit,
+        }
+    }
+}
+
+/// Read a file and extract BOTH its symbols and its imports as it is now, or
+/// note that it could not be read (the store then clears whatever it holds for
+/// it, and leaves it un-extracted so a later pass retries it). Touches no
+/// store: the result is applied by a publish.
+fn stage_extraction(
     repo_root: &Path,
     path: &str,
     lang: engram_domain::Language,
-) -> Result<Option<bool>> {
-    let Ok(src) = std::fs::read_to_string(repo_root.join(path)) else {
-        store.clear_extracted(path)?;
-        return Ok(None);
+) -> ExtractionUpdate {
+    let extraction = match std::fs::read_to_string(repo_root.join(path)) {
+        Ok(src) => Extraction::Extracted {
+            symbols: symbols::extract_file(path, &src, lang),
+            imports: symbols::extract_imports(&src, lang),
+        },
+        Err(_) => Extraction::Unreadable,
     };
-    let syms = symbols::extract_file(path, &src, lang);
-    let imports = symbols::extract_imports(&src, lang);
-    // Imports first: replacing symbols is what marks the file extracted, so an
-    // interruption between the two leaves it to be retried, not half-trusted.
-    store.replace_imports_for_file(path, &imports)?;
-    store.replace_symbols_for_file(path, &syms)?;
-    Ok(Some(!syms.is_empty() || !imports.is_empty()))
+    ExtractionUpdate {
+        path: path.to_owned(),
+        extraction,
+    }
 }
 
 /// Lazily ensure a file is Tier-1 extracted (called by retrieval on cache miss).
 ///
-/// Returns whether this call recorded new symbols or imports. A caller holding
-/// an in-memory index built from the store (chunk boundaries, the import graph)
-/// must treat `true` as "my copy is now stale".
+/// Returns whether this call changed the stored symbols or imports, which it
+/// publishes as a generation of its own (see [`Store::publish_batch`]). A
+/// caller holding an in-memory index built from the store (chunk boundaries,
+/// the import graph) must treat `true` as "my copy is now stale".
 pub fn ensure_tier1(store: &mut Store, repo_root: &Path, path: &str) -> Result<bool> {
     if store.is_tier1_done(path) {
         return Ok(false);
@@ -100,44 +182,47 @@ pub fn ensure_tier1(store: &mut Store, repo_root: &Path, path: &str) -> Result<b
     if !symbols::supports(lang) {
         return Ok(false);
     }
-    Ok(extract_into_store(store, repo_root, path, lang)?.unwrap_or(false))
+    let batch = IndexBatch {
+        extractions: vec![stage_extraction(repo_root, path, lang)],
+        ..IndexBatch::default()
+    };
+    Ok(store.publish_batch_detailed(batch)?.changed)
 }
 
-/// Record one already-fingerprinted file and re-extract it: refresh its `files`
-/// row, symbols, and imports, and invalidate its cached vector so it
-/// re-embeds. The caller has checked that the file is part of the inventory.
-fn index_scanned(
-    store: &mut Store,
-    repo_root: &Path,
-    scanned: inventory::ScannedFile,
-) -> Result<()> {
+/// Stage one file that is part of the inventory: its `files` row (with its
+/// cached vectors invalidated, so they re-embed) and, for a language with a
+/// parser, its symbols and imports as they are now.
+fn stage_scanned(batch: &mut IndexBatch, repo_root: &Path, scanned: inventory::ScannedFile) {
     let path = scanned.record.path.clone();
     let lang = scanned.record.language;
-    store.upsert_fingerprinted(&[scanned])?;
+    batch.files.push(FileUpdate {
+        scanned,
+        invalidate_vectors: true,
+    });
     if symbols::supports(lang) {
-        extract_into_store(store, repo_root, &path, lang)?;
+        batch
+            .extractions
+            .push(stage_extraction(repo_root, &path, lang));
     }
-    store.invalidate_vector(&path)
 }
 
-/// Incrementally re-extract a single changed file: refresh its `files` row,
-/// symbols, and imports, and invalidate its cached vector so it re-embeds.
-/// If the file no longer exists, every trace of it is removed (row, symbols,
-/// imports, vectors). A rename arrives as a remove of the old path plus a
-/// create of the new one, and each half lands correctly on its own. Used by
-/// the file-watcher for reindex-on-save.
+/// Stage the refresh of a single changed path into `batch`, from the disk as it
+/// is right now: a file that is still part of the inventory is re-recorded and
+/// re-extracted; anything else (removed, replaced by something that is not a
+/// file, or no longer indexable) is forgotten entirely, and a directory path
+/// takes everything beneath it. The caller publishes the batch.
 ///
-/// Returns whether the index may have changed: `false` only when the path was
-/// not indexed and nothing was stored for it, so the caller can skip rebuilding.
-pub fn reindex_file(store: &mut Store, repo_root: &Path, path: &str) -> Result<bool> {
+/// Staging a path reads the disk's current state, not "what the event said", so
+/// several events for one path, in any order, stage the same thing.
+pub fn stage_reindex_file(batch: &mut IndexBatch, repo_root: &Path, path: &str) {
     use engram_domain::{FileRecord, Language};
     let full = repo_root.join(path);
     match std::fs::metadata(&full) {
         // Same inclusion rules as the full scan, so a live-updated index and a
         // freshly built one cover the same files.
         Ok(meta) if meta.is_file() && inventory::is_indexable(path, meta.len()) => {
-            index_scanned(
-                store,
+            stage_scanned(
+                batch,
                 repo_root,
                 inventory::ScannedFile {
                     record: FileRecord {
@@ -149,28 +234,23 @@ pub fn reindex_file(store: &mut Store, repo_root: &Path, path: &str) -> Result<b
                     mtime_ns: inventory::mtime_ns(&meta),
                     content_hash: inventory::hash_file(&full),
                 },
-            )?;
-            Ok(true)
+            );
         }
-        _ => {
-            // Removed, replaced by something that is not a file, or no longer
-            // part of the inventory: forget it entirely. A directory path also
-            // takes everything beneath it.
-            Ok(store.remove_path(path)? > 0)
-        }
+        _ => batch.removals.push(path.to_string()),
     }
 }
 
-/// Index every file under a directory that appeared or moved into the repo.
+/// Stage every file under a directory that appeared or moved into the repo.
 /// A directory rename reaches the watcher as an event for the directory only,
 /// so its files would otherwise never be seen until the next restart.
-/// Returns the number of files reindexed.
+/// Returns the number of files staged.
 ///
-/// The scan already read and hashed each file, so its result is stored as is
-/// rather than going back through [`reindex_file`] (which would hash it again).
-pub fn reindex_dir(store: &mut Store, repo_root: &Path, rel_dir: &str) -> Result<usize> {
+/// The scan already read and hashed each file, so its result is staged as is
+/// rather than going back through [`stage_reindex_file`] (which would hash it
+/// again).
+pub fn stage_reindex_dir(batch: &mut IndexBatch, repo_root: &Path, rel_dir: &str) -> usize {
     let prefix = rel_dir.trim_end_matches('/');
-    let mut reindexed = 0;
+    let mut staged = 0;
     for mut scanned in inventory::scan(&repo_root.join(prefix)) {
         // The scan is rooted at the directory; the store is rooted at the repo.
         scanned.record.path = format!("{prefix}/{}", scanned.record.path);
@@ -179,10 +259,41 @@ pub fn reindex_dir(store: &mut Store, repo_root: &Path, rel_dir: &str) -> Result
         if !inventory::is_indexable(&scanned.record.path, scanned.record.size_bytes) {
             continue;
         }
-        index_scanned(store, repo_root, scanned)?;
-        reindexed += 1;
+        stage_scanned(batch, repo_root, scanned);
+        staged += 1;
     }
-    Ok(reindexed)
+    staged
+}
+
+/// Stage a rebuild of the co-change graph and file recency from git history.
+pub fn stage_history(batch: &mut IndexBatch, repo_root: &Path) {
+    batch.history = Some(HistoryUpdate::from(cochange::build(repo_root)));
+}
+
+/// Incrementally re-extract a single changed file and publish it as one
+/// generation: refresh its `files` row, symbols, and imports, and invalidate
+/// its cached vector so it re-embeds. If the file no longer exists, every trace
+/// of it is removed (row, symbols, imports, vectors). A rename arrives as a
+/// remove of the old path plus a create of the new one, and each half lands
+/// correctly on its own. The file-watcher stages many events into one batch
+/// instead (see [`stage_reindex_file`]); this is the single-path form.
+///
+/// Returns whether the index changed: `false` when nothing was stored for the
+/// path and nothing is now, or when it was re-recorded exactly as it was, so
+/// the caller can skip rebuilding.
+pub fn reindex_file(store: &mut Store, repo_root: &Path, path: &str) -> Result<bool> {
+    let mut batch = IndexBatch::default();
+    stage_reindex_file(&mut batch, repo_root, path);
+    Ok(store.publish_batch_detailed(batch)?.changed)
+}
+
+/// Index every file under a directory that appeared or moved into the repo, as
+/// one generation. Returns the number of files reindexed.
+pub fn reindex_dir(store: &mut Store, repo_root: &Path, rel_dir: &str) -> Result<usize> {
+    let mut batch = IndexBatch::default();
+    let staged = stage_reindex_dir(&mut batch, repo_root, rel_dir);
+    store.publish_batch(batch)?;
+    Ok(staged)
 }
 
 /// The commit the repository has checked out, or `"no-git"` when there is none
@@ -205,11 +316,12 @@ pub fn snapshot_id(store: &Store, repo_root: &Path) -> Result<String> {
 }
 
 /// Rebuild the co-change graph and file recency from git history (called when
-/// HEAD moves — a new commit landed).
+/// HEAD moves — a new commit landed), published as one generation: the edges,
+/// their completeness facts and the recency land together or not at all.
 pub fn refresh_history(store: &mut Store, repo_root: &Path) -> Result<()> {
-    let history = cochange::build(repo_root);
-    history.record_into(store)?;
-    store.update_recency(&history.last_commit)?;
+    let mut batch = IndexBatch::default();
+    stage_history(&mut batch, repo_root);
+    store.publish_batch(batch)?;
     Ok(())
 }
 
@@ -706,5 +818,140 @@ mod tests {
         assert_eq!(count(&store, "files", "notes.txt"), 0);
         assert_eq!(count(&store, "files", "pkg/target/gen.rs"), 0);
         assert_eq!(snapshot_id(&store, &repo.0).unwrap(), before);
+    }
+
+    // ----- generations -----
+
+    fn generation_of(repo: &TempRepo) -> u64 {
+        repo.store().generation().unwrap()
+    }
+
+    #[test]
+    fn a_reconcile_of_edits_removals_and_additions_is_exactly_one_generation() {
+        let repo = TempRepo::new();
+        repo.write_at("a.rs", "use helpers::thing;\nfn user() {}\n", 1_000_000);
+        repo.write_at("helpers.rs", "pub fn thing() {}\n", 1_000_000);
+        repo.write_at("gone.rs", "fn ghost() {}\n", 1_000_000);
+        index_repo(&repo.0, 100).unwrap();
+        let first = generation_of(&repo);
+        assert_eq!(first, 1, "indexing a repository for the first time");
+
+        // Nothing changed: reconciling again is not a new generation.
+        index_repo(&repo.0, 100).unwrap();
+        assert_eq!(generation_of(&repo), first);
+
+        // Offline: edit one file, delete one, add one.
+        repo.write_at("a.rs", "use renamed::thing;\nfn user_two() {}\n", 2_000_000);
+        std::fs::remove_file(repo.0.join("gone.rs")).unwrap();
+        repo.write_at("fresh.rs", "fn brand_new() {}\n", 2_000_000);
+        let stats = index_repo(&repo.0, 100).unwrap();
+
+        assert_eq!(stats.pruned_files, 1);
+        assert_eq!(
+            generation_of(&repo),
+            first + 1,
+            "the whole reconcile is one generation"
+        );
+        let store = repo.store();
+        assert_eq!(symbol_names(&store, "a.rs"), vec!["user_two"]);
+        assert_eq!(imports_of(&store, "a.rs"), vec!["renamed/thing"]);
+        assert_eq!(symbol_names(&store, "fresh.rs"), vec!["brand_new"]);
+        assert!(symbol_names(&store, "gone.rs").is_empty());
+        assert_eq!(count(&store, "files", "gone.rs"), 0);
+    }
+
+    #[test]
+    fn a_reconcile_beyond_the_per_generation_limit_is_published_in_atomic_chunks() {
+        let repo = TempRepo::new();
+        for i in 0..5 {
+            repo.write_at(
+                &format!("f{i}.rs"),
+                &format!("fn func_{i}() {{}}\n"),
+                1_000_000,
+            );
+        }
+        let stats = index_repo_in_generations(&repo.0, 100, 2).unwrap();
+        assert_eq!(stats.tier1_files, 5);
+        // 5 extractions at 2 per generation: 2 + 2 + 1.
+        assert_eq!(generation_of(&repo), 3);
+        let store = repo.store();
+        for i in 0..5 {
+            assert!(store.is_tier1_done(&format!("f{i}.rs")), "f{i}.rs");
+        }
+
+        // The same repository fits one generation under the real limit.
+        let other = TempRepo::new();
+        for i in 0..5 {
+            other.write_at(
+                &format!("f{i}.rs"),
+                &format!("fn func_{i}() {{}}\n"),
+                1_000_000,
+            );
+        }
+        index_repo(&other.0, 100).unwrap();
+        assert_eq!(generation_of(&other), 1);
+    }
+
+    #[test]
+    fn lazy_extraction_publishes_one_generation_per_file_that_gained_facts() {
+        let repo = TempRepo::new();
+        repo.write_at("a.rs", OLD, 1_000_000);
+        repo.write_at("empty.rs", "// nothing here\n", 1_000_000);
+        let mut store = repo.store();
+        store
+            .upsert_fingerprinted(&inventory::scan(&repo.0))
+            .unwrap();
+        let before = store.generation().unwrap();
+
+        assert!(ensure_tier1(&mut store, &repo.0, "a.rs").unwrap());
+        assert_eq!(store.generation().unwrap(), before + 1);
+        // Already done, then extracted-but-empty: neither adds facts.
+        assert!(!ensure_tier1(&mut store, &repo.0, "a.rs").unwrap());
+        assert!(!ensure_tier1(&mut store, &repo.0, "empty.rs").unwrap());
+        assert_eq!(store.generation().unwrap(), before + 1);
+    }
+
+    #[test]
+    fn a_save_that_changes_nothing_is_not_a_new_generation_and_a_real_one_is() {
+        let repo = TempRepo::new();
+        repo.write_at("a.rs", OLD, 1_000_000);
+        let mut store = repo.store();
+        assert!(reindex_file(&mut store, &repo.0, "a.rs").unwrap());
+        let first = store.generation().unwrap();
+
+        // The editor re-saved identical bytes (mtime pinned): nothing to publish.
+        assert!(!reindex_file(&mut store, &repo.0, "a.rs").unwrap());
+        assert_eq!(store.generation().unwrap(), first);
+
+        repo.write_at("a.rs", NEW, 2_000_000);
+        assert!(reindex_file(&mut store, &repo.0, "a.rs").unwrap());
+        assert_eq!(store.generation().unwrap(), first + 1);
+        assert_eq!(symbol_names(&store, "a.rs"), vec!["new_name_here"]);
+    }
+
+    #[test]
+    fn a_directory_of_files_is_one_generation_and_so_is_a_burst_of_staged_paths() {
+        let repo = TempRepo::new();
+        for name in ["x", "y", "z"] {
+            repo.write_at(&format!("pkg/{name}.rs"), OLD, 1_000_000);
+        }
+        let mut store = repo.store();
+        assert_eq!(reindex_dir(&mut store, &repo.0, "pkg").unwrap(), 3);
+        assert_eq!(store.generation().unwrap(), 1);
+
+        // What the watcher does with a burst: stage many paths, publish once.
+        repo.write_at("pkg/x.rs", NEW, 2_000_000);
+        std::fs::remove_file(repo.0.join("pkg/y.rs")).unwrap();
+        repo.write_at("pkg/w.rs", NEW, 2_000_000);
+        let mut batch = store::IndexBatch::default();
+        for path in ["pkg/x.rs", "pkg/y.rs", "pkg/w.rs", "pkg/x.rs"] {
+            stage_reindex_file(&mut batch, &repo.0, path);
+        }
+        let published = store.publish_batch_detailed(batch).unwrap();
+        assert!(published.changed);
+        assert_eq!(published.generation, 2);
+        assert_eq!(symbol_names(&store, "pkg/x.rs"), vec!["new_name_here"]);
+        assert_eq!(symbol_names(&store, "pkg/w.rs"), vec!["new_name_here"]);
+        assert_eq!(count(&store, "files", "pkg/y.rs"), 0);
     }
 }

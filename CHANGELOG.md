@@ -7,6 +7,36 @@ release tags.
 ## [Unreleased]
 
 ### Added
+- **Staged, atomically published index generations.** Index updates no longer
+  land as many small per-file transactions. Files are read and parsed, and git
+  history is walked, into an in-memory `IndexBatch` with no write transaction
+  open; one `Store::publish_batch` then applies the whole batch (fingerprints,
+  derived-row invalidation, symbols, imports, removals, co-change, recency, and
+  the `tier1_done` marks that go with the symbols) in a single `IMMEDIATE`
+  transaction and bumps a persistent `meta.generation` counter inside it, only
+  if something changed. A failure before the commit leaves the previous
+  generation untouched. A restart's whole reconcile is one generation, and the
+  server is `Ready` only after it commits; a burst of watcher events is one
+  generation; a lazy extraction that gains symbols or imports is one.
+- **`generation` on every index-backed response**, next to `snapshot`: the
+  generation the answer's facts were read at. It is a publish counter, not a
+  content identity (the snapshot id is unchanged). `index_state` now carries
+  `generation` (newest in the cache) and `built_generation` (listed only when it
+  differs). **Behaviour change:** `index_state.generation` used to count the
+  engines built by this process; it is now the cache's generation.
+- **Consistent reads.** `Engine::build` reads every fact from one read
+  transaction and records the generation (`Engine::generation`); a newer
+  generation in the store makes the engine stale (`Engine::is_stale_in`) and
+  makes the server rebuild before the next call, with no dirty flag needed.
+  Queries that read the store live read inside one transaction and flag the
+  response stale rather than mixing generations; a search served by an out-of-date
+  engine skips its lazy extraction and live symbol lookups. See `docs/CONTRACT.md`,
+  "Index generations".
+- **Spans never come from a different version of a file.** When an engine is
+  built, a file whose bytes no longer match the hash its symbols were extracted
+  from (an edit the watcher has not published yet) has its symbols left out
+  instead of cutting old line spans out of new text, and `index_warnings` says
+  how many files.
 - **Citable graph facts.** Every import and co-change edge has a content-derived
   `edge_id` (`e_` plus 16 hex digits: a 64-bit FNV-1a over the snapshot id, the
   edge kind, its endpoints, and the full import chain or the co-change

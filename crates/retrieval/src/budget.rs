@@ -352,8 +352,9 @@ enum Form {
 /// Fields that survive the degraded layouts: they identify the snapshot the
 /// answer (or its absence) refers to. The pack-only layout drops all of them,
 /// so `Packer::pack` mirrors the mismatch/staleness/warnings as flags.
-const ESSENTIAL_KEYS: [&str; 4] = [
+const ESSENTIAL_KEYS: [&str; 5] = [
     "snapshot",
+    "generation",
     "snapshot_mismatch",
     "index_warnings",
     "index_state",

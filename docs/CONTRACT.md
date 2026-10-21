@@ -58,9 +58,10 @@ Responses from the index-backed tools (`search_context`, `expand_connections`,
 | Field | Present | Meaning |
 |---|---|---|
 | `snapshot` | always, on index-backed tools | Id of the index the answer was computed from (see [Snapshot id](#snapshot-id)). |
+| `generation` | always, on index-backed tools | Integer. The index generation every fact in the answer was read at (see [Index generations](#index-generations)). A publish counter, not a content identity: unlike `snapshot` it says how many times the index has been published, and it does not repeat. |
 | `snapshot_mismatch` | `search_context`, `expand_connections`, `get_graph` and aliases, when the `snapshot` argument differs from the current one | `{ "requested": "...", "current": "..." }`. The answer still comes from the current snapshot. |
 | `index_warnings` | when results may be out of date | Array of plain-text warnings (see [Index state](#index-state)). |
-| `index_state` | only when results may be stale | `{ "status": "ready", "stale": true, "generation": n, "snapshot": "..." }`. |
+| `index_state` | only when results may be stale | `{ "status": "ready", "stale": true, "generation": n, "built_generation": m, "snapshot": "..." }`. `generation` is the newest generation in the cache; `built_generation` (listed only when it differs) is the one the answer was read at, which is also the response's own `generation`. They differ exactly when a newer generation was published after the answer's facts were read; the next call rebuilds first. |
 | `pack` | `search_context`, `expand_connections` and aliases | Budget and omission report (see [The pack object](#the-pack-object)). |
 
 `get_verification_plan` and `get_review_history` do not carry `snapshot` or
@@ -655,6 +656,91 @@ Use the id to check whether a remembered answer is still current: pass it back a
 `snapshot` and look for `snapshot_mismatch`. The answer is always from the current
 snapshot.
 
+## Index generations
+
+A **generation** is one atomically published state of the index. The cache keeps
+a counter (`meta.generation`, an integer that starts at 0 and only goes up), and
+every response from an index-backed tool carries the `generation` its facts were
+read at, next to its `snapshot`.
+
+The two answer different questions:
+
+| | `snapshot` | `generation` |
+|---|---|---|
+| What it is | A hash of the indexed content (commit, rules, every file's path and content hash). | A counter of publishes to the cache. |
+| Same content twice | Same id, on any machine. | Different generations, if anything was published between. |
+| A publish that changes nothing | Same id. | Same generation (a no-op batch does not bump). |
+| Use it to | Cite what an answer was computed from; `edge_id`s derive from it. | Tell whether the cache has moved past an answer, and order two answers from one cache. |
+
+Generation numbers are local to one cache directory; they say nothing across
+machines or after deleting `.engram`.
+
+### What a publish is
+
+Every change to the indexed facts follows the same two steps. The change is
+**staged** first: files are read and parsed, and git history is walked, into an
+in-memory batch, with no write transaction open (so a slow parse never blocks a
+reader or another writer). It is then **published** by one call that applies the
+whole batch in a single SQLite `IMMEDIATE` transaction: file fingerprints, the
+removal of the derived rows of changed files, symbols, imports, removals of
+deleted files, co-change rows and recency, and the `tier1_done` marks that go
+with the symbols they describe. The generation is bumped by one inside that same
+transaction, and only if some fact actually changed.
+
+Guarantees:
+
+- **Atomic.** An error, a panic or a crash before the commit leaves the previous
+  generation exactly as it was: no half-applied file set, no new symbols beside
+  old imports. A reader sees all of a publish or none of it.
+- **One generation per unit of work.** A restart's whole reconcile (files edited,
+  added and deleted while the server was stopped, the refreshed history, and the
+  eager extraction) is one generation, and the server is `Ready` only after it
+  commits, so the stale facts of an edited or deleted file are gone before the
+  first answer. A burst of file events (events within a 75 ms quiet window, up
+  to 2000 events or one second) is one generation. A file that is lazily
+  extracted on a search hit is a generation of its own, but only if it gained
+  symbols or imports.
+- **Consistent reads.** An engine is built from one read transaction (a WAL
+  snapshot): the file list, symbols, import edges, co-change edges, recency,
+  hashes, snapshot id and cached chunk vectors are all of the generation the
+  engine reports. Queries that also read the store live (the co-change rows of
+  `explain_connection`, `get_graph` and `expand_connections`; the symbol lookups
+  of `search_context`) read inside one transaction too.
+- **Never silently mixed.** If the store has moved past an engine's generation
+  when a query runs, the query is answered from the engine's own facts where it
+  can be (a search skips its lazy extraction and its live symbol lookups),
+  and the response is flagged: `index_state.stale` is `true` with `generation`
+  (newest) and `built_generation` (the answer's). The next call rebuilds the
+  engine first. If that rebuild fails, the previous engine keeps serving, still
+  flagged, with the `index_warnings` entry described under [Index state](#index-state).
+- **The disk can be ahead of the index.** An edit the watcher has not published
+  yet is not a generation. While building an engine, a file whose content no
+  longer matches the hash its symbols were extracted from has its symbols left
+  out (their line spans would point at the wrong lines), and a warning says how
+  many files; the watcher's publish replaces the engine and clears it.
+
+Limits, stated plainly:
+
+- A full reconcile is one generation up to 5000 eagerly extracted files (the
+  server's own eager limit is 3000). Beyond that its extractions are published
+  in further generations of up to 5000 each, to bound memory. The first carries
+  the inventory, the removals and the history; every one is atomic by itself,
+  but the reconcile as a whole is then not.
+- Two writers publish one after the other, never merged. A staged extraction is
+  a snapshot of the disk when it was read: if the same file changes between
+  staging and publish, the next scan or watcher event corrects it, as before.
+- Rebuilding the in-memory engine after a publish still costs a pass over the
+  indexed files (cached embeddings make it cheap, not free); a publish does not
+  patch the engine in place.
+- Embeddings computed while building an engine are cache (`vectors`,
+  `chunk_vectors`), written back after the build and dropped when a file changes.
+  They are not part of the generation and do not move it.
+- Pull-request and review data ingested from GitHub lives in its own tables and
+  is not part of the generation.
+- A watcher whose publish fails leaves the previous generation intact and is
+  reported in `index_warnings` as stale; a restart reconciles the whole
+  inventory again in one generation.
+
 ## Local cache and concurrency
 
 The index lives in `<repo>/.engram/engram.db` (SQLite, write-ahead logging, so
@@ -666,6 +752,13 @@ writer's lock before failing, and write transactions take the lock up front, so
 startup indexing racing a watcher event or a first query does not surface
 `database is locked`. Only a lock held for longer than that fails, as an
 ordinary tool error or index warning.
+
+Writers hold that lock only for the publish itself: parsing and the git walk
+happen first, in memory, and the whole result is applied in one short
+transaction (see [Index generations](#index-generations)). Readers never take
+it. An engine is built from a single read transaction, which in WAL mode is a
+snapshot, so a publish by the watcher while an engine is being built can neither
+block the build nor leak into it half-way.
 
 A failed history walk (the directory is not a git repository, it has no commits
 yet, or `git` cannot be run) stores no co-change rows and leaves the

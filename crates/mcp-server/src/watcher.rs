@@ -4,20 +4,37 @@
 //! graph. Either way it flips a `dirty` flag; the server rebuilds the in-memory
 //! index lazily on the next tool call (cheap — only changed files re-embed).
 //!
+//! Events are coalesced: a burst is staged in memory and published as ONE
+//! generation (one transaction), so readers see a burst entirely or not at all.
+//! If a publish fails the previous generation stays intact and the failure is
+//! recorded in the health as stale; the next start reconciles the whole
+//! inventory in a single generation.
+//!
 //! The watcher is best-effort, but never silently so: every failure is logged
 //! with the path involved and recorded in a [`WatcherHealth`] the server shares,
 //! so a client can be told its results may not reflect recent edits.
 
 use engram_repo_map::inventory::is_ignored_component;
-use engram_repo_map::store::Store;
+use engram_repo_map::store::{IndexBatch, Store};
 use notify::{event::ModifyKind, EventKind, RecursiveMode, Watcher};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 /// How many individual refresh failures to spell out before summarizing.
 const MAX_LISTED_FAILURES: usize = 5;
+
+/// What a failed git-history refresh is recorded under.
+const HISTORY_KEY: &str = "git history";
+
+/// A burst of events is published once it has been quiet this long.
+const DEBOUNCE: Duration = Duration::from_millis(75);
+/// A burst is published at the latest after this many events, or this long
+/// after its first one, however busy the stream stays.
+const MAX_BATCH_EVENTS: usize = 2000;
+const MAX_BATCH_WAIT: Duration = Duration::from_secs(1);
 
 /// What is currently wrong with live reindexing, if anything.
 #[derive(Debug, Default)]
@@ -131,8 +148,22 @@ fn run(repo_root: &Path, dirty: &Arc<AtomicBool>, health: &SharedHealth) -> noti
 
     // The watcher handle must stay alive for the lifetime of the loop.
     let mut store = Store::open(repo_root).map_err(|e| notify::Error::generic(&e.to_string()))?;
-    for res in rx {
-        if process(res, repo_root, &mut store, health) {
+    // One batch per burst of events: a save, a `git checkout` or a build step
+    // produces dozens of events within milliseconds, and each used to be its own
+    // transaction (and its own generation). Wait for the burst to go quiet, then
+    // stage everything it touched and publish it as ONE generation.
+    while let Ok(first) = rx.recv() {
+        let started = Instant::now();
+        let mut burst = vec![first];
+        while burst.len() < MAX_BATCH_EVENTS && started.elapsed() < MAX_BATCH_WAIT {
+            match rx.recv_timeout(DEBOUNCE) {
+                Ok(next) => burst.push(next),
+                // Quiet for a whole debounce window, or the channel closed
+                // (the next `recv` then ends the loop).
+                Err(_) => break,
+            }
+        }
+        if process_burst(burst, repo_root, &mut store, health) {
             dirty.store(true, Ordering::SeqCst);
         }
     }
@@ -140,100 +171,153 @@ fn run(repo_root: &Path, dirty: &Arc<AtomicBool>, health: &SharedHealth) -> noti
 }
 
 /// Handle one item from the watcher's channel. Returns whether the index
-/// changed (see [`handle_event`]).
+/// changed (see [`handle_events`]).
+#[cfg(test)]
 fn process(
     res: notify::Result<notify::Event>,
     repo_root: &Path,
     store: &mut Store,
     health: &SharedHealth,
 ) -> bool {
-    match res {
-        Ok(event) => {
-            // Events are flowing again, so the error that may have dropped
-            // some is no longer news worth warning about on every response.
-            lock(health).clear_event_error();
-            handle_event(&event, repo_root, store, health)
-        }
-        Err(e) => {
-            // An OS-level watcher error (queue overflow, a watched path
-            // vanishing) can mean events were lost; say so rather than
-            // carry on looking healthy.
-            eprintln!("[engram] file watcher error: {e}");
-            lock(health).event_error = Some(e.to_string());
-            false
-        }
-    }
+    process_burst(vec![res], repo_root, store, health)
 }
 
-/// Apply one filesystem event to the store. Returns whether anything changed
-/// (so the in-memory index should be rebuilt). Failures are logged with the
-/// path and recorded in `health` rather than discarded.
+/// Handle a burst of items from the watcher's channel as one batch. Returns
+/// whether the index changed (see [`handle_events`]).
+fn process_burst(
+    items: Vec<notify::Result<notify::Event>>,
+    repo_root: &Path,
+    store: &mut Store,
+    health: &SharedHealth,
+) -> bool {
+    let mut events = Vec::with_capacity(items.len());
+    for res in items {
+        match res {
+            Ok(event) => {
+                // Events are flowing again, so the error that may have dropped
+                // some is no longer news worth warning about on every response.
+                lock(health).clear_event_error();
+                events.push(event);
+            }
+            Err(e) => {
+                // An OS-level watcher error (queue overflow, a watched path
+                // vanishing) can mean events were lost; say so rather than
+                // carry on looking healthy.
+                eprintln!("[engram] file watcher error: {e}");
+                lock(health).event_error = Some(e.to_string());
+            }
+        }
+    }
+    handle_events(&events.iter().collect::<Vec<_>>(), repo_root, store, health)
+}
+
+/// Apply one filesystem event to the store (see [`handle_events`]).
+#[cfg(test)]
 fn handle_event(
     event: &notify::Event,
     repo_root: &Path,
     store: &mut Store,
     health: &SharedHealth,
 ) -> bool {
-    if !matches!(
-        event.kind,
-        EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)
-    ) {
-        return false;
-    }
-    // A directory that appeared or moved in brings files nobody will report
-    // individually. Plain directory modifications (a child was added) are not
-    // worth a rescan; the child's own event covers it.
-    let dir_arrived = matches!(
-        event.kind,
-        EventKind::Create(_) | EventKind::Modify(ModifyKind::Name(_))
-    );
-    let mut changed = false;
-    for path in &event.paths {
-        let Ok(rel) = path.strip_prefix(repo_root) else {
-            continue;
-        };
-        let rel_str = rel.to_string_lossy().replace('\\', "/");
-        // The repository root itself (its own mtime changing, say) is not a
-        // path inside the repository; treating it as one would rescan it all.
-        if rel_str.is_empty() {
+    handle_events(&[event], repo_root, store, health)
+}
+
+/// Apply a burst of filesystem events to the store as ONE published generation.
+/// Returns whether anything changed (so the in-memory index should be rebuilt).
+///
+/// The events only say which paths to look at. Each distinct path is staged
+/// from the disk as it is now (so several events for one path, in any order,
+/// stage the same thing), the git history is staged once if HEAD moved, and
+/// the whole batch is published in a single transaction: a reader sees the
+/// burst entirely or not at all. A failed publish leaves the previous
+/// generation intact; it is logged and recorded in `health` against every path
+/// in the batch, rather than discarded.
+fn handle_events(
+    events: &[&notify::Event],
+    repo_root: &Path,
+    store: &mut Store,
+    health: &SharedHealth,
+) -> bool {
+    let mut head_moved = false;
+    // rel path -> whether any event for it said it appeared or moved in.
+    let mut paths: BTreeMap<String, bool> = BTreeMap::new();
+    for event in events {
+        if !matches!(
+            event.kind,
+            EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)
+        ) {
             continue;
         }
-        if is_head_ref(&rel_str) {
-            match engram_repo_map::refresh_history(store, repo_root) {
-                Ok(()) => lock(health).clear_failure("git history"),
-                Err(e) => {
-                    eprintln!("[engram] could not refresh git history: {e}");
-                    lock(health).record_failure("git history", &e.to_string());
-                }
+        // A directory that appeared or moved in brings files nobody will report
+        // individually. Plain directory modifications (a child was added) are
+        // not worth a rescan; the child's own event covers it.
+        let dir_arrived = matches!(
+            event.kind,
+            EventKind::Create(_) | EventKind::Modify(ModifyKind::Name(_))
+        );
+        for path in &event.paths {
+            let Ok(rel) = path.strip_prefix(repo_root) else {
+                continue;
+            };
+            let rel_str = rel.to_string_lossy().replace('\\', "/");
+            // The repository root itself (its own mtime changing, say) is not a
+            // path inside the repository; treating it as one would rescan it all.
+            if rel_str.is_empty() {
+                continue;
             }
-            changed = true;
-            continue;
+            if is_head_ref(&rel_str) {
+                head_moved = true;
+                continue;
+            }
+            if is_ignored(&rel_str) {
+                continue;
+            }
+            *paths.entry(rel_str).or_insert(false) |= dir_arrived;
         }
-        if is_ignored(&rel_str) {
-            continue;
-        }
-        let result = if path.is_dir() {
+    }
+
+    let mut batch = IndexBatch::default();
+    let mut involved: Vec<String> = Vec::new();
+    if head_moved {
+        engram_repo_map::stage_history(&mut batch, repo_root);
+        involved.push(HISTORY_KEY.to_owned());
+    }
+    for (rel_str, dir_arrived) in &paths {
+        if repo_root.join(rel_str).is_dir() {
             if !dir_arrived {
                 continue;
             }
-            engram_repo_map::reindex_dir(store, repo_root, &rel_str).map(|n| n > 0)
+            engram_repo_map::stage_reindex_dir(&mut batch, repo_root, rel_str);
         } else {
-            engram_repo_map::reindex_file(store, repo_root, &rel_str)
-        };
-        match result {
-            Ok(index_changed) => {
-                lock(health).clear_failure(&rel_str);
-                changed |= index_changed;
+            engram_repo_map::stage_reindex_file(&mut batch, repo_root, rel_str);
+        }
+        involved.push(rel_str.clone());
+    }
+    if batch.is_empty() {
+        return false;
+    }
+
+    match store.publish_batch_detailed(batch) {
+        Ok(published) => {
+            let mut health = lock(health);
+            for what in &involved {
+                health.clear_failure(what);
             }
-            Err(e) => {
-                eprintln!("[engram] could not reindex {rel_str}: {e}");
-                lock(health).record_failure(&rel_str, &e.to_string());
-                // A failure part-way may still have written something.
-                changed = true;
+            // A moved HEAD is reported as a change even when the history came
+            // out identical: the owner then rechecks the store's generation,
+            // which is cheap, instead of the watcher judging it.
+            head_moved || published.changed
+        }
+        Err(e) => {
+            let mut health = lock(health);
+            for what in &involved {
+                eprintln!("[engram] could not publish the refresh of {what}: {e}");
+                health.record_failure(what, &e.to_string());
             }
+            // Nothing of the batch was applied, but let the owner look again.
+            true
         }
     }
-    changed
 }
 
 /// A git HEAD/ref move (new commit or checkout) — refresh co-change history.

@@ -153,13 +153,21 @@ const INDEXED_TOOLS: &[&str] = &[
 
 /// The `index_state` object attached to a response when the index is not
 /// plainly Ready and current.
+///
+/// `generation` is the store's publish counter as last read, `built_generation`
+/// the one the serving engine's facts were read at; the latter is only listed
+/// when they differ, which is exactly "the store has moved past this answer".
 fn index_state_info(
     state: &IndexState,
     snapshot: Option<&str>,
     generation: u64,
+    built_generation: u64,
     stale: bool,
 ) -> Value {
     let mut info = json!({ "generation": generation, "stale": stale });
+    if built_generation != generation {
+        info["built_generation"] = json!(built_generation);
+    }
     match state {
         IndexState::Indexing { started } => {
             info["status"] = json!("indexing");
@@ -191,11 +199,17 @@ pub struct Engram {
     dirty: Arc<AtomicBool>,
     /// Whether live reindexing is working, for `index_warnings`.
     watcher_health: SharedHealth,
-    /// How many engines have been published so far.
-    generation: u64,
+    /// How many engines this process has built and swapped in so far. Not the
+    /// store's generation (the published-batch counter in `meta`): many batches
+    /// can land between two engine builds, and one build reads only one.
+    engine_builds: u64,
     /// Why the last attempt to rebuild failed, while an older generation is
     /// still being served in its place.
     rebuild_error: Option<String>,
+    /// Test hook: runs once at the end of the next `ensure_engine`, i.e. in the
+    /// window between the engine being current and the query being answered.
+    #[cfg(test)]
+    after_ensure: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl Engram {
@@ -224,8 +238,10 @@ impl Engram {
             index_state: Arc::new(Mutex::new(IndexState::Failed(error))),
             dirty: Arc::new(AtomicBool::new(false)),
             watcher_health: SharedHealth::default(),
-            generation: 0,
+            engine_builds: 0,
             rebuild_error: None,
+            #[cfg(test)]
+            after_ensure: None,
         }
     }
 
@@ -272,8 +288,10 @@ impl Engram {
             index_state,
             dirty,
             watcher_health,
-            generation: 0,
+            engine_builds: 0,
             rebuild_error: None,
+            #[cfg(test)]
+            after_ensure: None,
         }
     }
 
@@ -305,25 +323,42 @@ impl Engram {
     }
 
     fn ensure_engine(&mut self) -> Result<(), String> {
+        let outcome = self.ensure_engine_current();
+        #[cfg(test)]
+        if let Some(hook) = self.after_ensure.take() {
+            hook();
+        }
+        outcome
+    }
+
+    fn ensure_engine_current(&mut self) -> Result<(), String> {
         self.ensure_store()?;
         // A watcher change invalidates the in-memory index, and so does lazy
-        // extraction that wrote symbols/imports after the engine was built.
+        // extraction that wrote symbols/imports after the engine was built, and
+        // so does ANY published generation the engine has not seen (another
+        // process, a watcher batch that landed before its dirty flag was
+        // noticed): the store's generation is read (one cheap meta row) and a
+        // mismatch with the engine's counts as dirty.
         // Rebuild lazily here (cheap: persisted vectors mean only changed
         // files re-embed).
         let watcher_dirty = self.dirty.swap(false, Ordering::SeqCst);
-        let engine_stale = self.engine.as_ref().is_some_and(Engine::is_stale);
+        let engine_stale = match (&self.engine, &self.store) {
+            (Some(engine), Some(store)) => engine.is_stale_in(store),
+            _ => false,
+        };
         if self.engine.is_some() && !watcher_dirty && !engine_stale {
             return Ok(());
         }
         // Build the next generation completely off to the side (chunks, BM25
-        // index, vectors, and code graph together) and only then swap it in
-        // with one assignment. The previous engine keeps serving until then,
-        // so a query never sees new symbols with an old graph or vice versa.
+        // index, vectors, and code graph together, all read from one store
+        // generation) and only then swap it in with one assignment. The
+        // previous engine keeps serving until then, so a query never sees new
+        // symbols with an old graph or vice versa.
         let store = self.store.as_mut().unwrap();
         match Engine::build(&self.repo_root, store) {
             Ok(next) => {
                 self.engine = Some(next);
-                self.generation += 1;
+                self.engine_builds += 1;
                 self.rebuild_error = None;
                 Ok(())
             }
@@ -341,7 +376,8 @@ impl Engram {
     }
 
     /// Everything currently making results possibly out of date, as text for
-    /// the client: a degraded watcher, or a failed rebuild.
+    /// the client: a degraded watcher, a failed rebuild, or indexed files that
+    /// changed on disk before the refresh was published.
     fn index_warnings(&self) -> Vec<String> {
         let mut warnings = crate::watcher::warnings(&self.watcher_health);
         if let Some(err) = &self.rebuild_error {
@@ -350,20 +386,46 @@ impl Engram {
                  and may be out of date"
             ));
         }
+        if let Some(ahead) = self
+            .engine
+            .as_ref()
+            .map(Engine::files_ahead_of_index)
+            .filter(|n| *n > 0)
+        {
+            warnings.push(format!(
+                "{ahead} indexed file(s) changed on disk before their refresh was published; \
+                 their symbols are left out of these results until it is"
+            ));
+        }
         warnings
     }
 
-    /// The `snapshot` and (when not plainly healthy) `index_state` fields for
-    /// a response served by the current engine.
+    /// The `snapshot`, `generation` and (when not plainly healthy)
+    /// `index_state` fields for a response served by the current engine.
+    ///
+    /// `generation` is the store generation the engine's facts were read at;
+    /// `index_state.generation` is the store's generation now, so the two
+    /// differ exactly when a publish landed after the engine was built (in
+    /// which case `built_generation` is listed too and the response is stale).
     fn decorate(&self, result: &mut Value) {
         let Some(obj) = result.as_object_mut() else {
             return;
         };
         let warnings = self.index_warnings();
-        let engine_stale = self.engine.as_ref().is_some_and(Engine::is_stale);
+        // Checked here, after the query ran, so a publish that landed while it
+        // was being answered is reported too.
+        let engine_stale = match (&self.engine, &self.store) {
+            (Some(engine), Some(store)) => engine.is_stale_in(store),
+            (Some(engine), None) => engine.is_stale(),
+            _ => false,
+        };
         let snapshot = self.engine.as_ref().map(|e| e.snapshot_id().to_owned());
+        let built_generation = self.engine.as_ref().map(Engine::generation);
         if let Some(id) = &snapshot {
             obj.insert("snapshot".to_owned(), json!(id));
+        }
+        if let Some(generation) = built_generation {
+            obj.insert("generation".to_owned(), json!(generation));
         }
         if !warnings.is_empty() {
             obj.insert("index_warnings".to_owned(), json!(warnings));
@@ -373,12 +435,19 @@ impl Engram {
         // here; the response gains `index_state` exactly when it may be stale.
         let stale = engine_stale || !warnings.is_empty();
         if stale {
+            let built = built_generation.unwrap_or(0);
+            let current = self
+                .store
+                .as_ref()
+                .and_then(|store| store.generation().ok())
+                .unwrap_or(built);
             obj.insert(
                 "index_state".to_owned(),
                 index_state_info(
                     &IndexState::Ready,
                     snapshot.as_deref(),
-                    self.generation,
+                    current,
+                    built,
                     stale,
                 ),
             );
@@ -1277,13 +1346,13 @@ mod tests {
     #[test]
     fn index_state_info_describes_each_state() {
         let started = Instant::now();
-        let indexing = index_state_info(&IndexState::Indexing { started }, None, 0, false);
+        let indexing = index_state_info(&IndexState::Indexing { started }, None, 0, 0, false);
         assert_eq!(indexing["status"], "indexing");
         assert!(indexing.get("snapshot").is_none());
-        let failed = index_state_info(&IndexState::Failed("boom".into()), None, 0, false);
+        let failed = index_state_info(&IndexState::Failed("boom".into()), None, 0, 0, false);
         assert_eq!(failed["status"], "failed");
         assert_eq!(failed["error"], "boom");
-        let ready = index_state_info(&IndexState::Ready, Some("abc"), 3, true);
+        let ready = index_state_info(&IndexState::Ready, Some("abc"), 3, 3, true);
         assert_eq!(ready["status"], "ready");
         assert_eq!(ready["snapshot"], "abc");
         assert_eq!(ready["generation"], 3);
@@ -1332,7 +1401,7 @@ mod tests {
         engram.dirty.store(true, Ordering::SeqCst);
         let second = engram.call_tool("expand_connections", &args).unwrap();
         assert_ne!(second["snapshot"], snapshot.as_str());
-        assert_eq!(engram.generation, 2);
+        assert_eq!(engram.engine_builds, 2);
         let explained = engram
             .call_tool(
                 "explain_connection",
@@ -1403,7 +1472,7 @@ mod tests {
             "{warnings:?}"
         );
         assert_eq!(during["index_state"]["stale"], true);
-        assert_eq!(engram.generation, 1, "no new generation was published");
+        assert_eq!(engram.engine_builds, 1, "no new generation was published");
 
         // Repair it; the retry succeeds and the warning goes away.
         engram
@@ -1415,7 +1484,7 @@ mod tests {
             .unwrap();
         let after = engram.call_tool("expand_connections", &args).unwrap();
         assert!(after.get("index_warnings").is_none(), "{after}");
-        assert_eq!(engram.generation, 2);
+        assert_eq!(engram.engine_builds, 2);
     }
 
     #[test]
@@ -1434,6 +1503,156 @@ mod tests {
         assert_eq!(r["index_state"]["status"], "ready");
         assert_eq!(r["index_state"]["stale"], true);
         assert!(r["index_state"]["snapshot"].is_string());
+    }
+
+    /// What the watcher does on a save: edit the file, then refresh it through
+    /// ANOTHER connection, publishing a generation the server's engine has not
+    /// seen. Deliberately does not touch the server's `dirty` flag.
+    fn publish_edit(repo: &TempRepo, rel: &str, contents: &str) -> u64 {
+        std::fs::write(repo.0.join(rel), contents).unwrap();
+        let mut other = Store::open(&repo.0).unwrap();
+        assert!(engram_repo_map::reindex_file(&mut other, &repo.0, rel).unwrap());
+        other.generation().unwrap()
+    }
+
+    fn store_generation(repo: &TempRepo) -> u64 {
+        Store::open(&repo.0).unwrap().generation().unwrap()
+    }
+
+    /// One call per tool that is served from the engine, with arguments that
+    /// work on a repository holding `a.rs` and `b.rs`.
+    fn engine_backed_calls() -> Vec<(&'static str, Value)> {
+        vec![
+            ("search_context", json!({ "query": "a" })),
+            ("get_task_context", json!({ "task": "a" })),
+            ("find_existing_implementation", json!({ "concept": "a" })),
+            ("predict_impact", json!({ "task": "a" })),
+            ("expand_connections", json!({ "paths": ["a.rs"] })),
+            ("find_connected_files", json!({ "files": ["a.rs"] })),
+            (
+                "explain_connection",
+                json!({ "source": "a.rs", "target": "b.rs" }),
+            ),
+            ("get_graph", json!({ "paths": ["a.rs"] })),
+        ]
+    }
+
+    #[test]
+    fn every_engine_backed_response_carries_the_generation_it_was_answered_at() {
+        let repo = TempRepo::new();
+        std::fs::write(repo.0.join("a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(repo.0.join("b.rs"), "fn b() {}\n").unwrap();
+        let mut engram = ready_engram(&repo);
+        let generation = store_generation(&repo);
+        assert!(generation >= 1);
+
+        for (tool, args) in engine_backed_calls() {
+            let r = engram.call_tool(tool, &args).unwrap();
+            assert_eq!(r["generation"], generation, "{tool}: {r}");
+            assert!(r["snapshot"].is_string(), "{tool}");
+            assert!(
+                r.get("index_state").is_none(),
+                "{tool}: healthy and current"
+            );
+        }
+        assert_eq!(engram.engine_builds, 1, "nothing moved, nothing rebuilt");
+
+        // Another connection publishes. The server's dirty flag is NOT set: the
+        // generation alone makes the next call rebuild, and answer at the new one.
+        let published = publish_edit(&repo, "a.rs", "fn a_renamed() {}\n");
+        assert_eq!(published, generation + 1);
+        let r = engram
+            .call_tool("expand_connections", &json!({ "paths": ["a.rs"] }))
+            .unwrap();
+        assert_eq!(r["generation"], published);
+        assert_eq!(engram.engine_builds, 2);
+        assert!(r.get("index_state").is_none(), "{r}");
+    }
+
+    #[test]
+    fn a_publish_between_the_engine_and_the_answer_is_reported_never_silently_mixed() {
+        let repo = TempRepo::new();
+        std::fs::write(repo.0.join("a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(repo.0.join("b.rs"), "fn b() {}\n").unwrap();
+        let mut engram = ready_engram(&repo);
+
+        for (round, (tool, args)) in engine_backed_calls().into_iter().enumerate() {
+            // Make the engine current, then arrange for a publish to land in the
+            // window after it is current and before the query is answered.
+            engram.call_tool(tool, &args).unwrap();
+            let answered_at = store_generation(&repo);
+            let root = repo.0.clone();
+            engram.after_ensure = Some(Box::new(move || {
+                std::fs::write(root.join("b.rs"), format!("fn b_{round}() {{}}\n")).unwrap();
+                let mut other = Store::open(&root).unwrap();
+                engram_repo_map::reindex_file(&mut other, &root, "b.rs").unwrap();
+            }));
+
+            let r = engram.call_tool(tool, &args).unwrap();
+            assert_eq!(
+                r["generation"], answered_at,
+                "{tool}: the facts it holds are of the generation it was built at"
+            );
+            let state = &r["index_state"];
+            assert_eq!(state["stale"], true, "{tool}: {r}");
+            assert_eq!(state["generation"], answered_at + 1, "{tool}: {r}");
+            assert_eq!(state["built_generation"], answered_at, "{tool}: {r}");
+
+            // The next call rebuilds first and is plainly current again.
+            let next = engram.call_tool(tool, &args).unwrap();
+            assert_eq!(next["generation"], answered_at + 1, "{tool}");
+            assert!(next.get("index_state").is_none(), "{tool}: {next}");
+        }
+    }
+
+    #[test]
+    fn a_failed_rebuild_after_a_publish_keeps_the_old_engine_and_names_both_generations() {
+        let repo = TempRepo::new();
+        std::fs::write(repo.0.join("a.rs"), "fn a() {}\n").unwrap();
+        let mut engram = ready_engram(&repo);
+        let args = json!({ "paths": ["a.rs"] });
+        let before = engram.call_tool("expand_connections", &args).unwrap();
+        let old = before["generation"].as_u64().unwrap();
+
+        let published = publish_edit(&repo, "a.rs", "fn a_renamed() {}\n");
+        // Break the store under the rebuild that the new generation triggers.
+        engram
+            .store
+            .as_ref()
+            .unwrap()
+            .conn
+            .execute_batch("ALTER TABLE files RENAME TO files_x;")
+            .unwrap();
+        let during = engram
+            .call_tool("expand_connections", &args)
+            .expect("the previous engine must keep serving");
+        assert_eq!(during["snapshot"], before["snapshot"]);
+        assert_eq!(during["generation"], old);
+        assert_eq!(during["index_state"]["stale"], true);
+        assert_eq!(during["index_state"]["generation"], published);
+        assert_eq!(during["index_state"]["built_generation"], old);
+        assert!(during["index_warnings"].is_array());
+
+        engram
+            .store
+            .as_ref()
+            .unwrap()
+            .conn
+            .execute_batch("ALTER TABLE files_x RENAME TO files;")
+            .unwrap();
+        let after = engram.call_tool("expand_connections", &args).unwrap();
+        assert_eq!(after["generation"], published);
+        assert!(after.get("index_state").is_none(), "{after}");
+    }
+
+    #[test]
+    fn index_state_lists_the_built_generation_only_when_the_store_has_moved_past_it() {
+        let current = index_state_info(&IndexState::Ready, Some("abc"), 5, 5, true);
+        assert_eq!(current["generation"], 5);
+        assert!(current.get("built_generation").is_none(), "{current}");
+        let behind = index_state_info(&IndexState::Ready, Some("abc"), 7, 5, true);
+        assert_eq!(behind["generation"], 7);
+        assert_eq!(behind["built_generation"], 5);
     }
 
     #[test]

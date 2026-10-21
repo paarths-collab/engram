@@ -71,6 +71,19 @@ struct Chunk {
     vector: Vec<f32>,
 }
 
+/// Everything [`Engine::build`] takes from the store, read in one transaction
+/// so all of it belongs to `generation`.
+struct StoreFacts {
+    generation: u64,
+    files: Vec<engram_domain::FileRecord>,
+    symbols_by_path: HashMap<String, Vec<SymbolRecord>>,
+    hashes: HashMap<String, Option<String>>,
+    recency: HashMap<String, i64>,
+    cached: HashMap<engram_repo_map::store::ChunkKey, (String, Vec<u8>)>,
+    snapshot: String,
+    graph: CodeGraph,
+}
+
 fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -97,6 +110,21 @@ pub struct Engine {
     /// Identity of the indexed content this engine was built from; see
     /// `Store::snapshot_id`. Constant for the engine's life.
     snapshot: String,
+    /// The store generation (`Store::generation`) every fact this engine holds
+    /// was read at: all of them inside ONE read transaction, so none comes from
+    /// a different generation. Constant for the engine's life. Unlike the
+    /// snapshot id this is a publish counter, not a content identity.
+    built_generation: u64,
+    /// The newest generation this engine accounts for: `built_generation`, plus
+    /// each publish made by its own lazy extraction (exactly one generation
+    /// each, noticed as such). A store generation beyond it was published by
+    /// somebody else, and live store reads are then not trusted.
+    accepted_generation: std::sync::atomic::AtomicU64,
+    /// How many indexed files had changed on disk since the generation they
+    /// were indexed at, when this engine was built. Their symbols are left out
+    /// (they describe other text, so their spans would point at the wrong
+    /// lines); a later publish of the watcher's refresh replaces the engine.
+    files_ahead_of_index: usize,
 }
 
 /// Longest import chain the import graph is searched for, shared by the
@@ -272,7 +300,41 @@ impl Engine {
     /// Embeddings are cached in SQLite keyed by a content hash: unchanged files
     /// reuse their stored vector instead of re-embedding, so large repos don't
     /// pay the embedding cost on every server start.
+    ///
+    /// Every fact is read from the store inside ONE read transaction (a WAL
+    /// snapshot) before any of the slow work starts: the file list, symbols,
+    /// import edges, co-change edges, recency, hashes, snapshot id and cached
+    /// vectors all come from the same generation, recorded as
+    /// [`Engine::generation`], however many batches are published meanwhile.
+    /// Embeddings computed here are cache written back afterwards; they are not
+    /// part of the generation.
     pub fn build(repo_root: &Path, store: &mut Store) -> Result<Engine> {
+        let StoreFacts {
+            generation: built_generation,
+            files,
+            mut symbols_by_path,
+            hashes,
+            recency,
+            cached,
+            snapshot,
+            graph,
+        } = {
+            let view = store.begin_read()?;
+            let facts = StoreFacts {
+                generation: view.generation(),
+                files: store.all_files()?,
+                symbols_by_path: store.all_symbols_by_path()?,
+                hashes: store.file_hashes()?,
+                recency: store.recency_map()?,
+                cached: store.load_chunk_vectors()?,
+                snapshot: engram_repo_map::snapshot_id(store, repo_root)?,
+                graph: CodeGraph::build(store, repo_root)?,
+            };
+            drop(view);
+            facts
+        };
+        let mut files_ahead_of_index = 0usize;
+
         let mut schema_builder = Schema::builder();
         let f_path = schema_builder.add_text_field("path", TEXT | STORED);
         let f_body = schema_builder.add_text_field("body", TEXT);
@@ -290,13 +352,11 @@ impl Engine {
         let mut docs = Vec::new();
         let mut chunks: Vec<Chunk> = Vec::new();
         let mut by_path = HashMap::new();
-        let recency = store.recency_map()?;
-        let cached = store.load_chunk_vectors()?;
         let mut fresh: Vec<(String, usize, String, Vec<u8>)> = Vec::new();
         let mut present: HashSet<(String, usize)> = HashSet::new();
         let (mut reused, mut embedded) = (0usize, 0usize);
 
-        for f in store.all_files()? {
+        for f in files {
             let full = repo_root.join(&f.path);
             let Ok(src) = std::fs::read_to_string(&full) else {
                 continue;
@@ -306,7 +366,19 @@ impl Engine {
 
             // Symbols are extracted lazily, so a file may legitimately have
             // none yet; plan_chunks always yields at least the head chunk.
-            let symbols = store.symbols_for_path(&f.path).unwrap_or_default();
+            let mut symbols = symbols_by_path.remove(&f.path).unwrap_or_default();
+            // The symbols' line spans describe the text they were extracted
+            // from. If the file on disk is no longer that text (an edit the
+            // watcher has not published yet), cutting spans out of the new text
+            // with the old line numbers would quote the wrong lines; leave the
+            // symbols out until the refresh is published and this engine is
+            // replaced. A row with no recorded hash cannot be checked.
+            if let Some(Some(stored)) = hashes.get(&f.path) {
+                if *stored != engram_repo_map::inventory::hash_bytes(src.as_bytes()) {
+                    symbols.clear();
+                    files_ahead_of_index += 1;
+                }
+            }
             for (start_line, symbol, text) in plan_chunks(&src, &body, &symbols) {
                 let embed_text = match &symbol {
                     Some(name) => format!("{} {} {}", f.path, name, text),
@@ -368,8 +440,12 @@ impl Engine {
             chunks.len(),
             docs.len()
         );
-        let snapshot = engram_repo_map::snapshot_id(store, repo_root)?;
-        let graph = CodeGraph::build(store, repo_root)?;
+        if files_ahead_of_index > 0 {
+            eprintln!(
+                "[engram] {files_ahead_of_index} file(s) changed on disk since they were indexed; \
+                 their symbols are left out until the refresh is published"
+            );
+        }
         eprintln!(
             "[engram] code graph: {} nodes, {} edges",
             graph.node_count(),
@@ -392,6 +468,9 @@ impl Engine {
             stopwords,
             stale: std::sync::atomic::AtomicBool::new(false),
             snapshot,
+            built_generation,
+            accepted_generation: std::sync::atomic::AtomicU64::new(built_generation),
+            files_ahead_of_index,
         })
     }
 
@@ -401,12 +480,95 @@ impl Engine {
         &self.snapshot
     }
 
-    /// Whether the store now holds symbols or imports this engine never saw:
-    /// lazy extraction on a search hit writes them after the chunks and the
-    /// code graph were built. The owner should discard the engine and
-    /// rebuild it before the next query.
+    /// The store generation this engine's facts were all read at. A publish
+    /// counter, not a content identity: see [`Engine::snapshot_id`] for that.
+    pub fn generation(&self) -> u64 {
+        self.built_generation
+    }
+
+    /// Indexed files that, when this engine was built, no longer matched the
+    /// text their symbols were extracted from (edited, refresh not published
+    /// yet). Their symbols are left out of this engine.
+    pub fn files_ahead_of_index(&self) -> usize {
+        self.files_ahead_of_index
+    }
+
+    /// Whether this engine is known to be out of date. Latched: it turns true
+    /// when lazy Tier-1 extraction wrote symbols or imports this engine never
+    /// saw, or when [`Engine::check_generation`] (also called by every query
+    /// path that reads the store live) saw the store publish a newer
+    /// generation, and never turns false again. The owner should discard the
+    /// engine and rebuild it before the next query. For a check against the
+    /// store as it is right now use [`Engine::is_stale_in`].
     pub fn is_stale(&self) -> bool {
         self.stale.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// [`Engine::is_stale`], also true when the store's generation is not the
+    /// one this engine was built at (one cheap single-row read).
+    pub fn is_stale_in(&self, store: &Store) -> bool {
+        self.is_stale() || self.check_generation(store)
+    }
+
+    /// Compare the store's generation with the one this engine was built at,
+    /// latching the stale flag on a difference. Returns whether they differ.
+    /// A failed read changes nothing and reports "not moved".
+    pub fn check_generation(&self, store: &Store) -> bool {
+        match store.generation() {
+            Ok(current) if current != self.built_generation => {
+                self.mark_stale();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn mark_stale(&self) {
+        self.stale.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn accepted(&self) -> u64 {
+        self.accepted_generation
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Whether the store holds nothing this engine does not account for: its
+    /// generation is the one the engine was built at, plus only the publishes
+    /// the engine made itself. A failed read counts as accounted for (every
+    /// other read would fail the same way).
+    fn accounts_for_store(&self, store: &Store) -> bool {
+        store
+            .generation()
+            .map_or(true, |current| current == self.accepted())
+    }
+
+    /// Called right after this engine's own lazy extraction published. If the
+    /// store is exactly one generation past what was accounted for, that
+    /// generation is ours; if it is further (somebody else published around
+    /// it), it stays unaccounted and live reads stay off until a rebuild.
+    fn accept_own_publish(&self, store: &Store) {
+        let before = self.accepted();
+        if let Ok(now) = store.generation() {
+            if now == before + 1 {
+                self.accepted_generation
+                    .store(now, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// Run live store reads against one consistent generation. The reads see a
+    /// single snapshot, so they cannot mix two generations among themselves; if
+    /// that snapshot is not the generation this engine was built at, the engine
+    /// is latched stale, so the response built from them says so instead of
+    /// silently combining this engine's facts with newer store facts.
+    fn read_live<T>(&self, store: &Store, read: impl FnOnce(&Store) -> Result<T>) -> Result<T> {
+        let view = store.begin_read()?;
+        if view.generation() != self.built_generation {
+            self.mark_stale();
+        }
+        let out = read(store);
+        drop(view);
+        out
     }
 
     /// Rank file paths for a query under a given strategy (top `k`). Used by the
@@ -540,6 +702,15 @@ impl Engine {
     ) -> Result<SearchOutcome> {
         // Dev hot-reload: pick up config/scoring.toml edits without a restart.
         self.config.reload_if_changed();
+        // Has another connection published a generation this engine does not
+        // account for (it was built at one, and its own lazy extractions added
+        // the ones it made itself)? Then the store's symbols no longer describe
+        // this engine's chunks, so the live store reads below (lazy extraction,
+        // the symbol fallbacks) are skipped and the answer comes from the
+        // engine's own facts only. The engine is latched stale, which the
+        // response reports and the owner repairs by rebuilding.
+        self.check_generation(store);
+        let in_sync = self.accounts_for_store(store);
         let bm25 = self.bm25_candidates(query, 50);
         let vector_hits = self.vector_candidates_with_chunk(query, 50);
         let best_chunk: HashMap<usize, usize> = vector_hits
@@ -632,8 +803,11 @@ impl Engine {
         let mut packets = Vec::new();
         for (rank, (i, score, signals)) in ranked.iter().enumerate() {
             let d = &self.docs[*i];
-            if engram_repo_map::ensure_tier1(store, &self.repo_root, &d.path)? {
-                self.stale.store(true, std::sync::atomic::Ordering::SeqCst);
+            // Each lazy extraction is a generation of its own (it publishes),
+            // which this engine's copy cannot see: it is stale from then on.
+            if in_sync && engram_repo_map::ensure_tier1(store, &self.repo_root, &d.path)? {
+                self.mark_stale();
+                self.accept_own_publish(store);
             }
             // Prefer the span the vector side actually matched: its text is the
             // definition itself, where the symbol table only holds a signature
@@ -654,7 +828,13 @@ impl Engine {
                         line_span(chunk.start_line, chunk.end_line),
                     )
                 }
-                None => match best_symbols_for(store, &d.path, &q_tokens).first() {
+                None => match if in_sync {
+                    best_symbols_for(store, &d.path, &q_tokens)
+                } else {
+                    Vec::new()
+                }
+                .first()
+                {
                     Some(s) => (
                         format!("{} in {}", s.name, d.path),
                         Some(s.name.clone()),
@@ -695,7 +875,25 @@ impl Engine {
         // weight (which the langchain miss showed sits *below* fused noise).
         let top_fused = packets.iter().map(|p| p.score).fold(0.0_f32, f32::max);
         let exact_score = top_fused + self.config.weights.symbol_exact;
-        for ident in query_identifiers(query) {
+        // The two symbol lookups below read the store live; held in one read
+        // transaction they see a single generation between them, and a
+        // generation other than this engine's latches it stale.
+        let live = if in_sync {
+            let view = store.begin_read()?;
+            if view.generation() != self.built_generation {
+                self.mark_stale();
+            }
+            // Somebody else may have published since the check above.
+            (view.generation() == self.accepted()).then_some(view)
+        } else {
+            None
+        };
+        let query_idents = if live.is_some() {
+            query_identifiers(query)
+        } else {
+            Vec::new()
+        };
+        for ident in query_idents {
             for s in store.symbols_exact(&ident, 5)? {
                 if packets.iter().any(|p| p.symbol.as_deref() == Some(&s.name)) {
                     continue;
@@ -716,7 +914,8 @@ impl Engine {
         }
 
         // Weaker substring hits that BM25/vector may have missed entirely.
-        for t in &q_tokens {
+        let substring_tokens: &[String] = if live.is_some() { &q_tokens } else { &[] };
+        for t in substring_tokens {
             for s in store.symbols_matching(t, 3)? {
                 if packets.iter().any(|p| p.symbol.as_deref() == Some(&s.name)) {
                     continue;
@@ -894,15 +1093,32 @@ impl Engine {
 
         // Completeness facts of the last history walk. `None` (never zero)
         // for an index built before they were recorded.
-        let totals = store.cochange_totals()?;
-        let opportunities_source = store.cochange_commits_touching(source)?;
-        let opportunities_target = store.cochange_commits_touching(target)?;
+        //
+        // All the co-change rows are read in one snapshot, so the totals, the
+        // denominators and the two pair rows are from one generation; if that
+        // is not the one this engine was built at, the engine is latched stale
+        // and the response says so.
+        let (totals, opportunities_source, opportunities_target, pair_rows) =
+            self.read_live(store, |s| {
+                Ok((
+                    s.cochange_totals()?,
+                    s.cochange_commits_touching(source)?,
+                    s.cochange_commits_touching(target)?,
+                    [
+                        s.cochange_pair(source, target)?,
+                        s.cochange_pair(target, source)?,
+                    ],
+                ))
+            })?;
 
-        for (direction, from, to) in [
+        for ((direction, from, to), row) in [
             (CoChangeDirection::SourceToTarget, source, target),
             (CoChangeDirection::TargetToSource, target, source),
-        ] {
-            if let Some(row) = store.cochange_pair(from, to)? {
+        ]
+        .into_iter()
+        .zip(pair_rows)
+        {
+            if let Some(row) = row {
                 let from_opportunities = match direction {
                     CoChangeDirection::SourceToTarget => opportunities_source,
                     CoChangeDirection::TargetToSource => opportunities_target,
@@ -1139,7 +1355,14 @@ impl Engine {
             import_dist.iter().map(|(p, d)| (p.clone(), *d)).collect();
 
         // Co-change facts: each anchor's strongest rows plus the partner's
-        // row back, keyed (source, target).
+        // row back, keyed (source, target). Every read below happens inside one
+        // snapshot, so the rows, their denominators and the hidden count are
+        // all of one generation; if it is not this engine's, the engine is
+        // latched stale and the response says so rather than mixing the two.
+        let view = store.begin_read()?;
+        if view.generation() != self.built_generation {
+            self.mark_stale();
+        }
         let totals = store.cochange_totals()?;
         let mut cochange: BTreeMap<(String, String), GraphEdge> = BTreeMap::new();
         let mut cochange_total = 0usize;
@@ -1194,6 +1417,7 @@ impl Engine {
             // count is taken against.
             cochange_total = store.cochange_fact_count(&anchors)?;
         }
+        drop(view);
         let cochange_hidden = cochange_total.saturating_sub(cochange.len());
 
         // Node cap: anchors always stay; neighbours are kept nearest first,
@@ -1431,6 +1655,12 @@ impl Engine {
         }
         let mut expansions: HashMap<String, Expansion> = HashMap::new();
         let mut beyond_seed_cap: Vec<String> = Vec::new();
+        // The co-change rows of every seed come from one snapshot; a generation
+        // other than this engine's latches it stale (the response says so).
+        let view = store.begin_read()?;
+        if view.generation() != self.built_generation {
+            self.mark_stale();
+        }
         for seed in seeds {
             // Read every row, order it totally (strength desc, then path), and
             // keep the first COCHANGE_PER_SEED as the cap always did. The rows
@@ -1472,6 +1702,7 @@ impl Engine {
                 }
             }
         }
+        drop(view);
         // A path cut for one anchor but kept for another was not dropped.
         let mut dropped_cochange: Vec<String> = beyond_seed_cap
             .into_iter()
@@ -1716,6 +1947,192 @@ mod lazy_extraction_tests {
             .search(&mut store, "frobnicate_widgets", 8)
             .expect("search");
         assert!(!engine.is_stale(), "everything was already extracted");
+    }
+
+    fn batch_replacing_symbols(
+        path: &str,
+        symbol_name: &str,
+    ) -> engram_repo_map::store::IndexBatch {
+        use engram_repo_map::store::{Extraction, ExtractionUpdate, IndexBatch};
+        IndexBatch {
+            extractions: vec![ExtractionUpdate {
+                path: path.to_owned(),
+                extraction: Extraction::Extracted {
+                    symbols: vec![SymbolRecord {
+                        name: symbol_name.to_owned(),
+                        kind: engram_domain::SymbolKind::Function,
+                        path: path.to_owned(),
+                        start_line: 1,
+                        end_line: 2,
+                        signature: format!("def {symbol_name}()"),
+                    }],
+                    imports: Vec::new(),
+                },
+            }],
+            ..IndexBatch::default()
+        }
+    }
+
+    #[test]
+    fn an_engine_records_the_generation_it_was_built_from_and_goes_stale_when_one_is_published() {
+        let repo = TempRepo::new();
+        repo.write("app.py", "def frobnicate_widgets():\n    return 1\n");
+        repo.write("lib.py", "def helper():\n    return 2\n");
+        engram_repo_map::index_repo(&repo.0, 100).expect("index");
+        let mut store = Store::open(&repo.0).expect("open store");
+        let engine = Engine::build(&repo.0, &mut store).expect("build engine");
+
+        let built = store.generation().unwrap();
+        assert!(built > 0);
+        assert_eq!(engine.generation(), built);
+        assert!(!engine.is_stale_in(&store));
+        assert!(!engine.is_stale());
+
+        // Another connection publishes (as the watcher does).
+        let mut other = Store::open(&repo.0).expect("second handle");
+        repo.write("lib.py", "def helper_renamed():\n    return 2\n");
+        assert!(engram_repo_map::reindex_file(&mut other, &repo.0, "lib.py").unwrap());
+        assert_eq!(other.generation().unwrap(), built + 1);
+
+        assert!(
+            engine.is_stale_in(&store),
+            "the store moved past the engine"
+        );
+        assert!(engine.is_stale(), "and the engine remembers it");
+        assert_eq!(engine.generation(), built, "its own facts did not move");
+
+        let rebuilt = Engine::build(&repo.0, &mut store).expect("rebuild");
+        assert_eq!(rebuilt.generation(), built + 1);
+        assert!(!rebuilt.is_stale_in(&store));
+    }
+
+    #[test]
+    fn a_search_after_a_foreign_publish_is_answered_from_the_engines_facts_only() {
+        let repo = TempRepo::new();
+        repo.write("app.py", "def frobnicate_widgets():\n    return 1\n");
+        repo.write("lib.py", "def helper():\n    return 2\n");
+        engram_repo_map::index_repo(&repo.0, 100).expect("index");
+        let mut store = Store::open(&repo.0).expect("open store");
+        let mut engine = Engine::build(&repo.0, &mut store).expect("build engine");
+
+        // A different connection publishes a symbol this engine has never seen.
+        let mut other = Store::open(&repo.0).expect("second handle");
+        other
+            .publish_batch(batch_replacing_symbols("lib.py", "zzz_unheard_of"))
+            .unwrap();
+
+        let packets = engine
+            .search(&mut store, "zzz_unheard_of", 8)
+            .expect("search");
+        assert!(
+            !packets
+                .iter()
+                .any(|p| p.symbol.as_deref() == Some("zzz_unheard_of")),
+            "a newer generation's symbols must not be mixed into an older engine's answer: \
+             {packets:?}"
+        );
+        assert!(engine.is_stale(), "and the answer says it is out of date");
+
+        // The control: an engine built after the publish does find it.
+        let mut current = Engine::build(&repo.0, &mut store).expect("rebuild");
+        let packets = current
+            .search(&mut store, "zzz_unheard_of", 8)
+            .expect("search");
+        assert!(
+            packets
+                .iter()
+                .any(|p| p.symbol.as_deref() == Some("zzz_unheard_of")),
+            "{packets:?}"
+        );
+        assert!(!current.is_stale());
+    }
+
+    #[test]
+    fn co_change_reads_of_a_newer_generation_are_flagged_not_silently_mixed() {
+        let repo = TempRepo::new();
+        repo.write("a.py", "def alpha():\n    return 1\n");
+        repo.write("b.py", "def beta():\n    return 2\n");
+        engram_repo_map::index_repo(&repo.0, 100).expect("index");
+        let mut store = Store::open(&repo.0).expect("open store");
+        let mut engine = Engine::build(&repo.0, &mut store).expect("build engine");
+        let fresh = engine
+            .explain_connection(&mut store, "a.py", "b.py")
+            .expect("explain");
+        assert!(fresh.reasons.is_empty());
+        assert!(
+            !engine.is_stale(),
+            "every read was of the engine's generation"
+        );
+
+        let mut other = Store::open(&repo.0).expect("second handle");
+        other
+            .replace_cochange(&[engram_domain::CoChange {
+                path_a: "a.py".to_owned(),
+                path_b: "b.py".to_owned(),
+                count: 3,
+                strength: 0.9,
+            }])
+            .unwrap();
+
+        // The explanation is still produced, and says what it is made of.
+        let explained = engine
+            .explain_connection(&mut store, "a.py", "b.py")
+            .expect("explain");
+        assert_eq!(explained.reasons.len(), 1, "{explained:?}");
+        assert!(
+            engine.is_stale(),
+            "co-change rows of generation N+1 under engine N"
+        );
+    }
+
+    #[test]
+    fn get_graph_and_expansion_flag_a_store_that_moved_past_the_engine() {
+        let repo = TempRepo::new();
+        repo.write("a.py", "def alpha():\n    return 1\n");
+        repo.write("b.py", "def beta():\n    return 2\n");
+        engram_repo_map::index_repo(&repo.0, 100).expect("index");
+        let mut store = Store::open(&repo.0).expect("open store");
+        let mut engine = Engine::build(&repo.0, &mut store).expect("build engine");
+        let anchors = ["a.py".to_owned()];
+        engine
+            .graph_facts(
+                &store,
+                &anchors,
+                2,
+                GraphKinds::default(),
+                GraphCaps::default(),
+            )
+            .expect("graph");
+        engine
+            .impact_from_files(&mut store, &anchors)
+            .expect("impact");
+        assert!(!engine.is_stale());
+
+        let mut other = Store::open(&repo.0).expect("second handle");
+        other
+            .publish_batch(batch_replacing_symbols("b.py", "beta_two"))
+            .unwrap();
+
+        engine
+            .graph_facts(
+                &store,
+                &anchors,
+                2,
+                GraphKinds::default(),
+                GraphCaps::default(),
+            )
+            .expect("graph");
+        assert!(engine.is_stale(), "get_graph read a newer generation");
+
+        let mut second = Engine::build(&repo.0, &mut store).expect("rebuild");
+        assert!(!second.is_stale());
+        other
+            .publish_batch(batch_replacing_symbols("b.py", "beta_three"))
+            .unwrap();
+        second
+            .impact_from_files(&mut store, &anchors)
+            .expect("impact");
+        assert!(second.is_stale(), "expansion read a newer generation");
     }
 }
 
