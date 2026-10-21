@@ -22,16 +22,28 @@ pub enum Language {
     Other,
 }
 
+/// File extension (without the dot) to language. The single table behind
+/// [`Language::from_path`]; the inventory's rules fingerprint reads it too, so
+/// adding an extension here invalidates stale indexes by itself.
+pub const LANGUAGE_EXTENSIONS: &[(&str, Language)] = &[
+    ("rs", Language::Rust),
+    ("py", Language::Python),
+    ("ts", Language::TypeScript),
+    ("tsx", Language::TypeScript),
+    ("js", Language::JavaScript),
+    ("jsx", Language::JavaScript),
+    ("mjs", Language::JavaScript),
+    ("cjs", Language::JavaScript),
+    ("go", Language::Go),
+];
+
 impl Language {
     pub fn from_path(path: &str) -> Self {
-        match path.rsplit('.').next().unwrap_or("") {
-            "rs" => Language::Rust,
-            "py" => Language::Python,
-            "ts" | "tsx" => Language::TypeScript,
-            "js" | "jsx" | "mjs" | "cjs" => Language::JavaScript,
-            "go" => Language::Go,
-            _ => Language::Other,
-        }
+        let ext = path.rsplit('.').next().unwrap_or("");
+        LANGUAGE_EXTENSIONS
+            .iter()
+            .find(|(e, _)| *e == ext)
+            .map_or(Language::Other, |(_, lang)| *lang)
     }
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -165,6 +177,12 @@ pub enum ConnectionReason {
         /// `count` / commits touching the row's first file.
         strength: f32,
         window: CoChangeWindow,
+        /// Commits in the window that touched the queried source file (bulk
+        /// commits excluded, as for `strength`). `null` when the index was
+        /// built before these totals were recorded; never a silent zero.
+        opportunities_source: Option<u32>,
+        /// Same, for the queried target file.
+        opportunities_target: Option<u32>,
     },
 }
 
@@ -203,6 +221,13 @@ pub struct ConnectionScope {
     pub cochange_lookup: &'static str,
     pub cochange_directions_searched: Vec<CoChangeDirection>,
     pub cochange_window: CoChangeWindow,
+    /// Commits the last history walk covered (at most
+    /// `cochange_window.max_commits`). `null` when not recorded yet.
+    pub commits_scanned: Option<u32>,
+    /// Of those, commits touching more than `max_files_per_commit` files,
+    /// which contribute to neither counts nor strength. `null` when not
+    /// recorded yet.
+    pub bulk_commits_excluded: Option<u32>,
     pub note: String,
 }
 

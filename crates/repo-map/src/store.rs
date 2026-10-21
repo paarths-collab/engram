@@ -1,6 +1,7 @@
 //! SQLite persistence for the repo map. Single-file DB in .engram/engram.db.
 //! Tracks which files are extracted to Tier-1 so retrieval can lazily extract on miss.
 
+use crate::cochange::CoChangeFacts;
 use crate::inventory::ScannedFile;
 use anyhow::Result;
 use engram_domain::{
@@ -20,25 +21,35 @@ pub struct Store {
     pub conn: Connection,
 }
 
-/// Version of everything that decides what extraction produces from a file:
-/// the parsers and their queries, which files the inventory includes (ignore
-/// rules, extension list, size cap). Bump it by hand whenever any of those
-/// change. On open, a database written under a different version has all its
-/// derived data (symbols, imports, vectors) discarded and every file marked
-/// for re-extraction, and the snapshot id changes with it.
+/// Version of what the parsers and their queries produce from a file. Bump it
+/// by hand when extraction logic changes in a way the inventory rules cannot
+/// reveal. The rules themselves (ignored directories, extension list, size
+/// cap) need no bump: `inventory::inventory_rules_fingerprint` folds them in
+/// together with this number, and that fingerprint is what the database
+/// records. On open, a database written under a different fingerprint has all
+/// its derived data (symbols, imports, vectors) discarded and every file
+/// marked for re-extraction, and the snapshot id changes with it.
 pub const PARSER_CONFIG_VERSION: u32 = 1;
 
+/// Meta key holding the rules fingerprint. The name predates the fingerprint
+/// (it used to hold the bare version number); an old value never matches, so
+/// such a database is simply re-extracted once.
 const PARSER_VERSION_KEY: &str = "parser_config_version";
+const COCHANGE_SCANNED_KEY: &str = "cochange_commits_scanned";
+const COCHANGE_BULK_KEY: &str = "cochange_bulk_commits_excluded";
 
 impl Store {
     pub fn open(repo_root: &Path) -> Result<Self> {
-        Self::open_with_parser_version(repo_root, PARSER_CONFIG_VERSION)
+        Self::open_with_rules_fingerprint(
+            repo_root,
+            &crate::inventory::inventory_rules_fingerprint(),
+        )
     }
 
-    /// [`Store::open`] under an explicit parser/config version. Exists so the
-    /// invalidation on a version change can be tested without editing the
-    /// constant.
-    pub fn open_with_parser_version(repo_root: &Path, parser_version: u32) -> Result<Self> {
+    /// [`Store::open`] under an explicit rules fingerprint. Exists so the
+    /// invalidation on a fingerprint change can be tested without editing the
+    /// rules themselves.
+    pub fn open_with_rules_fingerprint(repo_root: &Path, fingerprint: &str) -> Result<Self> {
         let dir = repo_root.join(".engram");
         std::fs::create_dir_all(&dir)?;
         let conn = Connection::open(dir.join("engram.db"))?;
@@ -77,6 +88,13 @@ impl Store {
                 count INTEGER NOT NULL,
                 strength REAL NOT NULL,
                 PRIMARY KEY (path_a, path_b)
+            );
+            -- Per-file denominator of cochange.strength: non-bulk commits in
+            -- the window that touched the file. Absent (with the meta totals)
+            -- until the next history walk on a database that predates it.
+            CREATE TABLE IF NOT EXISTS cochange_file_commits (
+                path TEXT PRIMARY KEY,
+                commits INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS file_imports (
                 path TEXT NOT NULL,
@@ -154,14 +172,14 @@ impl Store {
             "#,
         )?;
         Self::migrate(&conn);
-        Self::reconcile_parser_version(&conn, parser_version)?;
+        Self::reconcile_parser_version(&conn, fingerprint)?;
         Ok(Store { conn })
     }
 
     /// Discard derived data if the database was written under a different
-    /// parser/config version (see [`PARSER_CONFIG_VERSION`]). A brand-new
-    /// database has nothing to discard and just records the version.
-    fn reconcile_parser_version(conn: &Connection, version: u32) -> Result<()> {
+    /// rules fingerprint (see [`PARSER_CONFIG_VERSION`]). A brand-new database
+    /// has nothing to discard and just records the fingerprint.
+    fn reconcile_parser_version(conn: &Connection, version: &str) -> Result<()> {
         use rusqlite::OptionalExtension;
         let stored: Option<String> = conn
             .query_row(
@@ -170,7 +188,7 @@ impl Store {
                 |r| r.get(0),
             )
             .optional()?;
-        if stored.as_deref() == Some(version.to_string().as_str()) {
+        if stored.as_deref() == Some(version) {
             return Ok(());
         }
         // One transaction: a crash midway must not leave the derived data
@@ -186,7 +204,7 @@ impl Store {
         tx.execute(
             "INSERT INTO meta (key, value) VALUES (?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = ?2",
-            params![PARSER_VERSION_KEY, version.to_string()],
+            params![PARSER_VERSION_KEY, version],
         )?;
         tx.commit()?;
         Ok(())
@@ -825,7 +843,7 @@ impl Store {
     }
 
     /// A stable id for exactly what is indexed: the checked-out commit (`head`),
-    /// the parser/config version, and every indexed file's path and content
+    /// the inventory rules fingerprint, and every indexed file's path and content
     /// hash. Identical content at the same commit gives the same id regardless
     /// of mtimes or checkout location; any content, path, or version
     /// difference gives a different one.
@@ -838,7 +856,7 @@ impl Store {
                 params![PARSER_VERSION_KEY],
                 |r| r.get(0),
             )
-            .unwrap_or_else(|_| PARSER_CONFIG_VERSION.to_string());
+            .unwrap_or_else(|_| crate::inventory::inventory_rules_fingerprint());
         let mut hasher = Fnv64::default();
         // 0xff cannot occur in UTF-8, so fields cannot run into each other.
         let mut field = |s: &str| {
@@ -902,7 +920,29 @@ impl Store {
         Ok(())
     }
 
+    /// Replace the co-change rows only. The completeness facts that described
+    /// the previous rows no longer apply to these, so they are cleared and read
+    /// back as unknown; use [`Store::replace_cochange_with_facts`] to record
+    /// them.
     pub fn replace_cochange(&mut self, edges: &[CoChange]) -> Result<()> {
+        self.replace_cochange_inner(edges, None)
+    }
+
+    /// Replace the co-change rows together with the facts of the walk that
+    /// produced them, in one transaction.
+    pub fn replace_cochange_with_facts(
+        &mut self,
+        edges: &[CoChange],
+        facts: &CoChangeFacts,
+    ) -> Result<()> {
+        self.replace_cochange_inner(edges, Some(facts))
+    }
+
+    fn replace_cochange_inner(
+        &mut self,
+        edges: &[CoChange],
+        facts: Option<&CoChangeFacts>,
+    ) -> Result<()> {
         let tx = self.conn.transaction()?;
         tx.execute("DELETE FROM cochange", [])?;
         for e in edges {
@@ -912,8 +952,70 @@ impl Store {
                 params![e.path_a, e.path_b, e.count as i64, e.strength],
             )?;
         }
+        tx.execute("DELETE FROM cochange_file_commits", [])?;
+        tx.execute(
+            "DELETE FROM meta WHERE key IN (?1, ?2)",
+            params![COCHANGE_SCANNED_KEY, COCHANGE_BULK_KEY],
+        )?;
+        if let Some(facts) = facts {
+            for (path, commits) in &facts.file_commits {
+                tx.execute(
+                    "INSERT INTO cochange_file_commits (path, commits) VALUES (?1, ?2)",
+                    params![path, i64::from(*commits)],
+                )?;
+            }
+            for (key, value) in [
+                (COCHANGE_SCANNED_KEY, facts.commits_scanned),
+                (COCHANGE_BULK_KEY, facts.bulk_commits_excluded),
+            ] {
+                tx.execute(
+                    "INSERT INTO meta (key, value) VALUES (?1, ?2)
+                     ON CONFLICT(key) DO UPDATE SET value = ?2",
+                    params![key, value.to_string()],
+                )?;
+            }
+        }
         tx.commit()?;
         Ok(())
+    }
+
+    /// `(commits_scanned, bulk_commits_excluded)` of the walk that built the
+    /// co-change table, or `None` when this database has not recorded one yet
+    /// (it predates the totals, or the rows were written without them).
+    pub fn cochange_totals(&self) -> Result<Option<(u32, u32)>> {
+        let read = |key: &str| -> Result<Option<u32>> {
+            let value: Option<String> = self
+                .conn
+                .query_row("SELECT value FROM meta WHERE key = ?1", params![key], |r| {
+                    r.get(0)
+                })
+                .optional()?;
+            Ok(value.and_then(|v| v.parse().ok()))
+        };
+        Ok(
+            match (read(COCHANGE_SCANNED_KEY)?, read(COCHANGE_BULK_KEY)?) {
+                (Some(scanned), Some(bulk)) => Some((scanned, bulk)),
+                _ => None,
+            },
+        )
+    }
+
+    /// Non-bulk commits in the history window that touched `path` (the
+    /// denominator of its co-change strengths). `None` when the totals were
+    /// never recorded; `Some(0)` when they were and the file was not touched.
+    pub fn cochange_commits_touching(&self, path: &str) -> Result<Option<u32>> {
+        if self.cochange_totals()?.is_none() {
+            return Ok(None);
+        }
+        let n: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT commits FROM cochange_file_commits WHERE path = ?1",
+                params![path],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(Some(n.map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX))))
     }
 
     pub fn is_tier1_done(&self, path: &str) -> bool {
@@ -1722,7 +1824,7 @@ mod tests {
         let conn = Connection::open(repo.0.join(".engram").join("engram.db")).unwrap();
         // The symbols wipe runs before the statement that fails.
         conn.execute_batch("DROP TABLE vectors;").unwrap();
-        assert!(Store::reconcile_parser_version(&conn, PARSER_CONFIG_VERSION + 1).is_err());
+        assert!(Store::reconcile_parser_version(&conn, "another-fingerprint").is_err());
         let symbols: i64 = conn
             .query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))
             .unwrap();
@@ -1734,7 +1836,173 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(stored, PARSER_CONFIG_VERSION.to_string());
+        assert_eq!(stored, crate::inventory::inventory_rules_fingerprint());
+    }
+
+    fn stored_fingerprint(repo: &TempRepo) -> String {
+        let conn = Connection::open(repo.0.join(".engram").join("engram.db")).unwrap();
+        conn.query_row(
+            "SELECT value FROM meta WHERE key = ?1",
+            params![PARSER_VERSION_KEY],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_new_database_records_the_rules_fingerprint_and_reopening_keeps_derived_data() {
+        let repo = TempRepo::new();
+        {
+            let mut store = repo.store();
+            store.upsert_files(&[file("a.rs")]).unwrap();
+            store
+                .replace_symbols_for_file("a.rs", &[symbol("a.rs", "thing")])
+                .unwrap();
+        }
+        assert_eq!(
+            stored_fingerprint(&repo),
+            crate::inventory::inventory_rules_fingerprint()
+        );
+        // Same fingerprint on every later open: nothing is wiped (no loop).
+        for _ in 0..3 {
+            let store = repo.store();
+            assert_eq!(store.symbols_for_path("a.rs").unwrap().len(), 1);
+            assert!(store.is_tier1_done("a.rs"));
+        }
+    }
+
+    #[test]
+    fn a_database_stored_under_another_fingerprint_is_wiped_once() {
+        let repo = TempRepo::new();
+        {
+            let mut store = repo.store();
+            store
+                .upsert_fingerprinted(&[hashed("a.rs", 1, "h1")])
+                .unwrap();
+            store
+                .replace_symbols_for_file("a.rs", &[symbol("a.rs", "thing")])
+                .unwrap();
+            store
+                .replace_imports_for_file("a.rs", &["utils/retry".to_owned()])
+                .unwrap();
+            store
+                .upsert_vectors(&[("a.rs".to_owned(), "h".to_owned(), vec![1])])
+                .unwrap();
+        }
+        let before = repo.store().snapshot_id("c1").unwrap();
+
+        // The ignore/extension rules changed: the stored value no longer matches.
+        let changed = crate::inventory::rules_fingerprint(&["only-this"], &[], 1, 1);
+        assert_ne!(changed, crate::inventory::inventory_rules_fingerprint());
+        {
+            let store = Store::open_with_rules_fingerprint(&repo.0, &changed).unwrap();
+            assert!(!store.is_tier1_done("a.rs"));
+            assert!(store.symbols_for_path("a.rs").unwrap().is_empty());
+            assert!(store.all_imports().unwrap().is_empty());
+            assert!(store.load_vectors().unwrap().is_empty());
+            assert_eq!(store.all_files().unwrap().len(), 1, "file rows survive");
+            assert_ne!(store.snapshot_id("c1").unwrap(), before, "snapshot id");
+        }
+        assert_eq!(stored_fingerprint(&repo), changed);
+
+        // Re-extract, then reopen under the same fingerprint: kept, not wiped again.
+        {
+            let mut store = Store::open_with_rules_fingerprint(&repo.0, &changed).unwrap();
+            store
+                .replace_symbols_for_file("a.rs", &[symbol("a.rs", "thing")])
+                .unwrap();
+        }
+        let store = Store::open_with_rules_fingerprint(&repo.0, &changed).unwrap();
+        assert_eq!(store.symbols_for_path("a.rs").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_database_holding_the_old_numeric_version_is_wiped_once() {
+        let repo = TempRepo::new();
+        {
+            let mut store = repo.store();
+            store.upsert_files(&[file("a.rs")]).unwrap();
+            store
+                .replace_symbols_for_file("a.rs", &[symbol("a.rs", "thing")])
+                .unwrap();
+        }
+        let conn = Connection::open(repo.0.join(".engram").join("engram.db")).unwrap();
+        conn.execute(
+            "UPDATE meta SET value = '1' WHERE key = ?1",
+            params![PARSER_VERSION_KEY],
+        )
+        .unwrap();
+        drop(conn);
+        let store = repo.store();
+        assert!(store.symbols_for_path("a.rs").unwrap().is_empty());
+        assert_eq!(
+            stored_fingerprint(&repo),
+            crate::inventory::inventory_rules_fingerprint()
+        );
+    }
+
+    fn facts(scanned: u32, bulk: u32, files: &[(&str, u32)]) -> CoChangeFacts {
+        CoChangeFacts {
+            commits_scanned: scanned,
+            bulk_commits_excluded: bulk,
+            file_commits: files.iter().map(|(p, n)| ((*p).to_owned(), *n)).collect(),
+        }
+    }
+
+    #[test]
+    fn cochange_facts_round_trip_and_unrecorded_reads_as_unknown_not_zero() {
+        let repo = TempRepo::new();
+        let mut store = repo.store();
+        assert_eq!(store.cochange_totals().unwrap(), None);
+        assert_eq!(store.cochange_commits_touching("a.rs").unwrap(), None);
+
+        store
+            .replace_cochange_with_facts(&[], &facts(7, 2, &[("a.rs", 5)]))
+            .unwrap();
+        assert_eq!(store.cochange_totals().unwrap(), Some((7, 2)));
+        assert_eq!(store.cochange_commits_touching("a.rs").unwrap(), Some(5));
+        assert_eq!(
+            store.cochange_commits_touching("untouched.rs").unwrap(),
+            Some(0)
+        );
+
+        // Rows replaced without facts: the old facts described other rows.
+        store.replace_cochange(&[]).unwrap();
+        assert_eq!(store.cochange_totals().unwrap(), None);
+        assert_eq!(store.cochange_commits_touching("a.rs").unwrap(), None);
+    }
+
+    #[test]
+    fn a_database_predating_the_cochange_facts_migrates_and_reads_as_unknown() {
+        let repo = TempRepo::new();
+        {
+            let mut store = repo.store();
+            store
+                .replace_cochange(&[CoChange {
+                    path_a: "a.rs".into(),
+                    path_b: "b.rs".into(),
+                    count: 3,
+                    strength: 0.5,
+                }])
+                .unwrap();
+        }
+        // Make it look like an older database: no facts table, no totals.
+        let conn = Connection::open(repo.0.join(".engram").join("engram.db")).unwrap();
+        conn.execute_batch(
+            "DROP TABLE cochange_file_commits;
+             DELETE FROM meta WHERE key IN ('cochange_commits_scanned', 'cochange_bulk_commits_excluded');",
+        )
+        .unwrap();
+        drop(conn);
+
+        // Opening migrates idempotently, repeatedly, and keeps the old rows.
+        for _ in 0..2 {
+            let store = repo.store();
+            assert_eq!(store.cochange_totals().unwrap(), None);
+            assert_eq!(store.cochange_commits_touching("a.rs").unwrap(), None);
+            let pair = store.cochange_pair("a.rs", "b.rs").unwrap().unwrap();
+            assert_eq!(pair.count, 3);
+        }
     }
 
     fn hashed(path: &str, mtime: i64, hash: &str) -> ScannedFile {

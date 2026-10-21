@@ -828,25 +828,47 @@ impl Engine {
         };
         let mut reasons = Vec::new();
 
+        // Completeness facts of the last history walk. `None` (never zero)
+        // for an index built before they were recorded.
+        let totals = store.cochange_totals()?;
+        let opportunities_source = store.cochange_commits_touching(source)?;
+        let opportunities_target = store.cochange_commits_touching(target)?;
+
         for (direction, from, to) in [
             (CoChangeDirection::SourceToTarget, source, target),
             (CoChangeDirection::TargetToSource, target, source),
         ] {
             if let Some(row) = store.cochange_pair(from, to)? {
-                reasons.push(ConnectionReason::CoChange {
-                    detail: format!(
+                let from_opportunities = match direction {
+                    CoChangeDirection::SourceToTarget => opportunities_source,
+                    CoChangeDirection::TargetToSource => opportunities_target,
+                };
+                let detail = match from_opportunities {
+                    Some(m) => format!(
+                        "{from} and {to} changed together in {} of {m} commit{} that \
+                         touched {from} ({}%)",
+                        row.count,
+                        if m == 1 { "" } else { "s" },
+                        (row.strength * 100.0) as u32
+                    ),
+                    None => format!(
                         "{from} and {to} changed together in {} commit{}, \
                          {}% of the commits that touched {from}",
                         row.count,
                         if row.count == 1 { "" } else { "s" },
                         (row.strength * 100.0) as u32
                     ),
+                };
+                reasons.push(ConnectionReason::CoChange {
+                    detail,
                     weight: row.strength,
                     edge_kind: "cochange",
                     direction,
                     count: row.count,
                     strength: row.strength,
                     window,
+                    opportunities_source,
+                    opportunities_target,
                 });
             }
         }
@@ -916,12 +938,14 @@ impl Engine {
                 CoChangeDirection::TargetToSource,
             ],
             cochange_window: window,
+            commits_scanned: totals.map(|(scanned, _)| scanned),
+            bulk_commits_excluded: totals.map(|(_, bulk)| bulk),
             note: format!(
                 "Import chains up to {MAX_IMPORT_HOPS} hops were searched in both directions \
                  over heuristically resolved import edges. Co-change covers only the last {} \
                  commits, pairs sharing at least {} commits, ignoring commits touching more \
-                 than {} files. Absence of a fact means none was recorded within this scope, \
-                 not that the files are unrelated.",
+                 than {} files (counted in bulk_commits_excluded). Absence of a fact means \
+                 none was recorded within this scope, not that the files are unrelated.",
                 window.max_commits, window.min_count, window.max_files_per_commit
             ),
         };
@@ -1423,6 +1447,186 @@ fn second() {
             count,
             strength,
         }
+    }
+
+    fn run_git(dir: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args([
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "init.defaultBranch=main",
+            ])
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "Anonymous")
+            .env("GIT_AUTHOR_EMAIL", "anonymous@example.invalid")
+            .env("GIT_COMMITTER_NAME", "Anonymous")
+            .env("GIT_COMMITTER_EMAIL", "anonymous@example.invalid")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("run git");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// A real repository: `a.py` and `b.py` change together in three commits,
+    /// `a.py` changes alone once, one empty commit lists no files, and one
+    /// bulk commit touches 31 files (past the cap), `a.py` and `b.py` among
+    /// them. Returns `None` when `git` is unavailable.
+    fn history_fixture(tag: &str) -> Option<TempRepo> {
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .map(|o| !o.status.success())
+            .unwrap_or(true)
+        {
+            eprintln!("SKIPPED: git is not available");
+            return None;
+        }
+        let repo = TempRepo::new(tag);
+        let dir = repo.0.as_path();
+        std::fs::create_dir_all(dir.join("app")).unwrap();
+        run_git(dir, &["init", "-q"]);
+        let write = |name: &str, body: &str| {
+            std::fs::write(dir.join("app").join(name), body).unwrap();
+        };
+        for round in 1..=3 {
+            write("a.py", &format!("def a(): return {round}\n"));
+            write("b.py", &format!("def b(): return {round}\n"));
+            run_git(dir, &["add", "app/a.py", "app/b.py"]);
+            run_git(dir, &["commit", "-q", "-m", &format!("together {round}")]);
+        }
+        write("a.py", "def a(): return 'alone'\n");
+        run_git(dir, &["add", "app/a.py"]);
+        run_git(dir, &["commit", "-q", "-m", "a alone"]);
+        run_git(dir, &["commit", "-q", "--allow-empty", "-m", "no files"]);
+        write("a.py", "def a(): return 'bulk'\n");
+        write("b.py", "def b(): return 'bulk'\n");
+        for n in 0..29 {
+            write(&format!("bulk{n:02}.py"), "x = 1\n");
+        }
+        run_git(dir, &["add", "app"]);
+        run_git(dir, &["commit", "-q", "-m", "mass change"]);
+        Some(repo)
+    }
+
+    fn engine_over(repo: &TempRepo) -> (Store, Engine) {
+        engram_repo_map::index_repo(&repo.0, 100).expect("index");
+        let mut store = Store::open(&repo.0).expect("open store");
+        let engine = Engine::build(&repo.0, &mut store).expect("build engine");
+        (store, engine)
+    }
+
+    #[test]
+    fn explain_cochange_reports_opportunities_and_bulk_exclusions_from_real_history() {
+        let Some(repo) = history_fixture("cochange-facts") else {
+            return;
+        };
+        let (mut store, mut engine) = engine_over(&repo);
+        let explanation = engine
+            .explain_connection(&mut store, "app/a.py", "app/b.py")
+            .unwrap();
+
+        // 3 together + 1 alone + 1 empty + 1 bulk = 6 commits walked.
+        assert_eq!(explanation.scope.commits_scanned, Some(6));
+        assert_eq!(explanation.scope.bulk_commits_excluded, Some(1));
+
+        let json = serde_json::to_value(&explanation).unwrap();
+        assert_eq!(json["scope"]["commits_scanned"], 6);
+        assert_eq!(json["scope"]["bulk_commits_excluded"], 1);
+        let co: Vec<&serde_json::Value> = json["reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["type"] == "historical_cochange")
+            .collect();
+        assert_eq!(co.len(), 2, "{json}");
+        let forward = co.iter().find(|r| r["direction"] == "source_to_target");
+        let forward = forward.expect("a -> b");
+        // a.py: 3 shared + 1 alone = 4 non-bulk commits; b.py: 3. The bulk
+        // commit counts for neither.
+        assert_eq!(forward["count"], 3);
+        assert_eq!(forward["opportunities_source"], 4);
+        assert_eq!(forward["opportunities_target"], 3);
+        assert_eq!(forward["strength"], 0.75);
+        let detail = forward["detail"].as_str().unwrap();
+        assert!(
+            detail.contains("changed together in 3 of 4 commits that touched app/a.py"),
+            "{detail}"
+        );
+        let reverse = co
+            .iter()
+            .find(|r| r["direction"] == "target_to_source")
+            .expect("b -> a");
+        assert_eq!(reverse["opportunities_source"], 4);
+        assert_eq!(reverse["opportunities_target"], 3);
+        assert_eq!(reverse["strength"], 1.0);
+        assert!(reverse["detail"]
+            .as_str()
+            .unwrap()
+            .contains("changed together in 3 of 3 commits that touched app/b.py"));
+        // The wording is a statement of fact, not of cause.
+        for r in &co {
+            let d = r["detail"].as_str().unwrap();
+            assert!(!d.contains("because") && !d.contains("caused"), "{d}");
+        }
+    }
+
+    #[test]
+    fn explain_cochange_facts_are_null_not_zero_on_an_index_that_predates_them() {
+        let Some(repo) = history_fixture("cochange-old-db") else {
+            return;
+        };
+        let (mut store, mut engine) = engine_over(&repo);
+        // Make the database look like one written before the facts existed.
+        store
+            .conn
+            .execute_batch(
+                "DROP TABLE cochange_file_commits;
+                 DELETE FROM meta WHERE key IN
+                   ('cochange_commits_scanned', 'cochange_bulk_commits_excluded');",
+            )
+            .unwrap();
+
+        let old = serde_json::to_value(
+            engine
+                .explain_connection(&mut store, "app/a.py", "app/b.py")
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(old["scope"]["commits_scanned"].is_null(), "{old}");
+        assert!(old["scope"]["bulk_commits_excluded"].is_null(), "{old}");
+        let first = old["reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["type"] == "historical_cochange")
+            .expect("the pair itself is still reported");
+        assert!(first["opportunities_source"].is_null(), "{first}");
+        assert!(first["opportunities_target"].is_null(), "{first}");
+        assert_eq!(first["count"], 3);
+        // The wording falls back to the one that claims nothing it cannot back.
+        assert!(first["detail"]
+            .as_str()
+            .unwrap()
+            .contains("of the commits that touched"));
+
+        // Reopening migrates the schema; the next history refresh repopulates.
+        drop(store);
+        let mut store = Store::open(&repo.0).expect("reopen migrates");
+        engram_repo_map::refresh_history(&mut store, &repo.0).unwrap();
+        let fresh = serde_json::to_value(
+            engine
+                .explain_connection(&mut store, "app/a.py", "app/b.py")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(fresh["scope"]["commits_scanned"], 6);
+        assert_eq!(fresh["scope"]["bulk_commits_excluded"], 1);
     }
 
     #[test]

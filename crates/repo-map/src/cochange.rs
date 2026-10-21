@@ -18,17 +18,39 @@ pub struct History {
     pub edges: Vec<CoChange>,
     /// path -> most-recent commit unix timestamp.
     pub last_commit: HashMap<String, i64>,
+    /// What the walk covered, so a co-change count can be read against how
+    /// many commits had a chance to produce it.
+    pub facts: CoChangeFacts,
+}
+
+/// Completeness facts of one history walk.
+///
+/// A pair's `strength` is `count / file_commits[path_a]`, so `file_commits` is
+/// the exact denominator, and the two totals say how much of the window the
+/// table could not see.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CoChangeFacts {
+    /// Commits the walk covered, including ones listing no files (merges).
+    pub commits_scanned: u32,
+    /// Commits touching more than [`MAX_FILES_PER_COMMIT`] files; they feed
+    /// neither `count` nor `file_commits`.
+    pub bulk_commits_excluded: u32,
+    /// path -> non-bulk commits in the window that touched it.
+    pub file_commits: HashMap<String, u32>,
+}
+
+/// Parsed log: per-commit `(unix_timestamp, changed_files)` for commits that
+/// list files, plus the number of commits walked (merges list none).
+struct Records {
+    commits: Vec<(i64, Vec<String>)>,
+    walked: u32,
 }
 
 /// Parse recent git history into per-commit `(unix_timestamp, changed_files)`,
 /// skipping the `skip` newest commits first (used to build a leakage-free
 /// history that cannot see a held-out evaluation window — see
 /// [`build_from`]).
-fn commit_records_from(
-    repo_root: &Path,
-    skip: usize,
-    max_commits: usize,
-) -> Vec<(i64, Vec<String>)> {
+fn commit_records_from(repo_root: &Path, skip: usize, max_commits: usize) -> Records {
     let output = Command::new("git")
         .args([
             "log",
@@ -41,14 +63,19 @@ fn commit_records_from(
         .current_dir(repo_root)
         .output();
     let Ok(output) = output else {
-        return Vec::new();
+        return Records {
+            commits: Vec::new(),
+            walked: 0,
+        };
     };
     let text = String::from_utf8_lossy(&output.stdout);
     let mut records = Vec::new();
+    let mut walked: u32 = 0;
     let mut cur_ts: i64 = 0;
     let mut current: Vec<String> = Vec::new();
     for line in text.lines() {
         if let Some(ts) = line.strip_prefix("@@COMMIT@@") {
+            walked = walked.saturating_add(1);
             if !current.is_empty() {
                 records.push((cur_ts, std::mem::take(&mut current)));
             }
@@ -60,7 +87,10 @@ fn commit_records_from(
     if !current.is_empty() {
         records.push((cur_ts, current));
     }
-    records
+    Records {
+        commits: records,
+        walked,
+    }
 }
 
 /// Build the co-change edge list and per-file recency from git history.
@@ -72,7 +102,11 @@ pub fn build(repo_root: &Path) -> History {
 /// first). Used directly by benchmarks that need a leakage-free graph: skip
 /// the held-out evaluation window so the graph cannot see the future.
 pub fn build_from(repo_root: &Path, skip: usize, max_commits: usize) -> History {
-    let records = commit_records_from(repo_root, skip, max_commits);
+    let Records {
+        commits: records,
+        walked,
+    } = commit_records_from(repo_root, skip, max_commits);
+    let mut bulk_commits_excluded: u32 = 0;
     let mut file_commit_count: HashMap<String, u32> = HashMap::new();
     let mut pair_count: HashMap<(String, String), u32> = HashMap::new();
     let mut last_commit: HashMap<String, i64> = HashMap::new();
@@ -85,6 +119,7 @@ pub fn build_from(repo_root: &Path, skip: usize, max_commits: usize) -> History 
             last_commit.entry(f.clone()).or_insert(*ts);
         }
         if set.len() > MAX_FILES_PER_COMMIT {
+            bulk_commits_excluded += 1;
             continue;
         }
         for f in set {
@@ -116,5 +151,13 @@ pub fn build_from(repo_root: &Path, skip: usize, max_commits: usize) -> History 
         });
     }
     edges.sort_by(|x, y| y.strength.partial_cmp(&x.strength).unwrap());
-    History { edges, last_commit }
+    History {
+        edges,
+        last_commit,
+        facts: CoChangeFacts {
+            commits_scanned: walked,
+            bulk_commits_excluded,
+            file_commits: file_commit_count,
+        },
+    }
 }

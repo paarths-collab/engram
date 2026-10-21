@@ -25,13 +25,78 @@ const IGNORED_DIRS: &[&str] = &[
 /// The single ignore rule shared by the full scan, [`is_indexable`], and the
 /// file watcher, so they can never disagree about what is covered.
 ///
-/// Changing the list changes what is indexed: bump
-/// `store::PARSER_CONFIG_VERSION` when you do.
+/// Editing the list needs no manual version bump: it is part of
+/// [`inventory_rules_fingerprint`], which invalidates stale indexes.
 pub fn is_ignored_component(name: &str) -> bool {
     IGNORED_DIRS.contains(&name)
 }
 
 const MAX_FILE_BYTES: u64 = 1_500_000; // skip generated blobs / bundles
+
+/// Non-source files kept in the inventory (docs and config), as file-name
+/// suffixes. Source files are decided by `engram_domain::LANGUAGE_EXTENSIONS`.
+const EXTRA_SUFFIXES: &[&str] = &[".md", ".toml", ".json"];
+
+/// Fingerprint of everything that decides *which files* the inventory
+/// includes, over explicit rule lists so a test can change one.
+///
+/// Stable FNV-1a over the sorted, de-duplicated ignored directory names, the
+/// sorted indexable rules (each a self-describing string such as
+/// `lang:rs=rust` or `suffix:.md`), the size cap, and the parser/config
+/// version, so listing order never matters and any real change to a list does.
+pub fn rules_fingerprint(
+    ignored: &[&str],
+    indexable_rules: &[String],
+    max_file_bytes: u64,
+    parser_config_version: u32,
+) -> String {
+    fn sorted<T: AsRef<str>>(items: &[T]) -> Vec<&str> {
+        let mut v: Vec<&str> = items.iter().map(AsRef::as_ref).collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+    let mut h = Fnv64::default();
+    // 0xff cannot occur in UTF-8, so fields cannot run into each other.
+    let mut field = |s: &str| {
+        h.write(s.as_bytes());
+        h.write(&[0xff]);
+    };
+    field("engram-inventory-rules-v1");
+    field("ignored");
+    for name in sorted(ignored) {
+        field(name);
+    }
+    field("indexable");
+    for rule in sorted(indexable_rules) {
+        field(rule);
+    }
+    field("max_file_bytes");
+    field(&max_file_bytes.to_string());
+    field("parser_config_version");
+    field(&parser_config_version.to_string());
+    h.finish_hex()
+}
+
+/// The version recorded in the database and folded into the snapshot id:
+/// [`rules_fingerprint`] over the production ignore list, extension rules,
+/// size cap, and `store::PARSER_CONFIG_VERSION`. Editing any of those changes
+/// it, so a database written under other rules is re-extracted on open without
+/// anyone remembering to bump a number. `PARSER_CONFIG_VERSION` remains for
+/// changes this cannot see (parser queries, extraction logic).
+pub fn inventory_rules_fingerprint() -> String {
+    let mut rules: Vec<String> = engram_domain::LANGUAGE_EXTENSIONS
+        .iter()
+        .map(|(ext, lang)| format!("lang:{ext}={}", lang.as_str()))
+        .collect();
+    rules.extend(EXTRA_SUFFIXES.iter().map(|s| format!("suffix:{s}")));
+    rules_fingerprint(
+        IGNORED_DIRS,
+        &rules,
+        MAX_FILE_BYTES,
+        crate::store::PARSER_CONFIG_VERSION,
+    )
+}
 
 pub fn is_test_path(path: &str) -> bool {
     let p = path.to_lowercase();
@@ -124,8 +189,8 @@ pub struct ScannedFile {
 /// live-updated index and a freshly built one cover exactly the same files
 /// (and therefore produce the same snapshot id).
 ///
-/// Changing these rules changes what is indexed: bump
-/// `store::PARSER_CONFIG_VERSION` when you do.
+/// Changing these rules changes what is indexed; the change is picked up
+/// through [`inventory_rules_fingerprint`].
 pub fn is_indexable(rel: &str, size_bytes: u64) -> bool {
     if size_bytes > MAX_FILE_BYTES {
         return false;
@@ -137,9 +202,7 @@ pub fn is_indexable(rel: &str, size_bytes: u64) -> bool {
     }
     // keep only source-adjacent docs for now
     Language::from_path(rel) != Language::Other
-        || rel.ends_with(".md")
-        || rel.ends_with(".toml")
-        || rel.ends_with(".json")
+        || EXTRA_SUFFIXES.iter().any(|suffix| rel.ends_with(suffix))
 }
 
 /// Walk the repository and produce the Tier-0 file inventory.
@@ -194,6 +257,78 @@ mod tests {
         assert_eq!(hash_bytes(b""), "cbf29ce484222325");
         assert_eq!(hash_bytes(b"a"), "af63dc4c8601ec8c");
         assert_eq!(hash_bytes(b"foobar"), "85944171f73967e8");
+    }
+
+    fn rules(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn rules_fingerprint_is_deterministic_and_order_independent() {
+        let a = rules_fingerprint(
+            &["target", ".git"],
+            &rules(&["lang:rs=rust", "suffix:.md"]),
+            10,
+            1,
+        );
+        let b = rules_fingerprint(
+            &["target", ".git"],
+            &rules(&["lang:rs=rust", "suffix:.md"]),
+            10,
+            1,
+        );
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 16);
+        let reordered = rules_fingerprint(
+            &[".git", "target", ".git"],
+            &rules(&["suffix:.md", "lang:rs=rust"]),
+            10,
+            1,
+        );
+        assert_eq!(a, reordered, "order and duplicates must not matter");
+        assert_eq!(inventory_rules_fingerprint(), inventory_rules_fingerprint());
+    }
+
+    #[test]
+    fn changing_any_rule_changes_the_fingerprint() {
+        let base_ignored = ["target", ".git"];
+        let base_rules = rules(&["lang:rs=rust", "suffix:.md"]);
+        let base = rules_fingerprint(&base_ignored, &base_rules, 10, 1);
+        let ignore_added = rules_fingerprint(&["target", ".git", "out"], &base_rules, 10, 1);
+        let ignore_removed = rules_fingerprint(&["target"], &base_rules, 10, 1);
+        let ext_added = rules_fingerprint(
+            &base_ignored,
+            &rules(&["lang:rs=rust", "suffix:.md", "suffix:.yml"]),
+            10,
+            1,
+        );
+        let ext_renamed = rules_fingerprint(
+            &base_ignored,
+            &rules(&["lang:rs=python", "suffix:.md"]),
+            10,
+            1,
+        );
+        let size = rules_fingerprint(&base_ignored, &base_rules, 11, 1);
+        let version = rules_fingerprint(&base_ignored, &base_rules, 10, 2);
+        let all = [
+            &base,
+            &ignore_added,
+            &ignore_removed,
+            &ext_added,
+            &ext_renamed,
+            &size,
+            &version,
+        ];
+        for (i, x) in all.iter().enumerate() {
+            for y in &all[i + 1..] {
+                assert_ne!(x, y);
+            }
+        }
+        // Names cannot run together: ["ab"] is not ["a", "b"].
+        assert_ne!(
+            rules_fingerprint(&["ab"], &[], 0, 0),
+            rules_fingerprint(&["a", "b"], &[], 0, 0)
+        );
     }
 
     #[test]

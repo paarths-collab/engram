@@ -30,7 +30,7 @@ pub fn index_repo(repo_root: &Path, eager_tier1_limit: usize) -> Result<IndexSta
     let pruned_files = store.prune_missing_files(&present)?;
 
     let history = cochange::build(repo_root);
-    store.replace_cochange(&history.edges)?;
+    store.replace_cochange_with_facts(&history.edges, &history.facts)?;
     store.update_recency(&history.last_commit)?;
 
     // Eagerly extract symbols for up to N source files (small repos = instant full coverage).
@@ -208,7 +208,7 @@ pub fn snapshot_id(store: &Store, repo_root: &Path) -> Result<String> {
 /// HEAD moves — a new commit landed).
 pub fn refresh_history(store: &mut Store, repo_root: &Path) -> Result<()> {
     let history = cochange::build(repo_root);
-    store.replace_cochange(&history.edges)?;
+    store.replace_cochange_with_facts(&history.edges, &history.facts)?;
     store.update_recency(&history.last_commit)?;
     Ok(())
 }
@@ -653,8 +653,8 @@ mod tests {
                 .unwrap();
         }
 
-        let next = store::PARSER_CONFIG_VERSION + 1;
-        let store = Store::open_with_parser_version(&repo.0, next).unwrap();
+        let next = inventory::rules_fingerprint(&["other"], &[], 0, store::PARSER_CONFIG_VERSION);
+        let store = Store::open_with_rules_fingerprint(&repo.0, &next).unwrap();
         assert!(!store.is_tier1_done("a.rs"));
         assert!(symbol_names(&store, "a.rs").is_empty());
         assert!(imports_of(&store, "a.rs").is_empty());
