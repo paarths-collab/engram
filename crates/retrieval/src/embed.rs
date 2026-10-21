@@ -129,12 +129,9 @@ pub fn bytes_to_vector(bytes: &[u8]) -> Option<Vec<f32>> {
     if !bytes.len().is_multiple_of(4) || bytes.len() / 4 != DIM {
         return None;
     }
-    Some(
-        bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect(),
-    )
+    // Length is a verified multiple of 4, so the remainder is always empty.
+    let (chunks, _) = bytes.as_chunks::<4>();
+    Some(chunks.iter().map(|c| f32::from_le_bytes(*c)).collect())
 }
 
 #[cfg(test)]
