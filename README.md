@@ -115,6 +115,21 @@ built-in defaults (retrieval/src/weights.rs).
 - `Weights` (retrieval/src/weights.rs): tune via config/scoring.toml
 - SQLite → Postgres for cloud/team mode
 
+## Evidence and limits
+Each connection names the recorded fact behind it. The exact fields are in
+[`docs/CONTRACT.md`](docs/CONTRACT.md); a captured session is in
+[`docs/demo-transcript.md`](docs/demo-transcript.md).
+
+- **Import edges are heuristic.** They come from module-name matching, not compiler
+  resolution, and are reported as candidates.
+- **Co-change is history, not a requirement.** Two files changed in the same commits
+  within a bounded window. It does not mean one must change with the other.
+- **Budgets are estimates.** `budget_tokens` is checked against `ceil(bytes / 3)` of
+  the returned JSON (`pack.estimator`), not against a model tokenizer.
+- **Timings are not benchmarks.** The cold-start and per-call numbers in the demo
+  transcript come from a small fixture on a shared machine. Retrieval quality is in
+  [`docs/benchmarks.md`](docs/benchmarks.md).
+
 ## Benchmarks
 See `docs/benchmarks.md`. Headline: given one anchor file, the deterministic
 graph (`expand_connections`) recovers **58% of the files that actually
