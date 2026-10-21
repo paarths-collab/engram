@@ -85,6 +85,135 @@ pub struct CoChange {
     pub strength: f32,
 }
 
+/// Which way an import chain runs between the two files of a pairwise lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImportDirection {
+    SourceImportsTarget,
+    TargetImportsSource,
+}
+
+/// Which stored co-change row a fact came from. Rows are asymmetric: the
+/// strength of `a -> b` is relative to commits touching `a`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CoChangeDirection {
+    SourceToTarget,
+    TargetToSource,
+}
+
+/// One hop of an import route: `from` imports `to`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ImportEdge {
+    pub from: String,
+    pub to: String,
+}
+
+/// The limits the co-change table was built under. A pair that fell outside
+/// them (too few shared commits, only in bulk commits, older than the window)
+/// is absent from the table, so absence is only meaningful relative to these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct CoChangeWindow {
+    /// Most recent commits walked.
+    pub max_commits: usize,
+    /// Fewest shared commits for a pair to be recorded.
+    pub min_count: u32,
+    /// Commits touching more files than this are ignored.
+    pub max_files_per_commit: usize,
+}
+
+/// One recorded fact linking two files, as returned by `explain_connection`.
+///
+/// `type`, `detail` and `weight` are the original contract keys; the remaining
+/// fields are typed additions per variant. Import and co-change facts are
+/// independent: neither implies, requires or replaces the other.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "type")]
+pub enum ConnectionReason {
+    #[serde(rename = "import_edge")]
+    Import {
+        detail: String,
+        /// 0.6 for a direct import, 0.35 for a 2-hop chain.
+        weight: f32,
+        /// Always `"import"`.
+        edge_kind: &'static str,
+        direction: ImportDirection,
+        hops: usize,
+        /// Repo-relative paths from the importer to the imported file,
+        /// endpoints included; `hops + 1` entries.
+        chain: Vec<String>,
+        /// One `{from, to}` per hop, in route order.
+        edges: Vec<ImportEdge>,
+        /// Always `"heuristic"`: edges come from module-name matching, not
+        /// compiler resolution.
+        resolution: &'static str,
+        /// Always `"heuristic_module_segments"`.
+        resolver: &'static str,
+        /// Always `"candidate"`: a plausible edge, not a compiler-verified one.
+        resolution_status: &'static str,
+    },
+    #[serde(rename = "historical_cochange")]
+    CoChange {
+        detail: String,
+        /// Equal to `strength`.
+        weight: f32,
+        /// Always `"cochange"`.
+        edge_kind: &'static str,
+        direction: CoChangeDirection,
+        /// Commits in which both files changed.
+        count: u32,
+        /// `count` / commits touching the row's first file.
+        strength: f32,
+        window: CoChangeWindow,
+    },
+}
+
+/// Overall answer of a pairwise lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectionStatus {
+    /// At least one fact was recorded.
+    Found,
+    /// Nothing recorded, and every search ran to completion within its bound.
+    NotFoundWithinScope,
+    /// Nothing recorded, but the import search stopped at its hop bound with
+    /// unexplored import edges remaining, so a longer chain may exist.
+    UnknownBeyondBound,
+}
+
+/// How one directed import search ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImportSearchOutcome {
+    Found,
+    /// The whole reachable import neighbourhood was explored; no chain.
+    NoneWithinBound,
+    /// No chain within the bound, but imports continue past it.
+    BeyondBound,
+}
+
+/// What a pairwise lookup searched, so "not connected" is never read as more
+/// than it is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ConnectionScope {
+    pub import_max_hops: usize,
+    pub import_directions_searched: Vec<ImportDirection>,
+    pub import_search_source_imports_target: ImportSearchOutcome,
+    pub import_search_target_imports_source: ImportSearchOutcome,
+    pub cochange_lookup: &'static str,
+    pub cochange_directions_searched: Vec<CoChangeDirection>,
+    pub cochange_window: CoChangeWindow,
+    pub note: String,
+}
+
+/// Result of `explain_connection`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ConnectionExplanation {
+    pub status: ConnectionStatus,
+    pub scope: ConnectionScope,
+    pub reasons: Vec<ConnectionReason>,
+}
+
 /// One compact, evidence-backed recommendation returned to the coding agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvidencePacket {

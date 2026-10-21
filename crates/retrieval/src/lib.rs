@@ -7,8 +7,12 @@ pub mod weights;
 
 use anyhow::Result;
 use embed::{cosine, Embedder, HashedNgramEmbedder};
-use engram_domain::{EvidenceKind, EvidencePacket, ImpactPrediction, ScoredPath, SymbolRecord};
-use engram_repo_map::graph::{CodeGraph, EdgeKind};
+use engram_domain::{
+    CoChangeDirection, CoChangeWindow, ConnectionExplanation, ConnectionReason, ConnectionScope,
+    ConnectionStatus, EvidenceKind, EvidencePacket, ImpactPrediction, ImportDirection, ImportEdge,
+    ImportSearchOutcome, ScoredPath, SymbolRecord,
+};
+use engram_repo_map::graph::{CodeGraph, EdgeKind, ImportSearch};
 use engram_repo_map::store::Store;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -83,6 +87,14 @@ pub struct Engine {
     graph: CodeGraph,
     stopwords: std::sync::Arc<HashSet<String>>,
 }
+
+/// Longest import chain the import graph is searched for, shared by the
+/// expansion path and `explain_connection`.
+const MAX_IMPORT_HOPS: usize = 2;
+/// Import edges come from matching module names against file paths, not from a
+/// compiler, so every import fact is labelled with how it was resolved.
+const IMPORT_RESOLUTION: &str = "heuristic";
+const IMPORT_RESOLVER: &str = "heuristic_module_segments";
 
 const PREVIEW_BYTES: usize = 400;
 const INDEX_BODY_BYTES: usize = 60_000;
@@ -655,60 +667,151 @@ impl Engine {
         })
     }
 
-    /// Explain, from recorded facts only, why two files are connected. Returns a
-    /// list of structured reasons (import edge with direction/hops, or historical
-    /// co-change), each traceable to a concrete edge. Empty means "no recorded
-    /// connection found" — never a guess. Reuses the same deterministic
-    /// expansion as `impact_from_files`.
+    /// Explain, from recorded facts only, why two files are connected.
+    ///
+    /// A direct pairwise lookup, deliberately independent of the expansion path
+    /// (`expand_from_seeds`) and its caps, ranking and dedup:
+    /// - co-change: the exact `source -> target` and `target -> source` rows,
+    ///   each reported with its own `count` and `strength`;
+    /// - imports: the shortest import chain of up to [`MAX_IMPORT_HOPS`] hops in
+    ///   each direction, with every file and every edge on the chain named.
+    ///
+    /// Every fact found is returned (an import and a co-change for the same pair
+    /// both appear). With no facts, `status` says whether the search was
+    /// exhaustive within its scope or stopped at the hop bound, and `scope`
+    /// states exactly what was searched, so absence is never overstated.
+    /// Errors when either path is not an indexed file or both are the same file,
+    /// so a typo cannot masquerade as "not connected".
     pub fn explain_connection(
         &mut self,
         store: &mut Store,
         source: &str,
         target: &str,
-    ) -> Result<Vec<serde_json::Value>> {
+    ) -> Result<ConnectionExplanation> {
+        for path in [source, target] {
+            if !self.by_path.contains_key(path) {
+                anyhow::bail!(
+                    "{path} is not in the Engram index; use a repo-relative path \
+                     returned by search_context/expand_connections"
+                );
+            }
+        }
+        if source == target {
+            anyhow::bail!(
+                "source and target are the same file ({source}); \
+                 pass two different files to explain how they are connected"
+            );
+        }
+
+        let window = CoChangeWindow {
+            max_commits: engram_repo_map::cochange::MAX_COMMITS,
+            min_count: engram_repo_map::cochange::MIN_PAIR_COUNT,
+            max_files_per_commit: engram_repo_map::cochange::MAX_FILES_PER_COMMIT,
+        };
         let mut reasons = Vec::new();
-        // Expansions of `source`: co-change is symmetric; import_expansions here
-        // are files that import `source`, so `target` appearing means target->source.
-        let from_source =
-            self.impact_from_files(store, std::slice::from_ref(&source.to_string()))?;
-        for sp in from_source
-            .cochange_expansions
-            .iter()
-            .filter(|p| p.path == target)
-        {
-            reasons.push(serde_json::json!({
-                "type": "historical_cochange",
-                "detail": sp.reason,
-                "weight": sp.confidence,
-            }));
+
+        for (direction, from, to) in [
+            (CoChangeDirection::SourceToTarget, source, target),
+            (CoChangeDirection::TargetToSource, target, source),
+        ] {
+            if let Some(row) = store.cochange_pair(from, to)? {
+                reasons.push(ConnectionReason::CoChange {
+                    detail: format!(
+                        "{from} and {to} changed together in {} commit{}, \
+                         {}% of the commits that touched {from}",
+                        row.count,
+                        if row.count == 1 { "" } else { "s" },
+                        (row.strength * 100.0) as u32
+                    ),
+                    weight: row.strength,
+                    edge_kind: "cochange",
+                    direction,
+                    count: row.count,
+                    strength: row.strength,
+                    window,
+                });
+            }
         }
-        for sp in from_source
-            .import_expansions
-            .iter()
-            .filter(|p| p.path == target)
-        {
-            reasons.push(serde_json::json!({
-                "type": "import_edge",
-                "detail": format!("{target} imports {source}"),
-                "weight": sp.confidence,
-            }));
+
+        let mut outcomes = Vec::new();
+        for (direction, from, to) in [
+            (ImportDirection::SourceImportsTarget, source, target),
+            (ImportDirection::TargetImportsSource, target, source),
+        ] {
+            match self.graph.import_search(from, to, MAX_IMPORT_HOPS) {
+                ImportSearch::Found(chain) => {
+                    outcomes.push(ImportSearchOutcome::Found);
+                    let hops = chain.len() - 1;
+                    let route = if hops == 1 {
+                        format!("{from} imports {to} directly")
+                    } else {
+                        format!(
+                            "{from} reaches {to} in {hops} hops through imports: {}",
+                            chain.join(" -> ")
+                        )
+                    };
+                    let edges = chain
+                        .windows(2)
+                        .map(|w| ImportEdge {
+                            from: w[0].clone(),
+                            to: w[1].clone(),
+                        })
+                        .collect();
+                    reasons.push(ConnectionReason::Import {
+                        detail: format!(
+                            "{route} (heuristic module-name resolution, not compiler resolution)"
+                        ),
+                        weight: if hops <= 1 { 0.6 } else { 0.35 },
+                        edge_kind: "import",
+                        direction,
+                        hops,
+                        chain,
+                        edges,
+                        resolution: IMPORT_RESOLUTION,
+                        resolver: IMPORT_RESOLVER,
+                        resolution_status: "candidate",
+                    });
+                }
+                ImportSearch::None => outcomes.push(ImportSearchOutcome::NoneWithinBound),
+                ImportSearch::BeyondBound => outcomes.push(ImportSearchOutcome::BeyondBound),
+            }
         }
-        // Reverse direction: files that import `target`; `source` appearing means
-        // source->target.
-        let from_target =
-            self.impact_from_files(store, std::slice::from_ref(&target.to_string()))?;
-        for sp in from_target
-            .import_expansions
-            .iter()
-            .filter(|p| p.path == source)
-        {
-            reasons.push(serde_json::json!({
-                "type": "import_edge",
-                "detail": format!("{source} imports {target}"),
-                "weight": sp.confidence,
-            }));
-        }
-        Ok(reasons)
+
+        let status = if !reasons.is_empty() {
+            ConnectionStatus::Found
+        } else if outcomes.contains(&ImportSearchOutcome::BeyondBound) {
+            ConnectionStatus::UnknownBeyondBound
+        } else {
+            ConnectionStatus::NotFoundWithinScope
+        };
+        let scope = ConnectionScope {
+            import_max_hops: MAX_IMPORT_HOPS,
+            import_directions_searched: vec![
+                ImportDirection::SourceImportsTarget,
+                ImportDirection::TargetImportsSource,
+            ],
+            import_search_source_imports_target: outcomes[0],
+            import_search_target_imports_source: outcomes[1],
+            cochange_lookup: "exact_pair",
+            cochange_directions_searched: vec![
+                CoChangeDirection::SourceToTarget,
+                CoChangeDirection::TargetToSource,
+            ],
+            cochange_window: window,
+            note: format!(
+                "Import chains up to {MAX_IMPORT_HOPS} hops were searched in both directions \
+                 over heuristically resolved import edges. Co-change covers only the last {} \
+                 commits, pairs sharing at least {} commits, ignoring commits touching more \
+                 than {} files. Absence of a fact means none was recorded within this scope, \
+                 not that the files are unrelated.",
+                window.max_commits, window.min_count, window.max_files_per_commit
+            ),
+        };
+        Ok(ConnectionExplanation {
+            status,
+            scope,
+            reasons,
+        })
     }
 
     /// Shared deterministic expansion: co-change graph (git history fact) +
@@ -765,7 +868,10 @@ impl Engine {
             .map(|c| c.path.as_str())
             .collect();
         let mut import_expansions: Vec<ScoredPath> = Vec::new();
-        for hit in self.graph.dependents(seeds, &[EdgeKind::Imports], 2) {
+        for hit in self
+            .graph
+            .dependents(seeds, &[EdgeKind::Imports], MAX_IMPORT_HOPS)
+        {
             if seed_paths.contains(hit.path.as_str()) || cochange_paths.contains(hit.path.as_str())
             {
                 continue;
@@ -777,11 +883,14 @@ impl Engine {
             import_expansions.push(ScoredPath {
                 path: hit.path,
                 confidence,
-                reason: format!(
-                    "imports a likely-changed file ({} hop{})",
-                    hit.hops,
-                    if hit.hops == 1 { "" } else { "s" }
-                ),
+                reason: if hit.hops <= 1 {
+                    "imports a likely-changed file (1 hop)".to_string()
+                } else {
+                    format!(
+                        "imports a file that imports a likely-changed file ({} hops)",
+                        hit.hops
+                    )
+                },
             });
         }
         import_expansions.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
@@ -950,5 +1059,504 @@ fn second() {
             "h1",
         );
         assert!(!from_cache, "wrong-length blob must not be trusted");
+    }
+
+    /// Throwaway repo root, removed on drop. Not `tempfile`: CI builds
+    /// `--locked`, so a dev-dependency would need a Cargo.lock regeneration.
+    struct TempRepo(PathBuf);
+
+    impl TempRepo {
+        fn new(tag: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "engram-retrieval-test-{}-{tag}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("create temp repo");
+            TempRepo(path)
+        }
+    }
+
+    impl Drop for TempRepo {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Four modules: `alpha` imports `beta`, `beta` imports `gamma`, and
+    /// `delta` has no import edges.
+    fn connection_fixture(tag: &str) -> (TempRepo, Store, Engine) {
+        use engram_domain::{FileRecord, Language};
+        let repo = TempRepo::new(tag);
+        std::fs::create_dir_all(repo.0.join("app")).unwrap();
+        let mut files = Vec::new();
+        for n in ["alpha", "beta", "gamma", "delta"] {
+            std::fs::write(
+                repo.0.join(format!("app/{n}.py")),
+                format!("def {n}(): pass\n"),
+            )
+            .unwrap();
+            files.push(FileRecord {
+                path: format!("app/{n}.py"),
+                language: Language::Python,
+                size_bytes: 10,
+                is_test: false,
+            });
+        }
+        let mut store = Store::open(&repo.0).expect("open store");
+        store.upsert_files(&files).expect("upsert files");
+        store
+            .replace_imports_for_file("app/alpha.py", &["beta".to_owned()])
+            .unwrap();
+        store
+            .replace_imports_for_file("app/beta.py", &["gamma".to_owned()])
+            .unwrap();
+        let engine = Engine::build(&repo.0, &mut store).expect("build engine");
+        (repo, store, engine)
+    }
+
+    fn cochange(a: &str, b: &str, count: u32, strength: f32) -> engram_domain::CoChange {
+        engram_domain::CoChange {
+            path_a: a.to_owned(),
+            path_b: b.to_owned(),
+            count,
+            strength,
+        }
+    }
+
+    #[test]
+    fn explain_reports_a_direct_import_in_each_direction() {
+        let (_repo, mut store, mut engine) = connection_fixture("direct");
+
+        let fwd = engine
+            .explain_connection(&mut store, "app/alpha.py", "app/beta.py")
+            .unwrap()
+            .reasons;
+        assert_eq!(fwd.len(), 1, "{fwd:?}");
+        let ConnectionReason::Import {
+            direction,
+            hops,
+            chain,
+            weight,
+            resolution,
+            detail,
+            ..
+        } = &fwd[0]
+        else {
+            panic!("expected an import reason: {fwd:?}");
+        };
+        assert_eq!(*direction, ImportDirection::SourceImportsTarget);
+        assert_eq!(*hops, 1);
+        assert_eq!(chain, &["app/alpha.py", "app/beta.py"]);
+        assert_eq!(*weight, 0.6);
+        assert_eq!(*resolution, "heuristic");
+        assert!(
+            detail.contains("imports") && detail.contains("heuristic"),
+            "{detail}"
+        );
+
+        // Same pair, arguments swapped: the importer is now the target.
+        let rev = engine
+            .explain_connection(&mut store, "app/beta.py", "app/alpha.py")
+            .unwrap()
+            .reasons;
+        assert_eq!(rev.len(), 1, "{rev:?}");
+        let ConnectionReason::Import {
+            direction, chain, ..
+        } = &rev[0]
+        else {
+            panic!("expected an import reason: {rev:?}");
+        };
+        assert_eq!(*direction, ImportDirection::TargetImportsSource);
+        assert_eq!(chain, &["app/alpha.py", "app/beta.py"]);
+    }
+
+    #[test]
+    fn explain_names_the_intermediate_file_of_a_two_hop_chain() {
+        let (_repo, mut store, mut engine) = connection_fixture("twohop");
+        let rs = engine
+            .explain_connection(&mut store, "app/alpha.py", "app/gamma.py")
+            .unwrap()
+            .reasons;
+        assert_eq!(rs.len(), 1, "{rs:?}");
+        let ConnectionReason::Import {
+            hops,
+            chain,
+            weight,
+            detail,
+            direction,
+            ..
+        } = &rs[0]
+        else {
+            panic!("expected an import reason: {rs:?}");
+        };
+        assert_eq!(*hops, 2);
+        assert_eq!(chain, &["app/alpha.py", "app/beta.py", "app/gamma.py"]);
+        assert_eq!(*weight, 0.35);
+        assert_eq!(*direction, ImportDirection::SourceImportsTarget);
+        assert!(
+            detail.contains("app/beta.py"),
+            "intermediate missing: {detail}"
+        );
+        assert!(
+            !detail.contains("imports app/gamma.py directly"),
+            "a 2-hop chain must not read as a direct import: {detail}"
+        );
+    }
+
+    #[test]
+    fn explain_finds_a_cochange_pair_ranked_beyond_the_top_five() {
+        let (_repo, mut store, mut engine) = connection_fixture("rank");
+        // Seven stronger partners for alpha; delta ranks eighth by strength.
+        let mut edges: Vec<_> = (0..7)
+            .map(|i| cochange("app/alpha.py", &format!("app/other{i}.py"), 40, 0.9))
+            .collect();
+        edges.push(cochange("app/alpha.py", "app/delta.py", 3, 0.12));
+        store.replace_cochange(&edges).unwrap();
+
+        // The capped recommendation path cannot see delta...
+        let impact = engine
+            .impact_from_files(&mut store, &["app/alpha.py".to_owned()])
+            .unwrap();
+        assert!(!impact
+            .cochange_expansions
+            .iter()
+            .any(|p| p.path == "app/delta.py"));
+
+        // ...the pairwise lookup does.
+        let rs = engine
+            .explain_connection(&mut store, "app/alpha.py", "app/delta.py")
+            .unwrap()
+            .reasons;
+        assert_eq!(rs.len(), 1, "{rs:?}");
+        let ConnectionReason::CoChange {
+            direction,
+            count,
+            strength,
+            weight,
+            ..
+        } = &rs[0]
+        else {
+            panic!("expected a co-change reason: {rs:?}");
+        };
+        assert_eq!(*direction, CoChangeDirection::SourceToTarget);
+        assert_eq!(*count, 3);
+        assert_eq!(*strength, 0.12);
+        assert_eq!(*weight, 0.12);
+    }
+
+    #[test]
+    fn explain_keeps_both_the_import_and_the_cochange_for_one_pair() {
+        let (_repo, mut store, mut engine) = connection_fixture("both");
+        store
+            .replace_cochange(&[cochange("app/alpha.py", "app/beta.py", 5, 0.5)])
+            .unwrap();
+        let rs = engine
+            .explain_connection(&mut store, "app/alpha.py", "app/beta.py")
+            .unwrap()
+            .reasons;
+        assert_eq!(rs.len(), 2, "{rs:?}");
+        assert!(rs
+            .iter()
+            .any(|r| matches!(r, ConnectionReason::Import { hops: 1, .. })));
+        assert!(rs
+            .iter()
+            .any(|r| matches!(r, ConnectionReason::CoChange { count: 5, .. })));
+    }
+
+    #[test]
+    fn explain_reports_the_reverse_cochange_row_with_its_own_numbers() {
+        let (_repo, mut store, mut engine) = connection_fixture("reverse");
+        // Only delta -> alpha was recorded; asking alpha -> delta must find it.
+        store
+            .replace_cochange(&[cochange("app/delta.py", "app/alpha.py", 4, 0.8)])
+            .unwrap();
+        let rs = engine
+            .explain_connection(&mut store, "app/alpha.py", "app/delta.py")
+            .unwrap()
+            .reasons;
+        assert_eq!(rs.len(), 1, "{rs:?}");
+        assert!(matches!(
+            &rs[0],
+            ConnectionReason::CoChange {
+                direction: CoChangeDirection::TargetToSource,
+                count: 4,
+                ..
+            }
+        ));
+
+        // Both rows present: both directions are reported, distinctly.
+        store
+            .replace_cochange(&[
+                cochange("app/delta.py", "app/alpha.py", 4, 0.8),
+                cochange("app/alpha.py", "app/delta.py", 6, 0.1),
+            ])
+            .unwrap();
+        let rs = engine
+            .explain_connection(&mut store, "app/alpha.py", "app/delta.py")
+            .unwrap()
+            .reasons;
+        assert_eq!(rs.len(), 2, "{rs:?}");
+        assert!(rs.iter().any(|r| matches!(
+            r,
+            ConnectionReason::CoChange {
+                direction: CoChangeDirection::SourceToTarget,
+                count: 6,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn explain_serializes_with_the_original_keys_plus_typed_fields() {
+        let (_repo, mut store, mut engine) = connection_fixture("json");
+        store
+            .replace_cochange(&[cochange("app/alpha.py", "app/gamma.py", 2, 0.25)])
+            .unwrap();
+        let rs = engine
+            .explain_connection(&mut store, "app/alpha.py", "app/gamma.py")
+            .unwrap()
+            .reasons;
+        let v = serde_json::to_value(&rs).unwrap();
+        let by_type = |t: &str| {
+            v.as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["type"] == t)
+                .unwrap()
+        };
+        let imp = by_type("import_edge");
+        assert_eq!(imp["direction"], "source_imports_target");
+        assert_eq!(imp["hops"], 2);
+        assert_eq!(imp["resolution"], "heuristic");
+        assert_eq!(
+            imp["chain"],
+            serde_json::json!(["app/alpha.py", "app/beta.py", "app/gamma.py"])
+        );
+        assert!(imp["detail"].is_string() && imp["weight"].is_number());
+        let co = by_type("historical_cochange");
+        assert_eq!(co["direction"], "source_to_target");
+        assert_eq!(co["count"], 2);
+        assert_eq!(co["strength"], 0.25);
+        assert!(co["detail"].is_string() && co["weight"].is_number());
+    }
+
+    #[test]
+    fn explain_with_no_recorded_facts_states_what_was_searched() {
+        let (_repo, mut store, mut engine) = connection_fixture("none");
+        let ex = engine
+            .explain_connection(&mut store, "app/delta.py", "app/gamma.py")
+            .unwrap();
+        assert!(ex.reasons.is_empty(), "{ex:?}");
+        assert_eq!(ex.status, ConnectionStatus::NotFoundWithinScope);
+
+        let v = serde_json::to_value(&ex).unwrap();
+        assert_eq!(v["status"], "not_found_within_scope");
+        let scope = &v["scope"];
+        assert_eq!(scope["import_max_hops"], 2);
+        assert_eq!(
+            scope["import_directions_searched"],
+            serde_json::json!(["source_imports_target", "target_imports_source"])
+        );
+        assert_eq!(
+            scope["import_search_source_imports_target"],
+            "none_within_bound"
+        );
+        assert_eq!(scope["cochange_lookup"], "exact_pair");
+        assert_eq!(
+            scope["cochange_directions_searched"],
+            serde_json::json!(["source_to_target", "target_to_source"])
+        );
+        assert_eq!(
+            scope["cochange_window"],
+            serde_json::json!({
+                "max_commits": engram_repo_map::cochange::MAX_COMMITS,
+                "min_count": engram_repo_map::cochange::MIN_PAIR_COUNT,
+                "max_files_per_commit": engram_repo_map::cochange::MAX_FILES_PER_COMMIT,
+            })
+        );
+        assert!(scope["note"]
+            .as_str()
+            .unwrap()
+            .contains("not that the files are unrelated"));
+    }
+
+    /// Five modules in a line: aaa imports bbb imports ccc imports ddd imports eee.
+    fn long_chain_fixture(tag: &str) -> (TempRepo, Store) {
+        use engram_domain::{FileRecord, Language};
+        let repo = TempRepo::new(tag);
+        std::fs::create_dir_all(repo.0.join("app")).unwrap();
+        let names = ["aaa", "bbb", "ccc", "ddd", "eee"];
+        let mut files = Vec::new();
+        for n in names {
+            std::fs::write(repo.0.join(format!("app/{n}.py")), "pass\n").unwrap();
+            files.push(FileRecord {
+                path: format!("app/{n}.py"),
+                language: Language::Python,
+                size_bytes: 5,
+                is_test: false,
+            });
+        }
+        let mut store = Store::open(&repo.0).expect("open store");
+        store.upsert_files(&files).unwrap();
+        for w in names.windows(2) {
+            store
+                .replace_imports_for_file(&format!("app/{}.py", w[0]), &[w[1].to_owned()])
+                .unwrap();
+        }
+        (repo, store)
+    }
+
+    #[test]
+    fn explain_is_unknown_beyond_bound_not_absent_when_the_chain_is_too_long() {
+        let (repo, mut store) = long_chain_fixture("beyond");
+        let mut engine = Engine::build(&repo.0, &mut store).unwrap();
+        // aaa -> bbb -> ccc -> ddd is 3 hops: past the 2-hop bound.
+        let ex = engine
+            .explain_connection(&mut store, "app/aaa.py", "app/ddd.py")
+            .unwrap();
+        assert!(ex.reasons.is_empty(), "{ex:?}");
+        assert_eq!(ex.status, ConnectionStatus::UnknownBeyondBound);
+        assert_eq!(
+            ex.scope.import_search_source_imports_target,
+            ImportSearchOutcome::BeyondBound
+        );
+        assert_eq!(ex.scope.import_max_hops, 2);
+        let v = serde_json::to_value(&ex).unwrap();
+        assert_eq!(v["status"], "unknown_beyond_bound");
+        assert_eq!(v["scope"]["import_max_hops"], 2);
+
+        // Opposite direction has nothing to explore, but the pair as a whole
+        // is still not conclusively unconnected.
+        assert_eq!(
+            ex.scope.import_search_target_imports_source,
+            ImportSearchOutcome::NoneWithinBound
+        );
+
+        // Within the bound the same file is reachable and reported as found.
+        let ex = engine
+            .explain_connection(&mut store, "app/aaa.py", "app/ccc.py")
+            .unwrap();
+        assert_eq!(ex.status, ConnectionStatus::Found);
+    }
+
+    #[test]
+    fn explain_two_hop_route_carries_typed_edge_evidence() {
+        let (repo, mut store) = long_chain_fixture("typed");
+        let mut engine = Engine::build(&repo.0, &mut store).unwrap();
+        let ex = engine
+            .explain_connection(&mut store, "app/bbb.py", "app/ddd.py")
+            .unwrap();
+        assert_eq!(ex.status, ConnectionStatus::Found);
+        let v = serde_json::to_value(&ex).unwrap();
+        let imp = &v["reasons"][0];
+        assert_eq!(imp["type"], "import_edge");
+        assert_eq!(imp["edge_kind"], "import");
+        assert_eq!(imp["resolver"], "heuristic_module_segments");
+        assert_eq!(imp["resolution_status"], "candidate");
+        assert_eq!(imp["hops"], 2);
+        assert_eq!(imp["chain"].as_array().unwrap().len(), 3);
+        assert_eq!(imp["chain"][1], "app/ccc.py");
+        assert_eq!(
+            imp["edges"],
+            serde_json::json!([
+                {"from": "app/bbb.py", "to": "app/ccc.py"},
+                {"from": "app/ccc.py", "to": "app/ddd.py"},
+            ])
+        );
+    }
+
+    #[test]
+    fn explain_returns_imports_in_both_directions_and_cochange_alongside() {
+        let (repo, mut store) = long_chain_fixture("bidir");
+        // aaa already imports bbb; make bbb import aaa as well.
+        store
+            .replace_imports_for_file("app/bbb.py", &["aaa".to_owned(), "ccc".to_owned()])
+            .unwrap();
+        store
+            .replace_cochange(&[cochange("app/aaa.py", "app/bbb.py", 7, 0.7)])
+            .unwrap();
+        let mut engine = Engine::build(&repo.0, &mut store).unwrap();
+        let rs = engine
+            .explain_connection(&mut store, "app/aaa.py", "app/bbb.py")
+            .unwrap()
+            .reasons;
+        let dirs: Vec<_> = rs
+            .iter()
+            .filter_map(|r| match r {
+                ConnectionReason::Import { direction, .. } => Some(*direction),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(dirs.len(), 2, "{rs:?}");
+        assert!(dirs.contains(&ImportDirection::SourceImportsTarget));
+        assert!(dirs.contains(&ImportDirection::TargetImportsSource));
+        let co = rs
+            .iter()
+            .find_map(|r| match r {
+                ConnectionReason::CoChange {
+                    detail,
+                    edge_kind,
+                    window,
+                    ..
+                } => Some((detail, *edge_kind, *window)),
+                _ => None,
+            })
+            .expect("co-change fact kept alongside imports");
+        assert_eq!(co.1, "cochange");
+        assert_eq!(co.2.min_count, engram_repo_map::cochange::MIN_PAIR_COUNT);
+        assert!(co.0.contains("changed together in 7 commits"), "{}", co.0);
+        assert!(
+            !co.0.contains("must") && !co.0.contains("required"),
+            "{}",
+            co.0
+        );
+    }
+
+    #[test]
+    fn explain_rejects_unknown_paths_and_identical_endpoints() {
+        let (_repo, mut store, mut engine) = connection_fixture("errors");
+        let err = engine
+            .explain_connection(&mut store, "app/alpha.py", "app/missing.py")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("app/missing.py") && err.contains("not in the Engram index"),
+            "{err}"
+        );
+        let err = engine
+            .explain_connection(&mut store, "nope.py", "app/alpha.py")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("nope.py"), "{err}");
+        let err = engine
+            .explain_connection(&mut store, "app/alpha.py", "app/alpha.py")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("same file"), "{err}");
+    }
+
+    #[test]
+    fn expansion_does_not_describe_a_two_hop_dependent_as_a_direct_importer() {
+        let (_repo, mut store, mut engine) = connection_fixture("expansion");
+        let impact = engine
+            .impact_from_files(&mut store, &["app/gamma.py".to_owned()])
+            .unwrap();
+        let reason = |p: &str| {
+            impact
+                .import_expansions
+                .iter()
+                .find(|s| s.path == p)
+                .unwrap_or_else(|| panic!("{p} missing: {impact:?}"))
+                .reason
+                .clone()
+        };
+        let one = reason("app/beta.py");
+        assert!(one.contains("1 hop"), "{one}");
+        let two = reason("app/alpha.py");
+        assert!(
+            two.contains("2 hops") && two.contains("imports a file that imports"),
+            "{two}"
+        );
     }
 }

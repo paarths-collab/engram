@@ -6,7 +6,7 @@ use engram_domain::{
     CoChange, FileRecord, IngestedComment, Language, PrCommit, PrFileChange, ReviewComment,
     SymbolKind, SymbolRecord,
 };
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -755,6 +755,28 @@ impl Store {
         })?;
         Ok(rows.filter_map(Result::ok).collect())
     }
+
+    /// The single directed co-change row `a -> b`, looked up by primary key.
+    /// Unlike [`Store::cochange_for`] this is not ranked or capped, so a weak
+    /// pair is found as reliably as a strong one. `b -> a` is a separate row.
+    pub fn cochange_pair(&self, a: &str, b: &str) -> Result<Option<CoChange>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT path_a, path_b, count, strength FROM cochange
+                 WHERE path_a = ?1 AND path_b = ?2",
+                params![a, b],
+                |r| {
+                    Ok(CoChange {
+                        path_a: r.get(0)?,
+                        path_b: r.get(1)?,
+                        count: r.get::<_, i64>(2)? as u32,
+                        strength: r.get(3)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
 }
 
 fn lang_from_str(s: &str) -> Language {
@@ -1187,5 +1209,33 @@ mod tests {
             )
             .unwrap();
         assert_eq!(store.pr_commits(1).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn cochange_pair_reads_one_directed_row_regardless_of_rank() {
+        let repo = TempRepo::new();
+        let mut store = repo.store();
+        let mut edges: Vec<CoChange> = (0..10)
+            .map(|i| CoChange {
+                path_a: "a.rs".to_owned(),
+                path_b: format!("strong{i}.rs"),
+                count: 50,
+                strength: 0.9,
+            })
+            .collect();
+        edges.push(CoChange {
+            path_a: "a.rs".to_owned(),
+            path_b: "weak.rs".to_owned(),
+            count: 2,
+            strength: 0.05,
+        });
+        store.replace_cochange(&edges).unwrap();
+
+        // Ranked far outside any top-N, still found, with its own count.
+        let pair = store.cochange_pair("a.rs", "weak.rs").unwrap().unwrap();
+        assert_eq!((pair.count, pair.path_b.as_str()), (2, "weak.rs"));
+        // The reverse row was never recorded; direction matters.
+        assert!(store.cochange_pair("weak.rs", "a.rs").unwrap().is_none());
+        assert!(store.cochange_pair("a.rs", "nope.rs").unwrap().is_none());
     }
 }

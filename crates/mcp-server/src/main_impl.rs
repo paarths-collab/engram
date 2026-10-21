@@ -136,7 +136,7 @@ impl ToolHandler for Engram {
             },
             {
                 "name": "explain_connection",
-                "description": "Call this to see WHY two files are connected, from recorded facts only. Returns the concrete edges linking them — import edges (with direction) and historical co-change — each with a weight, or an empty list if no recorded connection exists. Never a guess.",
+                "description": "Call this to see WHY two specific files are connected, from recorded facts only. A direct pairwise lookup (not a ranked or capped recommendation): returns every recorded edge linking them. Import edges: source imports target and/or target imports source, directly or through one intermediate file (2 hops, with the full `chain` of paths); import edges come from heuristic module-name resolution, not compiler resolution (`resolution: \"heuristic\"`). Historical co-change: each direction found, with commit `count` and `strength`. Each reason has `type`, `detail`, `weight` plus typed fields (imports: `edge_kind`, `direction`, `hops`, `chain`, per-hop `edges`, `resolver`, `resolution_status: \"candidate\"`; co-change: `edge_kind`, `direction`, `count`, `strength`, `window`); import and co-change are separate facts and neither implies the other (co-change means files changed together, not that one must change with the other). `status` is `found`, `not_found_within_scope`, or `unknown_beyond_bound` (no chain within the hop bound but imports continue past it); `scope` states exactly what was searched, so `connected: false` means no recorded fact within that scope, never proof the files are unrelated. Returns an error if either path is not an indexed file or both paths are the same; use repo-relative paths from search_context/expand_connections. Never a guess.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -294,14 +294,16 @@ impl ToolHandler for Engram {
                 if source.is_empty() || target.is_empty() {
                     return Err("missing required arguments: source and target (file paths)".into());
                 }
-                let reasons = engine
+                let explanation = engine
                     .explain_connection(store, source, target)
                     .map_err(|e| e.to_string())?;
                 Ok(json!({
                     "source": source,
                     "target": target,
-                    "connected": !reasons.is_empty(),
-                    "reasons": reasons,
+                    "connected": !explanation.reasons.is_empty(),
+                    "status": serde_json::to_value(explanation.status).map_err(|e| e.to_string())?,
+                    "scope": serde_json::to_value(&explanation.scope).map_err(|e| e.to_string())?,
+                    "reasons": serde_json::to_value(&explanation.reasons).map_err(|e| e.to_string())?,
                 }))
             }
             "get_verification_plan" => {
