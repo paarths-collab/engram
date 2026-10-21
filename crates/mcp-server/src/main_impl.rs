@@ -4,6 +4,7 @@
 use crate::mcp::{serve, ToolHandler};
 use crate::watcher::SharedHealth;
 use engram_repo_map::store::Store;
+use engram_retrieval::budget::{self, PackPlan};
 use engram_retrieval::Engine;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -389,11 +390,13 @@ impl ToolHandler for Engram {
         json!({ "tools": [
             {
                 "name": "search_context",
-                "description": "ALWAYS call this FIRST, before planning or implementing any coding task. Returns ranked, evidence-backed context about this repository: existing code relevant to the query, symbols to reuse instead of reimplementing, related tests, and matched files (hybrid BM25+vector+symbol retrieval), plus any past reviewer comments on the matched files. Using this prevents duplicate implementations and wrong assumptions about the codebase.",
+                "description": "ALWAYS call this FIRST, before planning or implementing any coding task. Returns ranked, evidence-backed context about this repository: existing code relevant to the query, symbols to reuse instead of reimplementing, related tests, and matched files (hybrid BM25+vector+symbol retrieval), plus any past reviewer comments on the matched files. Using this prevents duplicate implementations and wrong assumptions about the codebase. The result carries a `pack` object: the token estimator used (`pack.estimator`, an estimate from serialized bytes, not a real tokenizer), `used_tokens`, whether anything was left out (`truncated`, `omitted_count`, and a budget-dependent number of `omitted` entries naming path/symbol/reason: `over_budget` or `below_cap`), and the fixed `ordering`. With `budget_tokens`, whole evidence units are kept in rank order so the serialized result, pack included, stays within the budget (estimated); a unit too large to include whole may come back as a `minimal` record (path, symbol, line range, score, `expansion_handle`, no snippet). A budget below the size of a bare `pack` cannot be honoured: the pack is returned alone with `pack.within_budget: false`. Results are always ordered by score, then path, then line.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "query": { "type": "string", "description": "What you are looking for, in natural language, e.g. 'add retry logic to billing webhooks'" }
+                        "query": { "type": "string", "description": "What you are looking for, in natural language, e.g. 'add retry logic to billing webhooks'" },
+                        "budget_tokens": { "type": "integer", "minimum": 1, "description": "Upper bound on the estimated tokens (ceil(bytes/3), see `pack.estimator`) of the whole serialized result, `pack` included. Omit for the default result with no budget truncation (existing result caps still apply and are reported in `pack`)." },
+                        "snapshot": { "type": "string", "description": "A `snapshot` id from an earlier response. If it differs from the current index snapshot the answer still comes from the current snapshot and says so in `snapshot_mismatch`." }
                     },
                     "required": ["query"]
                 }
@@ -404,7 +407,9 @@ impl ToolHandler for Engram {
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "task": { "type": "string", "description": "The task description in natural language" }
+                        "task": { "type": "string", "description": "The task description in natural language" },
+                        "budget_tokens": { "type": "integer", "minimum": 1, "description": "Same as search_context." },
+                        "snapshot": { "type": "string", "description": "Same as search_context." }
                     },
                     "required": ["task"]
                 }
@@ -422,7 +427,7 @@ impl ToolHandler for Engram {
             },
             {
                 "name": "expand_connections",
-                "description": "Call this when you already know which file(s) you are changing (e.g. the current diff) and want everything CONNECTED to them, with zero guessing. Takes exact file paths as anchors and returns only files linked by hard, deterministic facts already recorded in the store: the co-change graph (files that historically changed together in the same commits) and the import graph (files that statically import an anchor, up to 2 hops). Every result traces to a concrete recorded edge — this is fact-finding, not prediction. Prefer this over predict_impact whenever you have concrete anchor files.",
+                "description": "Call this when you already know which file(s) you are changing (e.g. the current diff) and want everything CONNECTED to them, with zero guessing. Takes exact file paths as anchors and returns only files linked by hard, deterministic facts already recorded in the store: the co-change graph (files that historically changed together in the same commits) and the import graph (files that statically import an anchor, up to `max_hops` hops, default 2). Every result traces to a concrete recorded edge — this is fact-finding, not prediction. Prefer this over predict_impact whenever you have concrete anchor files. Results are capped (top 5 co-change rows per anchor, 8 entries per kind); the result's `pack` object discloses what the caps cut (`omitted` entries with reason `recommendation_cap`, and `omitted_count`) and what `budget_tokens` cut (`over_budget`), names the estimator (an estimate from serialized bytes, not a real tokenizer) and reports `used_tokens`. Ordering is confidence descending, then path.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -430,7 +435,10 @@ impl ToolHandler for Engram {
                             "type": "array",
                             "items": { "type": "string" },
                             "description": "Repo-relative paths of files you are changing or about to change, e.g. ['src/billing/cancel.rs']"
-                        }
+                        },
+                        "budget_tokens": { "type": "integer", "minimum": 1, "description": "Upper bound on the estimated tokens (ceil(bytes/3), see `pack.estimator`) of the whole serialized result, `pack` included. Whole entries are kept in priority order (anchors, co-change, imports, tests); an entry too large to include whole may come back as a `minimal` record with an `expansion_handle`. Omit for no budget truncation." },
+                        "max_hops": { "type": "integer", "minimum": 1, "maximum": 2, "default": 2, "description": "How many import hops to follow from each anchor to find dependents (1 = direct importers only). Values outside 1..=2 are an error." },
+                        "snapshot": { "type": "string", "description": "A `snapshot` id from an earlier response. If it differs from the current index snapshot the answer still comes from the current snapshot and says so in `snapshot_mismatch`." }
                     },
                     "required": ["paths"]
                 }
@@ -457,7 +465,10 @@ impl ToolHandler for Engram {
                             "type": "array",
                             "items": { "type": "string" },
                             "description": "Repo-relative paths of files you are changing"
-                        }
+                        },
+                        "budget_tokens": { "type": "integer", "minimum": 1, "description": "Same as expand_connections." },
+                        "max_hops": { "type": "integer", "minimum": 1, "maximum": 2, "default": 2, "description": "Same as expand_connections." },
+                        "snapshot": { "type": "string", "description": "Same as expand_connections." }
                     },
                     "required": ["files"]
                 }
@@ -503,42 +514,113 @@ impl ToolHandler for Engram {
     }
 
     fn call_tool(&mut self, name: &str, args: &Value) -> Result<Value, String> {
-        let mut result = self.dispatch_tool(name, args)?;
+        let (mut result, plan) = match name {
+            "search_context"
+            | "get_task_context"
+            | "expand_connections"
+            | "find_connected_files" => {
+                let (result, plan) = self.dispatch_packed(name, args)?;
+                (result, Some(plan))
+            }
+            _ => (self.dispatch_tool(name, args)?, None),
+        };
         if INDEXED_TOOLS.contains(&name) {
             self.decorate(&mut result);
+        }
+        // Last, so the budget covers the decorated result: the snapshot id,
+        // index warnings and the pack itself are all part of what is measured.
+        if let Some(plan) = plan {
+            result = budget::apply(result, plan);
         }
         Ok(result)
     }
 }
 
 impl Engram {
-    fn dispatch_tool(&mut self, name: &str, args: &Value) -> Result<Value, String> {
-        match name {
-            "search_context" | "get_task_context" => {
-                self.ensure_engine()?;
-                let engine = self.engine.as_mut().unwrap();
-                let store = self.store.as_mut().unwrap();
-                let task = args
-                    .get("query")
-                    .or_else(|| args.get("task"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                if task.is_empty() {
-                    return Err("missing required argument: query".into());
-                }
-                let packets = engine.search(store, task, 8).map_err(|e| e.to_string())?;
-                // past_reviews: raw reviewer comments on the files retrieval matched.
-                let mut past_reviews = Vec::new();
-                let mut seen = std::collections::HashSet::new();
-                for p in &packets {
-                    if seen.insert(p.path.clone()) {
-                        if let Ok(cs) = store.review_comments_for_path(&p.path) {
-                            past_reviews.extend(cs);
-                        }
+    /// The two budgeted tools (and their deprecated aliases). Returns the
+    /// undecorated result and how to pack it; [`ToolHandler::call_tool`] adds
+    /// the snapshot/health fields and then applies the plan.
+    fn dispatch_packed(&mut self, name: &str, args: &Value) -> Result<(Value, PackPlan), String> {
+        let budget = budget_arg(args)?;
+        let requested_snapshot = snapshot_arg(args)?;
+        let expand = matches!(name, "expand_connections" | "find_connected_files");
+        let max_hops = if expand { max_hops_arg(args)? } else { None };
+        let (mut result, plan) = if expand {
+            let files: Vec<String> = args
+                .get("paths")
+                .or_else(|| args.get("files"))
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if files.is_empty() {
+                return Err("missing required argument: paths (array of file paths)".into());
+            }
+            self.ensure_engine()?;
+            let engine = self.engine.as_mut().unwrap();
+            let store = self.store.as_mut().unwrap();
+            let impact = engine
+                .impact_from_files_with(store, &files, max_hops.unwrap_or(2))
+                .map_err(|e| e.to_string())?;
+            let dropped: Vec<(&'static str, String)> = impact
+                .dropped
+                .iter()
+                .map(|d| (d.kind, d.path.clone()))
+                .collect();
+            (
+                serde_json::to_value(&impact).map_err(|e| e.to_string())?,
+                budget::expansion_plan(budget, &dropped),
+            )
+        } else {
+            let task = args
+                .get("query")
+                .or_else(|| args.get("task"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if task.is_empty() {
+                return Err("missing required argument: query".into());
+            }
+            self.ensure_engine()?;
+            let engine = self.engine.as_mut().unwrap();
+            let store = self.store.as_mut().unwrap();
+            let outcome = engine
+                .search_with_outcome(store, task, 8)
+                .map_err(|e| e.to_string())?;
+            // past_reviews: raw reviewer comments on the files retrieval matched.
+            let mut past_reviews = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            for p in &outcome.packets {
+                if seen.insert(p.path.clone()) {
+                    if let Ok(cs) = store.review_comments_for_path(&p.path) {
+                        past_reviews.extend(cs);
                     }
                 }
-                Ok(json!({ "task": task, "evidence": packets, "past_reviews": past_reviews }))
             }
+            (
+                json!({ "task": task, "evidence": outcome.packets, "past_reviews": past_reviews }),
+                budget::search_plan(budget, &outcome.cap_dropped, outcome.beyond_first_cap),
+            )
+        };
+        // Always answered from the current snapshot; a different one asked for
+        // is reported, never silently served as if it were the requested one.
+        if let (Some(requested), Some(engine)) = (requested_snapshot, self.engine.as_ref()) {
+            if requested != engine.snapshot_id() {
+                if let Some(obj) = result.as_object_mut() {
+                    obj.insert(
+                        "snapshot_mismatch".to_owned(),
+                        json!({ "requested": requested, "current": engine.snapshot_id() }),
+                    );
+                }
+            }
+        }
+        Ok((result, plan))
+    }
+
+    fn dispatch_tool(&mut self, name: &str, args: &Value) -> Result<Value, String> {
+        match name {
             "find_existing_implementation" => {
                 self.ensure_engine()?;
                 let engine = self.engine.as_mut().unwrap();
@@ -571,28 +653,6 @@ impl Engram {
                 }
                 let impact = engine
                     .predict_impact(store, task)
-                    .map_err(|e| e.to_string())?;
-                Ok(serde_json::to_value(impact).map_err(|e| e.to_string())?)
-            }
-            "expand_connections" | "find_connected_files" => {
-                self.ensure_engine()?;
-                let engine = self.engine.as_mut().unwrap();
-                let store = self.store.as_mut().unwrap();
-                let files: Vec<String> = args
-                    .get("paths")
-                    .or_else(|| args.get("files"))
-                    .and_then(|v| v.as_array())
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                if files.is_empty() {
-                    return Err("missing required argument: paths (array of file paths)".into());
-                }
-                let impact = engine
-                    .impact_from_files(store, &files)
                     .map_err(|e| e.to_string())?;
                 Ok(serde_json::to_value(impact).map_err(|e| e.to_string())?)
             }
@@ -693,6 +753,39 @@ impl Engram {
             }
             other => Err(format!("unknown tool: {other}")),
         }
+    }
+}
+
+/// `budget_tokens`: absent or null means no budget; otherwise an integer >= 1.
+fn budget_arg(args: &Value) -> Result<Option<usize>, String> {
+    match args.get("budget_tokens") {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => match v.as_u64() {
+            Some(n) if n >= 1 => Ok(Some(n as usize)),
+            _ => Err(format!("budget_tokens must be an integer >= 1, got {v}")),
+        },
+    }
+}
+
+/// `max_hops`: absent or null means the default; otherwise an integer in 1..=2.
+fn max_hops_arg(args: &Value) -> Result<Option<usize>, String> {
+    match args.get("max_hops") {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => match v.as_u64() {
+            Some(n) if (1..=2).contains(&n) => Ok(Some(n as usize)),
+            _ => Err(format!(
+                "max_hops must be an integer between 1 and 2, got {v}"
+            )),
+        },
+    }
+}
+
+/// `snapshot`: absent or null means none requested; otherwise a string.
+fn snapshot_arg(args: &Value) -> Result<Option<String>, String> {
+    match args.get("snapshot") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(id)) => Ok(Some(id.clone())),
+        Some(v) => Err(format!("snapshot must be a string, got {v}")),
     }
 }
 
@@ -1034,9 +1127,20 @@ mod tests {
             ])
         );
         // Existing fields are untouched.
-        for key in healthy.as_object().unwrap().keys() {
+        // (`pack.used_tokens` measures the whole result, warnings included,
+        // so it is the one field that legitimately grows with them.)
+        for key in healthy.as_object().unwrap().keys().filter(|k| *k != "pack") {
             assert_eq!(healthy[key], degraded[key], "{key} changed");
         }
+        for key in healthy["pack"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .filter(|k| *k != "used_tokens")
+        {
+            assert_eq!(healthy["pack"][key], degraded["pack"][key], "pack.{key}");
+        }
+        assert!(degraded["pack"]["used_tokens"].as_u64() > healthy["pack"]["used_tokens"].as_u64());
         let search = engram
             .call_tool("search_context", &json!({ "query": "a" }))
             .unwrap();
@@ -1257,5 +1361,525 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(!to_old.contains("a.py"), "{to_old}");
+    }
+
+    // ---- budgeted, deterministic evidence packs ----
+
+    /// Thirty near-duplicate modules, written in `order`, so a query matches
+    /// far more than fits in a small budget.
+    fn billing_repo(order: &[usize]) -> TempRepo {
+        let repo = TempRepo::new();
+        std::fs::create_dir_all(repo.0.join("src")).unwrap();
+        for &i in order {
+            let body: String = (0..14)
+                .map(|n| {
+                    format!("    step_{n} = attempt_{i} + {n}  # retry billing webhook delivery\n")
+                })
+                .collect();
+            std::fs::write(
+                repo.0.join(format!("src/svc{i:02}.py")),
+                format!(
+                    "def retry_billing_webhook_{i}(event):\n    \"\"\"Retry the billing webhook delivery.\"\"\"\n    attempt_{i} = 0\n{body}    return attempt_{i}\n"
+                ),
+            )
+            .unwrap();
+        }
+        repo
+    }
+
+    const BILLING_QUERY: &str = "retry billing webhook delivery";
+
+    fn tokens(result: &Value) -> usize {
+        budget::estimate_tokens(&budget::render(result))
+    }
+
+    fn array_len(result: &Value, key: &str) -> usize {
+        result[key].as_array().map_or(0, Vec::len)
+    }
+
+    #[test]
+    fn a_budgeted_search_stays_within_its_serialized_budget_and_names_what_it_omitted() {
+        let repo = billing_repo(&(0..30).collect::<Vec<_>>());
+        let mut engram = ready_engram(&repo);
+        let unbounded = engram
+            .call_tool("search_context", &json!({ "query": BILLING_QUERY }))
+            .unwrap();
+        let all = array_len(&unbounded, "evidence");
+        assert!(all >= 8, "corpus must yield many candidates, got {all}");
+        assert!(tokens(&unbounded) > 2000, "{}", tokens(&unbounded));
+
+        let result = engram
+            .call_tool(
+                "search_context",
+                &json!({ "query": BILLING_QUERY, "budget_tokens": 2000 }),
+            )
+            .unwrap();
+        // Measured on the exact text the MCP layer returns as the content.
+        let text = budget::render(&result);
+        assert!(budget::estimate_tokens(&text) <= 2000, "{}", text.len());
+        let pack = &result["pack"];
+        assert_eq!(pack["estimator"], "bytes3-v1");
+        assert_eq!(pack["budget_tokens"], 2000);
+        assert_eq!(pack["truncated"], true);
+        assert_eq!(pack["within_budget"], true);
+        assert_eq!(pack["ordering"], "score_desc,path_asc,line_asc");
+        let used = pack["used_tokens"].as_u64().unwrap() as usize;
+        assert!(used >= tokens(&result) && used <= 2000, "{used}");
+
+        let kept = array_len(&result, "evidence");
+        assert!(kept > 0 && kept < all, "kept {kept} of {all}");
+        let omitted = pack["omitted"].as_array().unwrap();
+        assert!(!omitted.is_empty());
+        assert!(pack["omitted_count"].as_u64().unwrap() as usize >= all - kept);
+        for entry in omitted {
+            assert!(
+                entry["path"].as_str().unwrap().starts_with("src/svc"),
+                "{entry}"
+            );
+            assert!(
+                ["over_budget", "below_cap"].contains(&entry["reason"].as_str().unwrap()),
+                "{entry}"
+            );
+        }
+        assert!(omitted.iter().any(|e| e["reason"] == "over_budget"));
+        // What was kept is a prefix of the unbudgeted ranking, in the same order.
+        for (got, want) in result["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .zip(unbounded["evidence"].as_array().unwrap())
+        {
+            assert_eq!(got["id"], want["id"]);
+        }
+    }
+
+    #[test]
+    fn the_same_query_and_differently_ordered_inputs_give_byte_identical_output() {
+        let forward: Vec<usize> = (0..30).collect();
+        let shuffled: Vec<usize> = (0..30).map(|i| (i * 7) % 30).collect();
+        assert_ne!(forward, shuffled);
+        let call = |order: &[usize]| {
+            let repo = billing_repo(order);
+            let mut engram = ready_engram(&repo);
+            let args = json!({ "query": BILLING_QUERY, "budget_tokens": 2000 });
+            let warm = engram.call_tool("search_context", &args).unwrap();
+            let first = budget::render(&engram.call_tool("search_context", &args).unwrap());
+            let second = budget::render(&engram.call_tool("search_context", &args).unwrap());
+            assert_eq!(first, second, "same query twice");
+            assert_eq!(first, budget::render(&warm), "first call vs later calls");
+            first
+        };
+        assert_eq!(call(&forward), call(&shuffled));
+    }
+
+    #[test]
+    fn a_tiny_budget_gets_minimal_records_and_a_tinier_one_gets_only_the_pack() {
+        let repo = billing_repo(&(0..30).collect::<Vec<_>>());
+        let mut engram = ready_engram(&repo);
+        let at = |engram: &mut Engram, budget: usize| {
+            engram
+                .call_tool(
+                    "search_context",
+                    &json!({ "query": BILLING_QUERY, "budget_tokens": budget }),
+                )
+                .unwrap()
+        };
+        let total = array_len(
+            &engram
+                .call_tool("search_context", &json!({ "query": BILLING_QUERY }))
+                .unwrap(),
+            "evidence",
+        );
+
+        // The smallest budget the pack itself fits in: nothing else does.
+        let bare = (1..400)
+            .find(|b| at(&mut engram, *b)["pack"]["within_budget"] == true)
+            .expect("a bare pack fits in 400 tokens");
+        let nothing = at(&mut engram, bare);
+        assert!(tokens(&nothing) <= bare);
+        assert_eq!(array_len(&nothing, "evidence"), 0, "{nothing}");
+        assert_eq!(nothing["pack"]["truncated"], true);
+        assert!(nothing["pack"]["omitted_count"].as_u64().unwrap() as usize >= total);
+
+        // Below that, the budget cannot be met and the response says so.
+        if bare > 1 {
+            let impossible = at(&mut engram, bare - 1);
+            assert_eq!(impossible["pack"]["within_budget"], false);
+            assert_eq!(array_len(&impossible, "evidence"), 0);
+        }
+
+        // The first budget that admits any evidence admits a minimal record.
+        let (budget, admitted) = (bare..4000)
+            .step_by(4)
+            .map(|b| (b, at(&mut engram, b)))
+            .find(|(_, r)| array_len(r, "evidence") > 0)
+            .expect("some budget admits evidence");
+        assert!(tokens(&admitted) <= budget);
+        let first = &admitted["evidence"][0];
+        assert_eq!(first["minimal"], true, "{first}");
+        assert!(first.get("snippet").is_none());
+        assert!(first["path"].as_str().unwrap().starts_with("src/svc"));
+        assert!(first["symbol"].is_string());
+        assert!(first["start_line"].is_number() && first["end_line"].is_number());
+        assert!(first["score"].is_number());
+        assert_eq!(first["expansion_handle"]["path"], first["path"]);
+        assert_eq!(first["expansion_handle"]["symbol"], first["symbol"]);
+        assert_eq!(admitted["pack"]["truncated"], true);
+    }
+
+    #[test]
+    fn without_a_budget_the_evidence_is_what_it_was_and_the_pack_only_reports() {
+        let repo = billing_repo(&(0..30).collect::<Vec<_>>());
+        let mut engram = ready_engram(&repo);
+        let result = engram
+            .call_tool("search_context", &json!({ "query": BILLING_QUERY }))
+            .unwrap();
+        let before = {
+            let engine = engram.engine.as_mut().unwrap();
+            let store = engram.store.as_mut().unwrap();
+            engine.search(store, BILLING_QUERY, 8).unwrap()
+        };
+        assert_eq!(array_len(&result, "evidence"), before.len());
+        for (got, want) in result["evidence"].as_array().unwrap().iter().zip(&before) {
+            assert_eq!(got["id"], want.id.as_str());
+            assert_eq!(got["path"], want.path.as_str());
+            assert!(got.get("minimal").is_none());
+            assert_eq!(got["snippet"], json!(want.snippet));
+        }
+        let pack = &result["pack"];
+        assert_eq!(pack["budget_tokens"], Value::Null);
+        assert_eq!(pack["estimator"], budget::TOKEN_ESTIMATOR);
+        assert_eq!(pack["within_budget"], true);
+        let used = pack["used_tokens"].as_u64().unwrap() as usize;
+        assert!(used >= tokens(&result) && used <= tokens(&result) + 1);
+        // Everything it used to return is still there, with its old fields.
+        for key in ["task", "evidence", "past_reviews", "snapshot"] {
+            assert!(result.get(key).is_some(), "{key} missing");
+        }
+        // The only omissions are the search's own caps, and they are named.
+        for entry in pack["omitted"].as_array().unwrap() {
+            assert_eq!(entry["reason"], "below_cap");
+        }
+    }
+
+    /// `app/anchor.py` with 12 co-change partners and 12 direct importers plus
+    /// one file that imports an importer (two hops away).
+    fn fan_repo() -> (TempRepo, Engram) {
+        let repo = TempRepo::new();
+        std::fs::create_dir_all(repo.0.join("app")).unwrap();
+        let mut names = vec!["anchor".to_owned(), "mid".to_owned(), "top".to_owned()];
+        names.extend(["chain_a", "chain_b", "chain_c"].map(str::to_owned));
+        names.extend((0..12).map(|i| format!("p{i:02}")));
+        names.extend((0..11).map(|i| format!("imp{i:02}")));
+        for n in &names {
+            std::fs::write(
+                repo.0.join(format!("app/{n}.py")),
+                format!("def {n}():\n    pass\n"),
+            )
+            .unwrap();
+        }
+        let engram = ready_engram(&repo);
+        let mut store = Store::open(&repo.0).unwrap();
+        store
+            .replace_imports_for_file("app/mid.py", &["anchor".to_owned()])
+            .unwrap();
+        store
+            .replace_imports_for_file("app/top.py", &["mid".to_owned()])
+            .unwrap();
+        // chain_c imports chain_b imports chain_a: a two-hop chain no cap touches.
+        store
+            .replace_imports_for_file("app/chain_b.py", &["chain_a".to_owned()])
+            .unwrap();
+        store
+            .replace_imports_for_file("app/chain_c.py", &["chain_b".to_owned()])
+            .unwrap();
+        for i in 0..11 {
+            store
+                .replace_imports_for_file(&format!("app/imp{i:02}.py"), &["anchor".to_owned()])
+                .unwrap();
+        }
+        let edges: Vec<engram_domain::CoChange> = (0..12)
+            .map(|i| engram_domain::CoChange {
+                path_a: "app/anchor.py".to_owned(),
+                path_b: format!("app/p{i:02}.py"),
+                count: 50 - i,
+                strength: 0.9 - i as f32 * 0.01,
+            })
+            .collect();
+        store.replace_cochange(&edges).unwrap();
+        engram.dirty.store(true, Ordering::SeqCst);
+        (repo, engram)
+    }
+
+    #[test]
+    fn expand_connections_discloses_exactly_what_its_caps_dropped() {
+        let (_repo, mut engram) = fan_repo();
+        let result = engram
+            .call_tool("expand_connections", &json!({ "paths": ["app/anchor.py"] }))
+            .unwrap();
+        // Defaults unchanged: 5 co-change per anchor, 8 imports.
+        assert_eq!(array_len(&result, "cochange_expansions"), 5);
+        assert_eq!(array_len(&result, "import_expansions"), 8);
+        // 12 partners - 5 returned; 12 direct + 1 two-hop importers - 8 returned.
+        let pack = &result["pack"];
+        assert_eq!(pack["omitted_count"], 7 + 5);
+        assert_eq!(pack["truncated"], true);
+        let omitted = pack["omitted"].as_array().unwrap();
+        assert_eq!(omitted.len(), 12);
+        let of = |kind: &str| -> Vec<&str> {
+            omitted
+                .iter()
+                .filter(|e| e["kind"] == kind)
+                .map(|e| e["path"].as_str().unwrap())
+                .collect()
+        };
+        assert_eq!(of("cochange").len(), 7);
+        assert_eq!(of("import").len(), 5);
+        assert!(omitted.iter().all(|e| e["reason"] == "recommendation_cap"));
+        // None of the disclosed paths is one that was returned.
+        for (kind, key) in [
+            ("cochange", "cochange_expansions"),
+            ("import", "import_expansions"),
+        ] {
+            let returned: Vec<&str> = result[key]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p["path"].as_str().unwrap())
+                .collect();
+            assert!(of(kind).iter().all(|p| !returned.contains(p)), "{kind}");
+        }
+        assert!(
+            of("import").contains(&"app/top.py"),
+            "two-hop importer is cut"
+        );
+    }
+
+    #[test]
+    fn expand_connections_with_a_budget_counts_both_kinds_of_omission() {
+        let (_repo, mut engram) = fan_repo();
+        let args = json!({ "paths": ["app/anchor.py"], "budget_tokens": 500 });
+        let result = engram.call_tool("expand_connections", &args).unwrap();
+        let text = budget::render(&result);
+        assert!(budget::estimate_tokens(&text) <= 500, "{}", text.len());
+        let pack = &result["pack"];
+        assert_eq!(pack["budget_tokens"], 500);
+        assert_eq!(pack["ordering"], "confidence_desc,path_asc");
+        let kept: usize = [
+            "likely_files",
+            "cochange_expansions",
+            "import_expansions",
+            "likely_tests",
+        ]
+        .iter()
+        .map(|k| array_len(&result, k))
+        .sum();
+        // 1 anchor + 5 co-change + 8 imports = 14 candidates before the budget;
+        // each is kept (whole or minimal) or counted, and 12 were cap-cut.
+        assert_eq!(
+            pack["omitted_count"].as_u64().unwrap() as usize + kept,
+            14 + 12,
+            "{pack}"
+        );
+        assert!(pack["omitted"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["reason"] == "over_budget"));
+        // Same call again: identical bytes.
+        let again = engram.call_tool("expand_connections", &args).unwrap();
+        assert_eq!(text, budget::render(&again));
+    }
+
+    #[test]
+    fn expand_connections_ignores_the_order_and_repetition_of_paths() {
+        let (_repo, mut engram) = fan_repo();
+        let call = |engram: &mut Engram, paths: Value| {
+            budget::render(
+                &engram
+                    .call_tool(
+                        "expand_connections",
+                        &json!({ "paths": paths, "budget_tokens": 600 }),
+                    )
+                    .unwrap(),
+            )
+        };
+        let a = call(&mut engram, json!(["app/anchor.py", "app/mid.py"]));
+        let b = call(
+            &mut engram,
+            json!(["app/mid.py", "app/anchor.py", "app/mid.py"]),
+        );
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn max_hops_one_excludes_two_hop_dependents_and_out_of_range_is_an_error() {
+        let (_repo, mut engram) = fan_repo();
+        let imports = |result: &Value| -> Vec<String> {
+            result["import_expansions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p["path"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        // chain_b imports the anchor directly, chain_c only through chain_b.
+        let chain = |engram: &mut Engram, extra: Value| {
+            let mut args = json!({ "paths": ["app/chain_a.py"] });
+            args.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            engram.call_tool("expand_connections", &args).unwrap()
+        };
+        assert_eq!(
+            imports(&chain(&mut engram, json!({}))),
+            ["app/chain_b.py", "app/chain_c.py"]
+        );
+        assert_eq!(
+            imports(&chain(&mut engram, json!({ "max_hops": 2 }))),
+            ["app/chain_b.py", "app/chain_c.py"]
+        );
+        let hop1 = chain(&mut engram, json!({ "max_hops": 1 }));
+        assert_eq!(imports(&hop1), ["app/chain_b.py"]);
+        assert!(!budget::render(&hop1).contains("chain_c"), "{hop1}");
+        assert_eq!(hop1["pack"]["omitted_count"], 0);
+        let anchor_two = engram
+            .call_tool(
+                "expand_connections",
+                &json!({ "paths": ["app/anchor.py"], "max_hops": 2 }),
+            )
+            .unwrap();
+        assert!(anchor_two["pack"]["omitted"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["path"] == "app/top.py"));
+        let default = engram
+            .call_tool("expand_connections", &json!({ "paths": ["app/anchor.py"] }))
+            .unwrap();
+        assert_eq!(budget::render(&default), budget::render(&anchor_two));
+
+        let one = engram
+            .call_tool(
+                "expand_connections",
+                &json!({ "paths": ["app/anchor.py"], "max_hops": 1 }),
+            )
+            .unwrap();
+        // top is not merely hidden: it is neither returned nor counted.
+        assert!(!budget::render(&one).contains("app/top.py"));
+        assert_eq!(array_len(&one, "import_expansions"), 8);
+        assert_eq!(one["pack"]["omitted_count"], 7 + 4);
+
+        for bad in [json!(0), json!(3), json!(-1), json!("1"), json!(1.5)] {
+            let err = engram
+                .call_tool(
+                    "expand_connections",
+                    &json!({ "paths": ["app/anchor.py"], "max_hops": bad }),
+                )
+                .expect_err("max_hops outside 1..=2 must be an error");
+            assert!(err.contains("max_hops"), "{err}");
+        }
+        // The deprecated alias takes the new arguments too.
+        let alias = engram
+            .call_tool(
+                "find_connected_files",
+                &json!({ "files": ["app/anchor.py"], "max_hops": 3 }),
+            )
+            .expect_err("alias validates max_hops too");
+        assert!(alias.contains("max_hops"), "{alias}");
+    }
+
+    #[test]
+    fn a_snapshot_other_than_the_current_one_is_flagged_never_silently_served() {
+        let repo = billing_repo(&[0, 1, 2]);
+        let mut engram = ready_engram(&repo);
+        let current = engram
+            .call_tool("search_context", &json!({ "query": BILLING_QUERY }))
+            .unwrap()["snapshot"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        for (tool, args) in [
+            ("search_context", json!({ "query": BILLING_QUERY })),
+            ("get_task_context", json!({ "task": BILLING_QUERY })),
+            ("expand_connections", json!({ "paths": ["src/svc00.py"] })),
+            ("find_connected_files", json!({ "files": ["src/svc00.py"] })),
+        ] {
+            let mut stale = args.clone();
+            stale["snapshot"] = json!("snap-from-yesterday");
+            let r = engram.call_tool(tool, &stale).unwrap();
+            assert_eq!(r["snapshot"], current.as_str(), "{tool}");
+            assert_eq!(
+                r["snapshot_mismatch"],
+                json!({ "requested": "snap-from-yesterday", "current": current }),
+                "{tool}"
+            );
+            let mut same = args.clone();
+            same["snapshot"] = json!(current);
+            let r = engram.call_tool(tool, &same).unwrap();
+            assert!(r.get("snapshot_mismatch").is_none(), "{tool}: {r}");
+            assert!(engram
+                .call_tool(tool, &args)
+                .unwrap()
+                .get("snapshot_mismatch")
+                .is_none());
+        }
+        let err = engram
+            .call_tool("search_context", &json!({ "query": "x", "snapshot": 7 }))
+            .expect_err("snapshot must be a string");
+        assert!(err.contains("snapshot"), "{err}");
+    }
+
+    #[test]
+    fn a_budget_that_is_not_a_positive_integer_is_an_error() {
+        let repo = billing_repo(&[0]);
+        let mut engram = ready_engram(&repo);
+        for bad in [json!(0), json!(-5), json!("2000"), json!(12.5), json!(true)] {
+            let err = engram
+                .call_tool(
+                    "search_context",
+                    &json!({ "query": BILLING_QUERY, "budget_tokens": bad }),
+                )
+                .expect_err("invalid budget_tokens must be an error");
+            assert!(err.contains("budget_tokens"), "{err}");
+        }
+        // null means "no budget", like leaving it out.
+        let r = engram
+            .call_tool(
+                "search_context",
+                &json!({ "query": BILLING_QUERY, "budget_tokens": null }),
+            )
+            .unwrap();
+        assert_eq!(r["pack"]["budget_tokens"], Value::Null);
+    }
+
+    #[test]
+    fn the_schemas_advertise_budget_hops_and_snapshot() {
+        let repo = TempRepo::new();
+        let engram = Engram::start_with(repo.0.clone(), false, || Ok(()));
+        let tools = engram.list_tools();
+        let props = |name: &str| -> Value {
+            tools["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["name"] == name)
+                .unwrap()["inputSchema"]["properties"]
+                .clone()
+        };
+        for tool in ["search_context", "get_task_context"] {
+            let p = props(tool);
+            assert_eq!(p["budget_tokens"]["type"], "integer", "{tool}");
+            assert_eq!(p["budget_tokens"]["minimum"], 1, "{tool}");
+            assert_eq!(p["snapshot"]["type"], "string", "{tool}");
+        }
+        for tool in ["expand_connections", "find_connected_files"] {
+            let p = props(tool);
+            assert_eq!(p["budget_tokens"]["minimum"], 1, "{tool}");
+            assert_eq!(p["max_hops"]["minimum"], 1, "{tool}");
+            assert_eq!(p["max_hops"]["maximum"], 2, "{tool}");
+            assert_eq!(p["max_hops"]["default"], 2, "{tool}");
+            assert_eq!(p["snapshot"]["type"], "string", "{tool}");
+        }
     }
 }

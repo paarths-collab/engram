@@ -226,6 +226,12 @@ pub struct EvidencePacket {
     pub symbol: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snippet: Option<String>,
+    /// One-based first line of the definition this packet quotes, when known.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub start_line: Option<usize>,
+    /// Last line of that definition, inclusive, when known.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub end_line: Option<usize>,
     pub score: f32,
     /// Which signals contributed (bm25, vector, symbol, path, cochange).
     pub signals: Vec<String>,
@@ -248,6 +254,19 @@ pub struct ImpactPrediction {
     pub cochange_expansions: Vec<ScoredPath>,
     /// Files that statically import one of the direct hits (import-graph expansion).
     pub import_expansions: Vec<ScoredPath>,
+    /// Expansion candidates that existed but were cut by a recommendation cap
+    /// (per-anchor co-change top-N, or the per-kind result limit). Never
+    /// serialized with the prediction itself; the pack layer discloses them.
+    #[serde(skip)]
+    pub dropped: Vec<DroppedCandidate>,
+}
+
+/// An expansion candidate withheld by a recommendation cap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DroppedCandidate {
+    pub path: String,
+    /// `"cochange"` or `"import"`.
+    pub kind: &'static str,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

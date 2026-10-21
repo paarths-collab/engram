@@ -1,6 +1,7 @@
 //! engram-retrieval: hybrid BM25 (Tantivy) + vector (cosine) retrieval with
 //! score fusion, lazy Tier-1 extraction on miss, and co-change impact expansion.
 
+pub mod budget;
 pub mod embed;
 pub mod stopwords;
 pub mod weights;
@@ -9,8 +10,8 @@ use anyhow::Result;
 use embed::{cosine, Embedder, HashedNgramEmbedder};
 use engram_domain::{
     CoChangeDirection, CoChangeWindow, ConnectionExplanation, ConnectionReason, ConnectionScope,
-    ConnectionStatus, EvidenceKind, EvidencePacket, ImpactPrediction, ImportDirection, ImportEdge,
-    ImportSearchOutcome, ScoredPath, SymbolRecord,
+    ConnectionStatus, DroppedCandidate, EvidenceKind, EvidencePacket, ImpactPrediction,
+    ImportDirection, ImportEdge, ImportSearchOutcome, ScoredPath, SymbolRecord,
 };
 use engram_repo_map::graph::{CodeGraph, EdgeKind, ImportSearch};
 use engram_repo_map::store::Store;
@@ -60,6 +61,8 @@ struct Chunk {
     symbol: Option<String>,
     /// One-based; `0` for the head chunk. Doubles as the cache key.
     start_line: usize,
+    /// Last line of the symbol's span, inclusive; `0` for the head chunk.
+    end_line: usize,
     /// The span's source text, capped at [`CHUNK_BYTES`]. Returned as the
     /// snippet, so evidence quotes the matching definition itself.
     text: String,
@@ -97,6 +100,13 @@ pub struct Engine {
 /// Longest import chain the import graph is searched for, shared by the
 /// expansion path and `explain_connection`.
 const MAX_IMPORT_HOPS: usize = 2;
+/// Co-change rows kept per anchor file.
+const COCHANGE_PER_SEED: usize = 5;
+/// Entries kept per expansion kind (co-change, imports).
+const EXPANSION_CAP: usize = 8;
+/// Rows read per anchor so the ones past the per-anchor cap can be counted.
+/// Far above any real fan-out; SQLite's LIMIT is applied in the query.
+const COCHANGE_SCAN_LIMIT: usize = 100_000;
 /// Import edges come from matching module names against file paths, not from a
 /// compiler, so every import fact is labelled with how it was resolved.
 const IMPORT_RESOLUTION: &str = "heuristic";
@@ -240,10 +250,19 @@ impl Engine {
                     ));
                 }
                 present.insert(key);
+                let end_line = symbol
+                    .as_deref()
+                    .and_then(|name| {
+                        symbols
+                            .iter()
+                            .find(|s| s.start_line == start_line && s.name == name)
+                    })
+                    .map_or(0, |s| s.end_line);
                 chunks.push(Chunk {
                     doc: doc_index,
                     symbol,
                     start_line,
+                    end_line,
                     text,
                     vector,
                 });
@@ -397,7 +416,9 @@ impl Engine {
             .into_iter()
             .map(|(doc, (score, chunk))| (doc, score, chunk))
             .collect();
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        // Total order: equal scores fall back to the doc index (files are
+        // indexed in a fixed order), never to HashMap iteration order.
+        scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         scored.truncate(k);
         scored
     }
@@ -417,6 +438,18 @@ impl Engine {
         query: &str,
         top_k: usize,
     ) -> Result<Vec<EvidencePacket>> {
+        Ok(self.search_with_outcome(store, query, top_k)?.packets)
+    }
+
+    /// [`Engine::search`], also reporting what the result caps cut off, so a
+    /// caller can disclose it instead of presenting the capped list as the
+    /// whole answer. The returned `packets` are exactly what `search` returns.
+    pub fn search_with_outcome(
+        &mut self,
+        store: &mut Store,
+        query: &str,
+        top_k: usize,
+    ) -> Result<SearchOutcome> {
         // Dev hot-reload: pick up config/scoring.toml edits without a restart.
         self.config.reload_if_changed();
         let bm25 = self.bm25_candidates(query, 50);
@@ -496,7 +529,14 @@ impl Engine {
 
         let mut ranked: Vec<(usize, f32, Vec<String>)> =
             fused.into_iter().map(|(i, (s, sig))| (i, s, sig)).collect();
-        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        // Total order, so the top_k cut and the packet ids never depend on
+        // HashMap iteration order: score desc, then path asc, then doc index.
+        ranked.sort_by(|a, b| {
+            b.1.total_cmp(&a.1)
+                .then_with(|| self.docs[a.0].path.cmp(&self.docs[b.0].path))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        let beyond_first_cap = ranked.len().saturating_sub(top_k);
         ranked.truncate(top_k);
 
         // lazy Tier-1: ensure symbols exist for top hits, then attach best symbols
@@ -513,7 +553,7 @@ impl Engine {
                 .get(i)
                 .map(|&index| &self.chunks[index])
                 .filter(|chunk| chunk.symbol.is_some());
-            let (title, symbol, snippet) = match matched_span {
+            let (title, symbol, snippet, span) = match matched_span {
                 Some(chunk) => {
                     let name = chunk.symbol.clone().unwrap_or_default();
                     // path:line, so the agent can open the definition directly
@@ -522,6 +562,7 @@ impl Engine {
                         format!("{} in {}:{}", name, d.path, chunk.start_line),
                         Some(name),
                         Some(chunk.text.clone()),
+                        line_span(chunk.start_line, chunk.end_line),
                     )
                 }
                 None => match best_symbols_for(store, &d.path, &q_tokens).first() {
@@ -529,8 +570,9 @@ impl Engine {
                         format!("{} in {}", s.name, d.path),
                         Some(s.name.clone()),
                         Some(s.signature.clone()),
+                        line_span(s.start_line, s.end_line),
                     ),
-                    None => (d.path.clone(), None, Some(d.preview.clone())),
+                    None => (d.path.clone(), None, Some(d.preview.clone()), None),
                 },
             };
             packets.push(EvidencePacket {
@@ -546,6 +588,8 @@ impl Engine {
                 path: d.path.clone(),
                 symbol,
                 snippet,
+                start_line: span.map(|(start, _)| start),
+                end_line: span.map(|(_, end)| end),
                 score: *score,
                 signals: signals.clone(),
             });
@@ -574,6 +618,8 @@ impl Engine {
                     path: s.path.clone(),
                     symbol: Some(s.name.clone()),
                     snippet: Some(s.signature.clone()),
+                    start_line: line_span(s.start_line, s.end_line).map(|(start, _)| start),
+                    end_line: line_span(s.start_line, s.end_line).map(|(_, end)| end),
                     score: exact_score,
                     signals: vec!["symbol_exact".into()],
                 });
@@ -593,6 +639,8 @@ impl Engine {
                     path: s.path.clone(),
                     symbol: Some(s.name.clone()),
                     snippet: Some(s.signature.clone()),
+                    start_line: line_span(s.start_line, s.end_line).map(|(start, _)| start),
+                    end_line: line_span(s.start_line, s.end_line).map(|(_, end)| end),
                     score: self.config.weights.symbol_exact,
                     signals: vec!["symbol".into()],
                 });
@@ -603,13 +651,14 @@ impl Engine {
         // inserted in score order, so without this an exact match sits below
         // whatever fusion put in the first top_k slots and gets truncated away
         // — which is exactly how the langchain `merge_dicts` miss happened.
-        packets.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        packets.truncate(top_k + 3);
-        Ok(packets)
+        packets.sort_by(budget::compare_packets);
+        let cap = (top_k + 3).min(packets.len());
+        let cap_dropped = packets.split_off(cap);
+        Ok(SearchOutcome {
+            packets,
+            cap_dropped,
+            beyond_first_cap,
+        })
     }
 
     /// predict_impact: hybrid hits = direct; co-change graph = historical expansion.
@@ -633,8 +682,8 @@ impl Engine {
             }
         }
 
-        let (cochange_expansions, import_expansions, mut expansion_tests) =
-            self.expand_from_seeds(store, &seeds)?;
+        let (cochange_expansions, import_expansions, mut expansion_tests, dropped) =
+            self.expand_from_seeds(store, &seeds, MAX_IMPORT_HOPS)?;
         likely_tests.append(&mut expansion_tests);
         likely_tests.sort();
         likely_tests.dedup();
@@ -644,6 +693,7 @@ impl Engine {
             likely_tests,
             cochange_expansions,
             import_expansions,
+            dropped,
         })
     }
 
@@ -659,11 +709,32 @@ impl Engine {
         store: &mut Store,
         anchors: &[String],
     ) -> Result<ImpactPrediction> {
-        let known: Vec<String> = anchors
+        self.impact_from_files_with(store, anchors, MAX_IMPORT_HOPS)
+    }
+
+    /// [`Engine::impact_from_files`] with an explicit import-traversal depth.
+    /// `max_hops` must be in `1..=2`; anything else is an error rather than a
+    /// silent clamp. The result also lists, in `dropped`, every candidate the
+    /// recommendation caps cut, so callers can disclose them.
+    ///
+    /// Anchors are de-duplicated and sorted, so the result does not depend on
+    /// the order the caller listed them in.
+    pub fn impact_from_files_with(
+        &mut self,
+        store: &mut Store,
+        anchors: &[String],
+        max_hops: usize,
+    ) -> Result<ImpactPrediction> {
+        if !(1..=MAX_IMPORT_HOPS).contains(&max_hops) {
+            anyhow::bail!("max_hops must be between 1 and {MAX_IMPORT_HOPS}, got {max_hops}");
+        }
+        let mut known: Vec<String> = anchors
             .iter()
             .filter(|p| self.by_path.contains_key(p.as_str()))
             .cloned()
             .collect();
+        known.sort();
+        known.dedup();
         let likely_files: Vec<ScoredPath> = known
             .iter()
             .map(|path| ScoredPath {
@@ -678,8 +749,8 @@ impl Engine {
             .cloned()
             .collect();
 
-        let (cochange_expansions, import_expansions, mut expansion_tests) =
-            self.expand_from_seeds(store, &known)?;
+        let (cochange_expansions, import_expansions, mut expansion_tests, dropped) =
+            self.expand_from_seeds(store, &known, max_hops)?;
         likely_tests.append(&mut expansion_tests);
         likely_tests.sort();
         likely_tests.dedup();
@@ -689,6 +760,7 @@ impl Engine {
             likely_tests,
             cochange_expansions,
             import_expansions,
+            dropped,
         })
     }
 
@@ -840,17 +912,37 @@ impl Engine {
     }
 
     /// Shared deterministic expansion: co-change graph (git history fact) +
-    /// import graph (static-analysis fact, up to 2 hops), excluding files
-    /// already in `seeds`/`likely`. Returns (cochange, imports, discovered_tests).
+    /// import graph (static-analysis fact, up to `max_hops` hops), excluding
+    /// files already in `seeds`/`likely`. Returns (cochange, imports,
+    /// discovered_tests, dropped), where `dropped` lists every candidate a cap
+    /// withheld. The caps themselves are unchanged.
+    #[allow(clippy::type_complexity)]
     fn expand_from_seeds(
         &self,
         store: &mut Store,
         seeds: &[String],
-    ) -> Result<(Vec<ScoredPath>, Vec<ScoredPath>, Vec<String>)> {
+        max_hops: usize,
+    ) -> Result<(
+        Vec<ScoredPath>,
+        Vec<ScoredPath>,
+        Vec<String>,
+        Vec<DroppedCandidate>,
+    )> {
         let mut likely_tests = Vec::new();
         let mut expansions: HashMap<String, (f32, String)> = HashMap::new();
+        let mut beyond_seed_cap: Vec<String> = Vec::new();
         for seed in seeds {
-            for edge in store.cochange_for(seed, 5)? {
+            // Read every row, order it totally (strength desc, then path), and
+            // keep the first COCHANGE_PER_SEED as the cap always did. The rows
+            // past the cap are what gets disclosed.
+            let mut rows = store.cochange_for(seed, COCHANGE_SCAN_LIMIT)?;
+            rows.sort_by(|a, b| {
+                b.strength
+                    .total_cmp(&a.strength)
+                    .then_with(|| a.path_b.cmp(&b.path_b))
+            });
+            let cut = rows.len().min(COCHANGE_PER_SEED);
+            for edge in &rows[..cut] {
                 if self.by_path.contains_key(&edge.path_b) && !seeds.contains(&edge.path_b) {
                     let e = expansions
                         .entry(edge.path_b.clone())
@@ -866,7 +958,17 @@ impl Engine {
                     }
                 }
             }
+            for edge in &rows[cut..] {
+                if self.by_path.contains_key(&edge.path_b) && !seeds.contains(&edge.path_b) {
+                    beyond_seed_cap.push(edge.path_b.clone());
+                }
+            }
         }
+        // A path cut for one anchor but kept for another was not dropped.
+        let mut dropped_cochange: Vec<String> = beyond_seed_cap
+            .into_iter()
+            .filter(|p| !expansions.contains_key(p))
+            .collect();
 
         let mut cochange_expansions: Vec<ScoredPath> = expansions
             .into_iter()
@@ -881,22 +983,26 @@ impl Engine {
                 }
             })
             .collect();
-        cochange_expansions.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
-        cochange_expansions.truncate(8);
+        cochange_expansions.sort_by(by_confidence_then_path);
+        if cochange_expansions.len() > EXPANSION_CAP {
+            dropped_cochange.extend(
+                cochange_expansions
+                    .split_off(EXPANSION_CAP)
+                    .into_iter()
+                    .map(|c| c.path),
+            );
+        }
 
         // Import-graph expansion via the in-memory code graph: files that
-        // (transitively, up to 2 hops) import a seed. SQL stores the edges;
-        // we traverse them in memory (see docs/adr/0001).
+        // (transitively, up to `max_hops` hops) import a seed. SQL stores the
+        // edges; we traverse them in memory (see docs/adr/0001).
         let seed_paths: HashSet<&str> = seeds.iter().map(|s| s.as_str()).collect();
         let cochange_paths: HashSet<&str> = cochange_expansions
             .iter()
             .map(|c| c.path.as_str())
             .collect();
         let mut import_expansions: Vec<ScoredPath> = Vec::new();
-        for hit in self
-            .graph
-            .dependents(seeds, &[EdgeKind::Imports], MAX_IMPORT_HOPS)
-        {
+        for hit in self.graph.dependents(seeds, &[EdgeKind::Imports], max_hops) {
             if seed_paths.contains(hit.path.as_str()) || cochange_paths.contains(hit.path.as_str())
             {
                 continue;
@@ -918,11 +1024,65 @@ impl Engine {
                 },
             });
         }
-        import_expansions.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
-        import_expansions.truncate(8);
+        import_expansions.sort_by(by_confidence_then_path);
+        let dropped_import: Vec<String> = if import_expansions.len() > EXPANSION_CAP {
+            import_expansions
+                .split_off(EXPANSION_CAP)
+                .into_iter()
+                .map(|c| c.path)
+                .collect()
+        } else {
+            Vec::new()
+        };
 
-        Ok((cochange_expansions, import_expansions, likely_tests))
+        dropped_cochange.sort();
+        dropped_cochange.dedup();
+        let mut dropped: Vec<DroppedCandidate> = dropped_cochange
+            .into_iter()
+            .map(|path| DroppedCandidate {
+                path,
+                kind: "cochange",
+            })
+            .collect();
+        dropped.extend(dropped_import.into_iter().map(|path| DroppedCandidate {
+            path,
+            kind: "import",
+        }));
+
+        Ok((
+            cochange_expansions,
+            import_expansions,
+            likely_tests,
+            dropped,
+        ))
     }
+}
+
+/// Confidence descending, then path ascending: a total order, so equal
+/// confidences never fall back to hash-map or traversal order.
+fn by_confidence_then_path(a: &ScoredPath, b: &ScoredPath) -> std::cmp::Ordering {
+    b.confidence
+        .total_cmp(&a.confidence)
+        .then_with(|| a.path.cmp(&b.path))
+}
+
+/// What [`Engine::search_with_outcome`] returns: the packets `search` returns,
+/// plus what its two result caps cut.
+#[derive(Debug, Clone)]
+pub struct SearchOutcome {
+    pub packets: Vec<EvidencePacket>,
+    /// Packets that were built and ranked but fell past the final cap
+    /// (`top_k + 3`), in rank order.
+    pub cap_dropped: Vec<EvidencePacket>,
+    /// Fused candidates cut by the first cap (`top_k`) before any packet was
+    /// built. Counted, not enumerated.
+    pub beyond_first_cap: usize,
+}
+
+/// A symbol's `(start, end)` line span, or `None` for the zero spans a
+/// pre-span database holds.
+fn line_span(start: usize, end: usize) -> Option<(usize, usize)> {
+    (start > 0 && end >= start).then_some((start, end))
 }
 
 fn best_symbols_for(store: &Store, path: &str, q_tokens: &[String]) -> Vec<SymbolRecord> {
@@ -1676,5 +1836,266 @@ fn second() {
             two.contains("2 hops") && two.contains("imports a file that imports"),
             "{two}"
         );
+    }
+
+    /// One anchor, `partners` indexed files it co-changed with (strengths
+    /// strictly decreasing, so the ranking is unambiguous) and `importers`
+    /// indexed files that import it.
+    fn fan_fixture(tag: &str, partners: usize, importers: usize) -> (TempRepo, Store, Engine) {
+        use engram_domain::{FileRecord, Language};
+        let repo = TempRepo::new(tag);
+        std::fs::create_dir_all(repo.0.join("app")).unwrap();
+        let mut names = vec!["anchor".to_owned(), "other".to_owned()];
+        names.extend((0..partners).map(|i| format!("p{i:02}")));
+        names.extend((0..importers).map(|i| format!("imp{i:02}")));
+        let mut files = Vec::new();
+        for n in &names {
+            std::fs::write(
+                repo.0.join(format!("app/{n}.py")),
+                format!("def {n}(): pass\n"),
+            )
+            .unwrap();
+            files.push(FileRecord {
+                path: format!("app/{n}.py"),
+                language: Language::Python,
+                size_bytes: 10,
+                is_test: false,
+            });
+        }
+        let mut store = Store::open(&repo.0).expect("open store");
+        store.upsert_files(&files).expect("upsert files");
+        for i in 0..importers {
+            store
+                .replace_imports_for_file(&format!("app/imp{i:02}.py"), &["anchor".to_owned()])
+                .unwrap();
+        }
+        let edges: Vec<_> = (0..partners)
+            .map(|i| {
+                cochange(
+                    "app/anchor.py",
+                    &format!("app/p{i:02}.py"),
+                    50 - i as u32,
+                    0.9 - i as f32 * 0.01,
+                )
+            })
+            .collect();
+        store.replace_cochange(&edges).unwrap();
+        let engine = Engine::build(&repo.0, &mut store).expect("build engine");
+        (repo, store, engine)
+    }
+
+    fn dropped_of(impact: &ImpactPrediction, kind: &str) -> Vec<String> {
+        impact
+            .dropped
+            .iter()
+            .filter(|d| d.kind == kind)
+            .map(|d| d.path.clone())
+            .collect()
+    }
+
+    #[test]
+    fn cap_disclosure_counts_the_cochange_rows_past_the_per_anchor_cap() {
+        let (_repo, mut store, mut engine) = fan_fixture("cap-per-anchor", 12, 0);
+        let impact = engine
+            .impact_from_files(&mut store, &["app/anchor.py".to_owned()])
+            .unwrap();
+        // Unchanged behaviour: the top five by strength are returned.
+        let returned: Vec<&str> = impact
+            .cochange_expansions
+            .iter()
+            .map(|p| p.path.as_str())
+            .collect();
+        assert_eq!(
+            returned,
+            [
+                "app/p00.py",
+                "app/p01.py",
+                "app/p02.py",
+                "app/p03.py",
+                "app/p04.py"
+            ]
+        );
+        // Disclosure: exactly the seven that were cut, none of the returned.
+        let dropped = dropped_of(&impact, "cochange");
+        assert_eq!(dropped.len(), 7, "{dropped:?}");
+        assert_eq!(dropped.len() + returned.len(), 12);
+        assert!(dropped.iter().all(|d| !returned.contains(&d.as_str())));
+        assert!(dropped.contains(&"app/p11.py".to_owned()));
+        assert!(dropped_of(&impact, "import").is_empty());
+    }
+
+    #[test]
+    fn cap_disclosure_counts_entries_past_the_per_kind_limit() {
+        // Two anchors with five distinct partners each: ten unique candidates
+        // survive the per-anchor cap, eight are returned, two are cut.
+        let (_repo, mut store, mut engine) = fan_fixture("cap-per-kind", 10, 11);
+        store
+            .replace_cochange(
+                &(0..5)
+                    .map(|i| cochange("app/anchor.py", &format!("app/p{i:02}.py"), 9, 0.9))
+                    .chain(
+                        (5..10)
+                            .map(|i| cochange("app/other.py", &format!("app/p{i:02}.py"), 9, 0.5)),
+                    )
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        let impact = engine
+            .impact_from_files(
+                &mut store,
+                &["app/anchor.py".to_owned(), "app/other.py".to_owned()],
+            )
+            .unwrap();
+        assert_eq!(impact.cochange_expansions.len(), 8);
+        let dropped_co = dropped_of(&impact, "cochange");
+        assert_eq!(dropped_co, ["app/p08.py", "app/p09.py"]);
+
+        // Eleven direct importers, eight returned, three cut.
+        assert_eq!(impact.import_expansions.len(), 8);
+        let dropped_imp = dropped_of(&impact, "import");
+        assert_eq!(dropped_imp.len(), 3, "{dropped_imp:?}");
+        let returned: Vec<&str> = impact
+            .import_expansions
+            .iter()
+            .map(|p| p.path.as_str())
+            .collect();
+        assert!(dropped_imp.iter().all(|d| !returned.contains(&d.as_str())));
+        // Equal confidence is ordered by path, so the cut is the last three.
+        assert_eq!(
+            dropped_imp,
+            ["app/imp08.py", "app/imp09.py", "app/imp10.py"]
+        );
+    }
+
+    #[test]
+    fn nothing_is_disclosed_when_no_cap_applied() {
+        let (_repo, mut store, mut engine) = fan_fixture("cap-none", 3, 2);
+        let impact = engine
+            .impact_from_files(&mut store, &["app/anchor.py".to_owned()])
+            .unwrap();
+        assert_eq!(impact.cochange_expansions.len(), 3);
+        assert_eq!(impact.import_expansions.len(), 2);
+        assert!(impact.dropped.is_empty(), "{:?}", impact.dropped);
+        // The disclosure is not part of the prediction's own JSON.
+        let json = serde_json::to_value(&impact).unwrap();
+        assert!(json.get("dropped").is_none());
+    }
+
+    #[test]
+    fn expansion_ignores_anchor_order_and_duplicates() {
+        let (_repo, mut store, mut engine) = fan_fixture("anchor-order", 12, 3);
+        let run = |engine: &mut Engine, store: &mut Store, anchors: &[&str]| {
+            let anchors: Vec<String> = anchors.iter().map(|s| (*s).to_owned()).collect();
+            let impact = engine.impact_from_files(store, &anchors).unwrap();
+            (
+                serde_json::to_string(&impact).unwrap(),
+                impact
+                    .dropped
+                    .iter()
+                    .map(|d| (d.kind, d.path.clone()))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let a = run(&mut engine, &mut store, &["app/anchor.py", "app/other.py"]);
+        let b = run(
+            &mut engine,
+            &mut store,
+            &["app/other.py", "app/anchor.py", "app/anchor.py"],
+        );
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn max_hops_one_excludes_two_hop_dependents() {
+        let (_repo, mut store, mut engine) = connection_fixture("hops");
+        let anchors = ["app/gamma.py".to_owned()];
+        let paths = |impact: &ImpactPrediction| -> Vec<String> {
+            impact
+                .import_expansions
+                .iter()
+                .map(|p| p.path.clone())
+                .collect()
+        };
+        let default = engine.impact_from_files(&mut store, &anchors).unwrap();
+        assert_eq!(paths(&default), ["app/beta.py", "app/alpha.py"]);
+        let two = engine
+            .impact_from_files_with(&mut store, &anchors, 2)
+            .unwrap();
+        assert_eq!(paths(&two), paths(&default));
+        let one = engine
+            .impact_from_files_with(&mut store, &anchors, 1)
+            .unwrap();
+        assert_eq!(paths(&one), ["app/beta.py"]);
+    }
+
+    #[test]
+    fn max_hops_outside_one_to_two_is_an_error() {
+        let (_repo, mut store, mut engine) = connection_fixture("hops-bad");
+        for bad in [0, 3, 10] {
+            let err = engine
+                .impact_from_files_with(&mut store, &["app/gamma.py".to_owned()], bad)
+                .expect_err("out-of-range max_hops must fail");
+            assert!(err.to_string().contains("max_hops"), "{err}");
+        }
+    }
+
+    /// Twelve files with identical contents: every score ties, so the order
+    /// can only come from the tie-break rules.
+    fn tied_corpus(tag: &str, reversed: bool) -> (TempRepo, Store, Engine) {
+        use engram_domain::{FileRecord, Language};
+        let repo = TempRepo::new(tag);
+        std::fs::create_dir_all(repo.0.join("src")).unwrap();
+        let mut files: Vec<FileRecord> = (0..12)
+            .map(|i| FileRecord {
+                path: format!("src/twin{i:02}.py"),
+                language: Language::Python,
+                size_bytes: 10,
+                is_test: false,
+            })
+            .collect();
+        for f in &files {
+            std::fs::write(
+                repo.0.join(&f.path),
+                "def retry_handler():\n    return 'retry the webhook'\n",
+            )
+            .unwrap();
+        }
+        if reversed {
+            files.reverse();
+        }
+        let mut store = Store::open(&repo.0).expect("open store");
+        store.upsert_files(&files).expect("upsert files");
+        let engine = Engine::build(&repo.0, &mut store).expect("build engine");
+        (repo, store, engine)
+    }
+
+    #[test]
+    fn search_order_is_total_and_ignores_the_order_files_were_indexed_in() {
+        let render = |outcome: &SearchOutcome| {
+            serde_json::to_string(&(&outcome.packets, &outcome.cap_dropped)).unwrap()
+        };
+        let (_a, mut store_a, mut engine_a) = tied_corpus("tied-forward", false);
+        let first = engine_a
+            .search_with_outcome(&mut store_a, "retry webhook handler", 8)
+            .unwrap();
+        let again = engine_a
+            .search_with_outcome(&mut store_a, "retry webhook handler", 8)
+            .unwrap();
+        assert_eq!(render(&first), render(&again));
+
+        let (_b, mut store_b, mut engine_b) = tied_corpus("tied-reversed", true);
+        let other = engine_b
+            .search_with_outcome(&mut store_b, "retry webhook handler", 8)
+            .unwrap();
+        assert_eq!(render(&first), render(&other));
+
+        // Ordered by the documented total order, ties broken by path.
+        let mut sorted = first.packets.clone();
+        sorted.sort_by(budget::compare_packets);
+        assert_eq!(
+            sorted.iter().map(|p| &p.id).collect::<Vec<_>>(),
+            first.packets.iter().map(|p| &p.id).collect::<Vec<_>>()
+        );
+        assert!(first.packets.len() > 1);
     }
 }
