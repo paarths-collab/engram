@@ -9,7 +9,7 @@ use crate::imports::{crate_manifest_for, module_needles, package_name};
 use crate::store::Store;
 use anyhow::Result;
 use petgraph::graph::{DiGraph, NodeIndex};
-use petgraph::Direction::Incoming;
+use petgraph::Direction::{Incoming, Outgoing};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 
@@ -170,6 +170,83 @@ impl CodeGraph {
         }
         hits
     }
+
+    /// Shortest import chain `from -> ... -> to` of at most `max_hops` import
+    /// edges, following edges in their own direction (`from` imports the next
+    /// file, and so on). Returns every file on the chain, endpoints included,
+    /// so a 2-hop result names the intermediate file. `None` when `from == to`,
+    /// either file is not in the graph, or no chain within the bound exists.
+    /// Only [`EdgeKind::Imports`] edges are followed. See [`Self::import_search`]
+    /// for the variant that distinguishes "no chain" from "stopped at the bound".
+    pub fn import_path(&self, from: &str, to: &str, max_hops: usize) -> Option<Vec<String>> {
+        match self.import_search(from, to, max_hops) {
+            ImportSearch::Found(chain) => Some(chain),
+            _ => None,
+        }
+    }
+
+    /// Like [`Self::import_path`], but reports whether a negative answer is
+    /// conclusive. `BeyondBound` means no chain was found within `max_hops`
+    /// yet import edges lead to files not explored at the bound, so a longer
+    /// chain cannot be ruled out.
+    pub fn import_search(&self, from: &str, to: &str, max_hops: usize) -> ImportSearch {
+        use petgraph::visit::EdgeRef;
+        let (Some(&start), Some(&goal)) = (self.idx.get(from), self.idx.get(to)) else {
+            return ImportSearch::None;
+        };
+        if start == goal {
+            return ImportSearch::None;
+        }
+        let mut pred: HashMap<NodeIndex, NodeIndex> = HashMap::new();
+        let mut visited: HashSet<NodeIndex> = HashSet::from([start]);
+        let mut queue: VecDeque<(NodeIndex, usize)> = VecDeque::from([(start, 0)]);
+        let mut frontier_remains = false;
+        while let Some((node, hops)) = queue.pop_front() {
+            for edge in self.g.edges_directed(node, Outgoing) {
+                if *edge.weight() != EdgeKind::Imports {
+                    continue;
+                }
+                let next = edge.target();
+                if visited.contains(&next) {
+                    continue;
+                }
+                if hops >= max_hops {
+                    // An unexplored import edge past the bound.
+                    frontier_remains = true;
+                    continue;
+                }
+                visited.insert(next);
+                pred.insert(next, node);
+                if next == goal {
+                    let mut chain = vec![self.rev[goal.index()].clone()];
+                    let mut cur = goal;
+                    while let Some(&p) = pred.get(&cur) {
+                        chain.push(self.rev[p.index()].clone());
+                        cur = p;
+                    }
+                    chain.reverse();
+                    return ImportSearch::Found(chain);
+                }
+                queue.push_back((next, hops + 1));
+            }
+        }
+        if frontier_remains {
+            ImportSearch::BeyondBound
+        } else {
+            ImportSearch::None
+        }
+    }
+}
+
+/// Outcome of a bounded directed import search.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImportSearch {
+    /// Shortest chain, endpoints included.
+    Found(Vec<String>),
+    /// The reachable import neighbourhood was exhausted; no chain exists.
+    None,
+    /// No chain within the bound, but imports continue past it.
+    BeyondBound,
 }
 
 /// Candidate module keys contained in a normalized import target `a/b/c`:
@@ -228,6 +305,72 @@ mod tests {
         let imports_only = g.dependents(&["c.rs".to_string()], &[EdgeKind::Imports], 3);
         assert_eq!(imports_only.len(), 1);
         assert_eq!(imports_only[0].path, "b.rs");
+    }
+
+    #[test]
+    fn import_path_follows_imports_and_names_the_intermediate() {
+        let g = CodeGraph::from_edges([
+            e("a.rs", "b.rs", EdgeKind::Imports),
+            e("b.rs", "c.rs", EdgeKind::Imports),
+            e("c.rs", "d.rs", EdgeKind::Imports),
+        ]);
+        assert_eq!(
+            g.import_path("a.rs", "b.rs", 2),
+            Some(vec!["a.rs".into(), "b.rs".into()])
+        );
+        assert_eq!(
+            g.import_path("a.rs", "c.rs", 2),
+            Some(vec!["a.rs".into(), "b.rs".into(), "c.rs".into()])
+        );
+        // Beyond the hop bound, against the edge direction, same node, unknown node.
+        assert_eq!(g.import_path("a.rs", "d.rs", 2), None);
+        assert_eq!(g.import_path("c.rs", "a.rs", 2), None);
+        assert_eq!(g.import_path("a.rs", "a.rs", 2), None);
+        assert_eq!(g.import_path("a.rs", "zzz.rs", 2), None);
+    }
+
+    #[test]
+    fn import_path_ignores_cochange_edges_and_prefers_the_shortest_chain() {
+        let g = CodeGraph::from_edges([
+            e("a.rs", "c.rs", EdgeKind::CoChange),
+            e("a.rs", "b.rs", EdgeKind::Imports),
+            e("b.rs", "c.rs", EdgeKind::Imports),
+            e("a.rs", "x.rs", EdgeKind::Imports),
+            e("x.rs", "y.rs", EdgeKind::Imports),
+            e("y.rs", "c.rs", EdgeKind::Imports),
+            e("a.rs", "c.rs", EdgeKind::Imports),
+        ]);
+        // The direct import beats the 2-hop chain; the CoChange edge alone
+        // would not have counted.
+        assert_eq!(
+            g.import_path("a.rs", "c.rs", 2),
+            Some(vec!["a.rs".into(), "c.rs".into()])
+        );
+        let g = CodeGraph::from_edges([e("a.rs", "c.rs", EdgeKind::CoChange)]);
+        assert_eq!(g.import_path("a.rs", "c.rs", 2), None);
+    }
+
+    #[test]
+    fn import_search_tells_exhausted_from_stopped_at_the_bound() {
+        let g = CodeGraph::from_edges([
+            e("a.rs", "b.rs", EdgeKind::Imports),
+            e("b.rs", "c.rs", EdgeKind::Imports),
+            e("c.rs", "d.rs", EdgeKind::Imports),
+            e("x.rs", "y.rs", EdgeKind::Imports),
+        ]);
+        // d is 3 hops away: the bound cut the search short, not the graph.
+        assert_eq!(
+            g.import_search("a.rs", "d.rs", 2),
+            ImportSearch::BeyondBound
+        );
+        assert!(matches!(
+            g.import_search("a.rs", "d.rs", 3),
+            ImportSearch::Found(_)
+        ));
+        // a's whole import neighbourhood is explored and y.rs is not in it.
+        assert_eq!(g.import_search("a.rs", "y.rs", 5), ImportSearch::None);
+        // The reverse direction has nothing to explore at all.
+        assert_eq!(g.import_search("d.rs", "a.rs", 2), ImportSearch::None);
     }
 
     #[test]

@@ -1,12 +1,13 @@
 //! SQLite persistence for the repo map. Single-file DB in .engram/engram.db.
 //! Tracks which files are extracted to Tier-1 so retrieval can lazily extract on miss.
 
+use crate::inventory::ScannedFile;
 use anyhow::Result;
 use engram_domain::{
     CoChange, FileRecord, IngestedComment, Language, PrCommit, PrFileChange, ReviewComment,
     SymbolKind, SymbolRecord,
 };
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -19,8 +20,25 @@ pub struct Store {
     pub conn: Connection,
 }
 
+/// Version of everything that decides what extraction produces from a file:
+/// the parsers and their queries, which files the inventory includes (ignore
+/// rules, extension list, size cap). Bump it by hand whenever any of those
+/// change. On open, a database written under a different version has all its
+/// derived data (symbols, imports, vectors) discarded and every file marked
+/// for re-extraction, and the snapshot id changes with it.
+pub const PARSER_CONFIG_VERSION: u32 = 1;
+
+const PARSER_VERSION_KEY: &str = "parser_config_version";
+
 impl Store {
     pub fn open(repo_root: &Path) -> Result<Self> {
+        Self::open_with_parser_version(repo_root, PARSER_CONFIG_VERSION)
+    }
+
+    /// [`Store::open`] under an explicit parser/config version. Exists so the
+    /// invalidation on a version change can be tested without editing the
+    /// constant.
+    pub fn open_with_parser_version(repo_root: &Path, parser_version: u32) -> Result<Self> {
         let dir = repo_root.join(".engram");
         std::fs::create_dir_all(&dir)?;
         let conn = Connection::open(dir.join("engram.db"))?;
@@ -34,7 +52,13 @@ impl Store {
                 size_bytes INTEGER NOT NULL,
                 is_test INTEGER NOT NULL,
                 tier1_done INTEGER NOT NULL DEFAULT 0,
-                last_commit_ts INTEGER
+                last_commit_ts INTEGER,
+                mtime_ns INTEGER,
+                content_hash TEXT
+            );
+            CREATE TABLE IF NOT EXISTS meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS symbols (
                 id INTEGER PRIMARY KEY,
@@ -130,7 +154,42 @@ impl Store {
             "#,
         )?;
         Self::migrate(&conn);
+        Self::reconcile_parser_version(&conn, parser_version)?;
         Ok(Store { conn })
+    }
+
+    /// Discard derived data if the database was written under a different
+    /// parser/config version (see [`PARSER_CONFIG_VERSION`]). A brand-new
+    /// database has nothing to discard and just records the version.
+    fn reconcile_parser_version(conn: &Connection, version: u32) -> Result<()> {
+        use rusqlite::OptionalExtension;
+        let stored: Option<String> = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                params![PARSER_VERSION_KEY],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if stored.as_deref() == Some(version.to_string().as_str()) {
+            return Ok(());
+        }
+        // One transaction: a crash midway must not leave the derived data
+        // wiped but the old version recorded, which would trust the empty tables.
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(
+            "DELETE FROM symbols;
+             DELETE FROM file_imports;
+             DELETE FROM vectors;
+             DELETE FROM chunk_vectors;
+             UPDATE files SET tier1_done = 0;",
+        )?;
+        tx.execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = ?2",
+            params![PARSER_VERSION_KEY, version.to_string()],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Bring a database created by an older Engram up to the current schema.
@@ -142,6 +201,26 @@ impl Store {
     fn migrate(conn: &Connection) {
         // Predates recency tracking.
         let _ = conn.execute("ALTER TABLE files ADD COLUMN last_commit_ts INTEGER", []);
+
+        // Predates the per-file fingerprint. The ALTER succeeds exactly once, on
+        // a DB whose cached symbols and imports were never checked against the
+        // file on disk; distrust them all so each file re-extracts once rather
+        // than serving whatever an old run (or an offline edit) left behind.
+        if conn
+            .execute("ALTER TABLE files ADD COLUMN mtime_ns INTEGER", [])
+            .is_ok()
+        {
+            let _ = conn.execute("UPDATE files SET tier1_done = 0", []);
+        }
+
+        // Predates content hashing. Same reasoning as above: with no stored
+        // hash there is nothing to compare an on-disk file against.
+        if conn
+            .execute("ALTER TABLE files ADD COLUMN content_hash TEXT", [])
+            .is_ok()
+        {
+            let _ = conn.execute("UPDATE files SET tier1_done = 0", []);
+        }
 
         // Symbols predating span tracking have no end_line, and a stored zero
         // is indistinguishable from a real span. The ALTER succeeds exactly
@@ -341,13 +420,60 @@ impl Store {
         }
         let tx = self.conn.transaction()?;
         for path in &stale {
-            tx.execute("DELETE FROM files WHERE path = ?1", params![path])?;
-            tx.execute("DELETE FROM symbols WHERE path = ?1", params![path])?;
-            tx.execute("DELETE FROM file_imports WHERE path = ?1", params![path])?;
-            tx.execute("DELETE FROM chunk_vectors WHERE path = ?1", params![path])?;
+            Self::delete_file_rows(&tx, path)?;
         }
         tx.commit()?;
         Ok(stale.len())
+    }
+
+    /// Delete everything derived from a file's contents, keeping its `files`
+    /// row: symbols, import edges, and embeddings.
+    fn delete_derived_rows(tx: &rusqlite::Transaction<'_>, path: &str) -> Result<()> {
+        tx.execute("DELETE FROM symbols WHERE path = ?1", params![path])?;
+        tx.execute("DELETE FROM file_imports WHERE path = ?1", params![path])?;
+        tx.execute("DELETE FROM vectors WHERE path = ?1", params![path])?;
+        tx.execute("DELETE FROM chunk_vectors WHERE path = ?1", params![path])?;
+        Ok(())
+    }
+
+    /// Delete every row that belongs to one file.
+    fn delete_file_rows(tx: &rusqlite::Transaction<'_>, path: &str) -> Result<()> {
+        tx.execute("DELETE FROM files WHERE path = ?1", params![path])?;
+        Self::delete_derived_rows(tx, path)
+    }
+
+    /// Remove every trace of one file, and of anything beneath it should
+    /// `path` have been a directory (a renamed or deleted directory reaches the
+    /// watcher as one event for the directory, not one per file).
+    ///
+    /// Everything beneath a directory is matched with an index range
+    /// (`dir/` <= path < `dir0`, since `0` is the character after `/`), so a
+    /// removal costs a seek rather than a scan of every indexed file. Rows for
+    /// the exact path are cleaned even when its `files` row is already gone, so
+    /// rows orphaned by an older Engram do not survive a removal.
+    ///
+    /// Returns the number of rows deleted across all tables; zero means the
+    /// index did not change.
+    pub fn remove_path(&mut self, path: &str) -> Result<usize> {
+        let dir = path.trim_end_matches('/');
+        let range_start = format!("{dir}/");
+        let range_end = format!("{dir}0");
+        let tx = self.conn.transaction()?;
+        let mut removed = 0;
+        for table in [
+            "files",
+            "symbols",
+            "file_imports",
+            "vectors",
+            "chunk_vectors",
+        ] {
+            removed += tx.execute(
+                &format!("DELETE FROM {table} WHERE path = ?1 OR (path >= ?2 AND path < ?3)"),
+                params![dir, range_start, range_end],
+            )?;
+        }
+        tx.commit()?;
+        Ok(removed)
     }
 
     /// Upsert a pull request row.
@@ -618,22 +744,132 @@ impl Store {
         Ok(rows.filter_map(Result::ok).collect())
     }
 
+    /// Upsert files whose modification time is unknown. A size change still
+    /// invalidates extraction; see [`Store::upsert_scanned`].
     pub fn upsert_files(&mut self, files: &[FileRecord]) -> Result<()> {
+        let scanned: Vec<(FileRecord, Option<i64>)> =
+            files.iter().cloned().map(|f| (f, None)).collect();
+        self.upsert_scanned(&scanned)
+    }
+
+    /// Upsert files with their modification times but no content hash.
+    pub fn upsert_scanned(&mut self, files: &[(FileRecord, Option<i64>)]) -> Result<()> {
+        let scanned: Vec<ScannedFile> = files
+            .iter()
+            .map(|(record, mtime_ns)| ScannedFile {
+                record: record.clone(),
+                mtime_ns: *mtime_ns,
+                content_hash: None,
+            })
+            .collect();
+        self.upsert_fingerprinted(&scanned)
+    }
+
+    /// Upsert inventoried files with their full fingerprint.
+    ///
+    /// A file is *changed* when its size differs from what is stored, or the
+    /// new mtime differs, or the new content hash differs. Unknown values on
+    /// the new side (`None`) never count as a change on their own, but a
+    /// stored NULL against a known value does: a row from before a
+    /// fingerprint existed has never been verified, so it is re-extracted once.
+    ///
+    /// For a changed file every derived row (symbols, imports, vectors, chunk
+    /// vectors) is deleted and `tier1_done` reset, so the old contents can
+    /// neither be served nor mistaken for current.
+    pub fn upsert_fingerprinted(&mut self, files: &[ScannedFile]) -> Result<()> {
+        use rusqlite::OptionalExtension;
         let tx = self.conn.transaction()?;
-        for f in files {
+        for scanned in files {
+            let f = &scanned.record;
+            let old: Option<(i64, Option<i64>, Option<String>)> = tx
+                .query_row(
+                    "SELECT size_bytes, mtime_ns, content_hash FROM files WHERE path = ?1",
+                    params![f.path],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?;
+            let changed = old.is_some_and(|(size, mtime, hash)| {
+                size != f.size_bytes as i64
+                    || (scanned.mtime_ns.is_some() && mtime != scanned.mtime_ns)
+                    || (scanned.content_hash.is_some() && hash != scanned.content_hash)
+            });
+            if changed {
+                Self::delete_derived_rows(&tx, &f.path)?;
+            }
             tx.execute(
-                "INSERT INTO files (path, language, size_bytes, is_test)
-                 VALUES (?1, ?2, ?3, ?4)
+                "INSERT INTO files (path, language, size_bytes, is_test, mtime_ns, content_hash)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT(path) DO UPDATE SET
-                   language=?2, size_bytes=?3, is_test=?4",
+                   language=?2,
+                   is_test=?4,
+                   tier1_done = CASE WHEN ?7 THEN 0 ELSE tier1_done END,
+                   size_bytes=?3,
+                   mtime_ns=COALESCE(?5, mtime_ns),
+                   content_hash=COALESCE(?6, content_hash)",
                 params![
                     f.path,
                     f.language.as_str(),
                     f.size_bytes as i64,
-                    f.is_test as i64
+                    f.is_test as i64,
+                    scanned.mtime_ns,
+                    scanned.content_hash,
+                    changed
                 ],
             )?;
         }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// A stable id for exactly what is indexed: the checked-out commit (`head`),
+    /// the parser/config version, and every indexed file's path and content
+    /// hash. Identical content at the same commit gives the same id regardless
+    /// of mtimes or checkout location; any content, path, or version
+    /// difference gives a different one.
+    pub fn snapshot_id(&self, head: &str) -> Result<String> {
+        use crate::inventory::Fnv64;
+        let version: String = self
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                params![PARSER_VERSION_KEY],
+                |r| r.get(0),
+            )
+            .unwrap_or_else(|_| PARSER_CONFIG_VERSION.to_string());
+        let mut hasher = Fnv64::default();
+        // 0xff cannot occur in UTF-8, so fields cannot run into each other.
+        let mut field = |s: &str| {
+            hasher.write(s.as_bytes());
+            hasher.write(&[0xff]);
+        };
+        field("engram-snapshot-v1");
+        field(head);
+        field(&version);
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path, content_hash FROM files ORDER BY path")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+        })?;
+        for row in rows {
+            let (path, hash) = row?;
+            field(&path);
+            field(hash.as_deref().unwrap_or(""));
+        }
+        Ok(hasher.finish_hex())
+    }
+
+    /// Drop a file's stored symbols and imports without marking it extracted,
+    /// for when its contents can no longer be read: the old rows describe text
+    /// that is gone, and the file should be retried rather than trusted empty.
+    pub fn clear_extracted(&mut self, path: &str) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM symbols WHERE path = ?1", params![path])?;
+        tx.execute("DELETE FROM file_imports WHERE path = ?1", params![path])?;
+        tx.execute(
+            "UPDATE files SET tier1_done = 0 WHERE path = ?1",
+            params![path],
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -754,6 +990,28 @@ impl Store {
             })
         })?;
         Ok(rows.filter_map(Result::ok).collect())
+    }
+
+    /// The single directed co-change row `a -> b`, looked up by primary key.
+    /// Unlike [`Store::cochange_for`] this is not ranked or capped, so a weak
+    /// pair is found as reliably as a strong one. `b -> a` is a separate row.
+    pub fn cochange_pair(&self, a: &str, b: &str) -> Result<Option<CoChange>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT path_a, path_b, count, strength FROM cochange
+                 WHERE path_a = ?1 AND path_b = ?2",
+                params![a, b],
+                |r| {
+                    Ok(CoChange {
+                        path_a: r.get(0)?,
+                        path_b: r.get(1)?,
+                        count: r.get::<_, i64>(2)? as u32,
+                        strength: r.get(3)?,
+                    })
+                },
+            )
+            .optional()?)
     }
 }
 
@@ -1187,5 +1445,312 @@ mod tests {
             )
             .unwrap();
         assert_eq!(store.pr_commits(1).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn cochange_pair_reads_one_directed_row_regardless_of_rank() {
+        let repo = TempRepo::new();
+        let mut store = repo.store();
+        let mut edges: Vec<CoChange> = (0..10)
+            .map(|i| CoChange {
+                path_a: "a.rs".to_owned(),
+                path_b: format!("strong{i}.rs"),
+                count: 50,
+                strength: 0.9,
+            })
+            .collect();
+        edges.push(CoChange {
+            path_a: "a.rs".to_owned(),
+            path_b: "weak.rs".to_owned(),
+            count: 2,
+            strength: 0.05,
+        });
+        store.replace_cochange(&edges).unwrap();
+
+        // Ranked far outside any top-N, still found, with its own count.
+        let pair = store.cochange_pair("a.rs", "weak.rs").unwrap().unwrap();
+        assert_eq!((pair.count, pair.path_b.as_str()), (2, "weak.rs"));
+        // The reverse row was never recorded; direction matters.
+        assert!(store.cochange_pair("weak.rs", "a.rs").unwrap().is_none());
+        assert!(store.cochange_pair("a.rs", "nope.rs").unwrap().is_none());
+    }
+
+    fn sized(path: &str, size_bytes: u64) -> FileRecord {
+        FileRecord {
+            size_bytes,
+            ..file(path)
+        }
+    }
+
+    /// A store with `a.rs` upserted at (size 10, mtime 1000) and extracted.
+    fn extracted_store(repo: &TempRepo) -> Store {
+        let mut store = repo.store();
+        store.upsert_scanned(&[(file("a.rs"), Some(1000))]).unwrap();
+        store
+            .replace_symbols_for_file("a.rs", &[symbol("a.rs", "old_name")])
+            .unwrap();
+        assert!(store.is_tier1_done("a.rs"));
+        store
+    }
+
+    #[test]
+    fn upsert_resets_tier1_when_the_size_changes() {
+        let repo = TempRepo::new();
+        let mut store = extracted_store(&repo);
+        store
+            .upsert_scanned(&[(sized("a.rs", 11), Some(1000))])
+            .unwrap();
+        assert!(!store.is_tier1_done("a.rs"));
+    }
+
+    #[test]
+    fn upsert_resets_tier1_when_only_the_mtime_changes() {
+        // A same-size edit (rename a function to a name of equal length) keeps
+        // the size identical; only the mtime gives it away.
+        let repo = TempRepo::new();
+        let mut store = extracted_store(&repo);
+        store.upsert_scanned(&[(file("a.rs"), Some(2000))]).unwrap();
+        assert!(!store.is_tier1_done("a.rs"));
+    }
+
+    #[test]
+    fn upsert_keeps_tier1_when_the_fingerprint_is_unchanged() {
+        let repo = TempRepo::new();
+        let mut store = extracted_store(&repo);
+        store.upsert_scanned(&[(file("a.rs"), Some(1000))]).unwrap();
+        assert!(store.is_tier1_done("a.rs"));
+        // Unknown mtime and unchanged size is not evidence of a change either.
+        store.upsert_files(&[file("a.rs")]).unwrap();
+        assert!(store.is_tier1_done("a.rs"));
+        assert_eq!(store.symbols_matching("old_name", 5).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_pre_fingerprint_database_re_extracts_once() {
+        let repo = TempRepo::new();
+        drop(extracted_store(&repo));
+        {
+            // Rewrite the files table the way an older Engram left it: no
+            // mtime_ns column, symbols already extracted.
+            let conn = Connection::open(repo.0.join(".engram").join("engram.db")).unwrap();
+            conn.execute_batch("ALTER TABLE files DROP COLUMN mtime_ns;")
+                .unwrap();
+        }
+        let mut store = repo.store();
+        assert!(
+            !store.is_tier1_done("a.rs"),
+            "rows from before fingerprints existed must not be trusted"
+        );
+        // After it re-extracts, the migration does not fire again.
+        store.upsert_scanned(&[(file("a.rs"), Some(1000))]).unwrap();
+        store.replace_symbols_for_file("a.rs", &[]).unwrap();
+        drop(store);
+        let mut store = repo.store();
+        store.upsert_scanned(&[(file("a.rs"), Some(1000))]).unwrap();
+        assert!(store.is_tier1_done("a.rs"));
+    }
+
+    #[test]
+    fn remove_path_deletes_every_trace_including_vectors() {
+        let repo = TempRepo::new();
+        let mut store = repo.store();
+        store
+            .upsert_files(&[file("gone.rs"), file("kept.rs")])
+            .unwrap();
+        for p in ["gone.rs", "kept.rs"] {
+            store
+                .replace_symbols_for_file(p, &[symbol(p, "thing")])
+                .unwrap();
+            store
+                .replace_imports_for_file(p, &["utils/retry".to_owned()])
+                .unwrap();
+            store
+                .upsert_vectors(&[(p.to_owned(), "h".to_owned(), vec![1, 2])])
+                .unwrap();
+            store
+                .upsert_chunk_vectors(&[(p.to_owned(), 1, "h".to_owned(), vec![1, 2])])
+                .unwrap();
+        }
+        // One row in each of the five tables.
+        assert_eq!(store.remove_path("gone.rs").unwrap(), 5);
+
+        let count = |table: &str, path: &str| -> i64 {
+            store
+                .conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE path = ?1"),
+                    params![path],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        for table in [
+            "files",
+            "symbols",
+            "file_imports",
+            "vectors",
+            "chunk_vectors",
+        ] {
+            assert_eq!(count(table, "gone.rs"), 0, "{table} kept a row");
+            assert_eq!(count(table, "kept.rs"), 1, "{table} lost the other file");
+        }
+    }
+
+    #[test]
+    fn remove_path_on_a_directory_takes_the_files_beneath_it() {
+        let repo = TempRepo::new();
+        let mut store = repo.store();
+        store
+            .upsert_files(&[file("pkg/a.rs"), file("pkg/sub/b.rs"), file("pkgx/c.rs")])
+            .unwrap();
+        assert_eq!(store.remove_path("pkg").unwrap(), 2);
+        let left: Vec<String> = store
+            .all_files()
+            .unwrap()
+            .into_iter()
+            .map(|f| f.path)
+            .collect();
+        assert_eq!(left, vec!["pkgx/c.rs".to_owned()]);
+    }
+
+    #[test]
+    fn remove_path_changes_nothing_for_an_unknown_path_and_spares_lookalikes() {
+        let repo = TempRepo::new();
+        let mut store = repo.store();
+        // Neighbours of "pkg" in sort order: the range bounds must not catch them.
+        let lookalikes = ["pkg.rs", "pkg-x/a.rs", "pkg0/a.rs", "pkga/b.rs", "pkg"];
+        let files: Vec<FileRecord> = lookalikes.iter().map(|p| file(p)).collect();
+        store.upsert_files(&files).unwrap();
+        assert_eq!(
+            store.remove_path("pkg/").unwrap(),
+            1,
+            "only the exact `pkg`"
+        );
+        assert_eq!(store.all_files().unwrap().len(), lookalikes.len() - 1);
+        // Nothing left to remove: reports that the index did not change.
+        assert_eq!(store.remove_path("pkg").unwrap(), 0);
+        assert_eq!(store.remove_path("nope/at/all.rs").unwrap(), 0);
+    }
+
+    #[test]
+    fn a_failed_parser_version_reset_leaves_the_old_version_recorded() {
+        // The wipe and the version bump are one transaction: if the wipe
+        // cannot complete, the database must not claim the new version.
+        let repo = TempRepo::new();
+        {
+            let mut store = repo.store();
+            store.upsert_files(&[file("a.rs")]).unwrap();
+            store
+                .replace_symbols_for_file("a.rs", &[symbol("a.rs", "thing")])
+                .unwrap();
+        }
+        let conn = Connection::open(repo.0.join(".engram").join("engram.db")).unwrap();
+        // The symbols wipe runs before the statement that fails.
+        conn.execute_batch("DROP TABLE vectors;").unwrap();
+        assert!(Store::reconcile_parser_version(&conn, PARSER_CONFIG_VERSION + 1).is_err());
+        let symbols: i64 = conn
+            .query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(symbols, 1, "the partial wipe must roll back");
+        let stored: String = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                params![PARSER_VERSION_KEY],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, PARSER_CONFIG_VERSION.to_string());
+    }
+
+    fn hashed(path: &str, mtime: i64, hash: &str) -> ScannedFile {
+        ScannedFile {
+            record: file(path),
+            mtime_ns: Some(mtime),
+            content_hash: Some(hash.to_owned()),
+        }
+    }
+
+    #[test]
+    fn a_changed_content_hash_alone_invalidates_the_file() {
+        // Same size, same mtime: only the hash differs.
+        let repo = TempRepo::new();
+        let mut store = repo.store();
+        store
+            .upsert_fingerprinted(&[hashed("a.rs", 5, "h1")])
+            .unwrap();
+        store
+            .replace_symbols_for_file("a.rs", &[symbol("a.rs", "old_name")])
+            .unwrap();
+        store
+            .replace_imports_for_file("a.rs", &["utils/retry".to_owned()])
+            .unwrap();
+        store
+            .upsert_vectors(&[("a.rs".to_owned(), "h".to_owned(), vec![1])])
+            .unwrap();
+        store
+            .upsert_chunk_vectors(&[("a.rs".to_owned(), 1, "h".to_owned(), vec![1])])
+            .unwrap();
+
+        // Unchanged hash: everything is kept.
+        store
+            .upsert_fingerprinted(&[hashed("a.rs", 5, "h1")])
+            .unwrap();
+        assert!(store.is_tier1_done("a.rs"));
+        assert_eq!(store.symbols_for_path("a.rs").unwrap().len(), 1);
+
+        store
+            .upsert_fingerprinted(&[hashed("a.rs", 5, "h2")])
+            .unwrap();
+        assert!(!store.is_tier1_done("a.rs"));
+        assert!(store.symbols_for_path("a.rs").unwrap().is_empty());
+        assert!(store.all_imports().unwrap().is_empty());
+        assert!(store.load_vectors().unwrap().is_empty());
+        assert!(store.load_chunk_vectors().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_row_with_no_stored_hash_is_re_extracted_once_a_hash_is_known() {
+        let repo = TempRepo::new();
+        let mut store = extracted_store(&repo);
+        store
+            .upsert_fingerprinted(&[hashed("a.rs", 1000, "h1")])
+            .unwrap();
+        assert!(
+            !store.is_tier1_done("a.rs"),
+            "NULL stored hash vs a known hash means unverified"
+        );
+    }
+
+    #[test]
+    fn snapshot_ids_follow_content_commit_and_version() {
+        let repo = TempRepo::new();
+        let mut store = repo.store();
+        store
+            .upsert_fingerprinted(&[hashed("a.rs", 1, "h1"), hashed("b.rs", 2, "h2")])
+            .unwrap();
+        let base = store.snapshot_id("c1").unwrap();
+        assert_eq!(base, store.snapshot_id("c1").unwrap());
+        assert_ne!(base, store.snapshot_id("c2").unwrap(), "commit");
+        // mtime is not part of the identity.
+        store
+            .upsert_fingerprinted(&[hashed("a.rs", 99, "h1")])
+            .unwrap();
+        assert_eq!(base, store.snapshot_id("c1").unwrap());
+        store
+            .upsert_fingerprinted(&[hashed("a.rs", 99, "other")])
+            .unwrap();
+        assert_ne!(base, store.snapshot_id("c1").unwrap(), "content");
+    }
+
+    #[test]
+    fn pruning_a_deleted_file_takes_its_legacy_vector_too() {
+        let repo = TempRepo::new();
+        let mut store = repo.store();
+        store.upsert_files(&[file("gone.rs")]).unwrap();
+        store
+            .upsert_vectors(&[("gone.rs".to_owned(), "h".to_owned(), vec![1])])
+            .unwrap();
+        store.prune_missing_files(&HashSet::new()).unwrap();
+        assert!(store.load_vectors().unwrap().is_empty());
     }
 }

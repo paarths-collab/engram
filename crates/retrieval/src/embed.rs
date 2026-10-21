@@ -129,10 +129,16 @@ pub fn bytes_to_vector(bytes: &[u8]) -> Option<Vec<f32>> {
     if !bytes.len().is_multiple_of(4) || bytes.len() / 4 != DIM {
         return None;
     }
+    // The length check above guarantees `bytes.len() == DIM * 4`, so every
+    // index below is in bounds. Indexing avoids `chunks_exact(4)`, which
+    // clippy::chunks_exact_to_as_chunks flags, while keeping compatibility
+    // with toolchains older than `as_chunks` (stable in 1.88).
     Some(
-        bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        (0..DIM)
+            .map(|i| {
+                let j = i * 4;
+                f32::from_le_bytes([bytes[j], bytes[j + 1], bytes[j + 2], bytes[j + 3]])
+            })
             .collect(),
     )
 }
