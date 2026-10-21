@@ -511,10 +511,15 @@ pub struct GraphLimits {
     /// Most co-change rows read per anchor.
     pub cochange_per_anchor: usize,
     pub truncated: bool,
-    /// Facts that exist but are not in `edges`: co-change rows past the
-    /// per-anchor read limit, plus edges dropped by the node and edge caps.
+    /// Exactly the number of edges the same call would have emitted with no
+    /// cap, minus the number it did emit. The unit is one edge: one directed
+    /// co-change row or one import edge. Counts co-change rows past the
+    /// per-anchor read limit (with the reverse rows of the partners it hides),
+    /// edges touching a file past the node cap, and edges past the edge cap.
     pub omitted_edges: usize,
-    /// Neighbouring files that exist but are not in `nodes`.
+    /// Neighbouring files past the node cap. A co-change partner hidden by
+    /// the per-anchor read limit is never added as a node, so it is not
+    /// counted here; its rows are counted in `omitted_edges`.
     pub omitted_nodes: usize,
     pub reason: String,
 }

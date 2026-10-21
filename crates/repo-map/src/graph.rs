@@ -120,6 +120,12 @@ impl CodeGraph {
             }
         }
 
+        // Insertion order decides which of two equal-length routes a search
+        // finds first, and the order of `store.all_imports()` is the order of
+        // SQLite rows. Sorting by (from, to, kind) makes the graph, and so the
+        // routes it reports, the same for the same snapshot.
+        edges.sort_by(|a, b| (&a.0, &a.1, a.2 as u8).cmp(&(&b.0, &b.1, b.2 as u8)));
+        edges.dedup();
         Ok(Self::from_edges(edges))
     }
 
@@ -143,7 +149,11 @@ impl CodeGraph {
     ) -> Vec<GraphHit> {
         let mut visited: HashSet<NodeIndex> = HashSet::new();
         let mut queue: VecDeque<(NodeIndex, usize)> = VecDeque::new();
-        for s in seeds {
+        // Visited in path order, so which seed reaches a file first (and the
+        // order of the hits) does not depend on how the caller listed them.
+        let mut ordered: Vec<&String> = seeds.iter().collect();
+        ordered.sort();
+        for s in ordered {
             if let Some(&n) = self.idx.get(s) {
                 if visited.insert(n) {
                     queue.push_back((n, 0));
@@ -159,13 +169,24 @@ impl CodeGraph {
             if hops >= max_hops {
                 continue;
             }
-            for edge in self.g.edges_directed(node, Incoming) {
-                let kind = *edge.weight();
-                if !kinds.contains(&kind) {
-                    continue;
-                }
-                use petgraph::visit::EdgeRef;
-                let src = edge.source();
+            // Equal-length routes: the dependent is reached through the
+            // alphabetically first parent, whatever order the edges were
+            // inserted in.
+            let mut incoming: Vec<(NodeIndex, EdgeKind)> = self
+                .g
+                .edges_directed(node, Incoming)
+                .filter(|edge| kinds.contains(edge.weight()))
+                .map(|edge| {
+                    use petgraph::visit::EdgeRef;
+                    (edge.source(), *edge.weight())
+                })
+                .collect();
+            incoming.sort_by(|a, b| {
+                self.rev[a.0.index()]
+                    .cmp(&self.rev[b.0.index()])
+                    .then_with(|| (a.1 as u8).cmp(&(b.1 as u8)))
+            });
+            for (src, kind) in incoming {
                 if visited.insert(src) {
                     let mut chain = vec![self.rev[src.index()].clone()];
                     chain.extend(routes.get(&node).cloned().unwrap_or_default());
@@ -254,11 +275,16 @@ impl CodeGraph {
         let mut queue: VecDeque<(NodeIndex, usize)> = VecDeque::from([(start, 0)]);
         let mut frontier_remains = false;
         while let Some((node, hops)) = queue.pop_front() {
-            for edge in self.g.edges_directed(node, Outgoing) {
-                if *edge.weight() != EdgeKind::Imports {
-                    continue;
-                }
-                let next = edge.target();
+            // Sorted by path so the first shortest chain found is the same
+            // whatever order the edges were inserted in.
+            let mut outgoing: Vec<NodeIndex> = self
+                .g
+                .edges_directed(node, Outgoing)
+                .filter(|edge| *edge.weight() == EdgeKind::Imports)
+                .map(|edge| edge.target())
+                .collect();
+            outgoing.sort_by(|a, b| self.rev[a.index()].cmp(&self.rev[b.index()]));
+            for next in outgoing {
                 if visited.contains(&next) {
                     continue;
                 }
@@ -565,5 +591,51 @@ mod tests {
             2,
         );
         assert_eq!(dependents.len(), 1, "{dependents:?}");
+    }
+
+    #[test]
+    fn equal_length_routes_are_the_same_whatever_order_the_edges_were_inserted_in() {
+        // a -> b1 -> c and a -> b2 -> c: two routes of two hops.
+        let edges = [
+            e("a.rs", "b1.rs", EdgeKind::Imports),
+            e("a.rs", "b2.rs", EdgeKind::Imports),
+            e("b1.rs", "c.rs", EdgeKind::Imports),
+            e("b2.rs", "c.rs", EdgeKind::Imports),
+        ];
+        let mut reversed = edges.clone();
+        reversed.reverse();
+        let mut shuffled = edges.clone();
+        shuffled.swap(0, 3);
+        shuffled.swap(1, 2);
+        let route = |order: &[(String, String, EdgeKind)]| {
+            let g = CodeGraph::from_edges(order.to_vec());
+            (
+                g.dependents(&["c.rs".to_owned()], &[EdgeKind::Imports], 2),
+                g.import_path("a.rs", "c.rs", 2),
+                g.import_search("a.rs", "c.rs", 2),
+            )
+        };
+        let reference = route(&edges);
+        assert_eq!(reference, route(&reversed));
+        assert_eq!(reference, route(&shuffled));
+        // The alphabetically first of the equal routes, from both ends.
+        let chain = ["a.rs", "b1.rs", "c.rs"].map(str::to_owned).to_vec();
+        assert_eq!(reference.1, Some(chain.clone()));
+        let a = reference.0.iter().find(|h| h.path == "a.rs").unwrap();
+        assert_eq!(a.chain, chain);
+    }
+
+    #[test]
+    fn seed_order_does_not_change_which_seed_reaches_a_file() {
+        let g = CodeGraph::from_edges([
+            e("x.rs", "s1.rs", EdgeKind::Imports),
+            e("x.rs", "s2.rs", EdgeKind::Imports),
+        ]);
+        let seeds_a = ["s1.rs".to_owned(), "s2.rs".to_owned()];
+        let seeds_b = ["s2.rs".to_owned(), "s1.rs".to_owned()];
+        assert_eq!(
+            g.dependents(&seeds_a, &[EdgeKind::Imports], 1),
+            g.dependents(&seeds_b, &[EdgeKind::Imports], 1)
+        );
     }
 }

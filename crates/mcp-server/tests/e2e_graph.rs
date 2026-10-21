@@ -154,11 +154,9 @@ fn get_graph_returns_the_api_service_facts_under_the_ids_explain_reports() {
     assert_ne!(route["edge_id"], hops[0]["edge_id"]);
     assert!(!edge_ids(&wide).contains(route["edge_id"].as_str().unwrap()));
 
-    // 5. Everything the recommendations cite is a fact get_graph emits.
-    let emitted = edge_ids(
-        &s.client
-            .ok("get_graph", json!({ "paths": [SERVICE], "max_hops": 2 })),
-    );
+    // 5. Everything the recommendations cite is a fact get_graph emits, at
+    // its default arguments (nothing cut, and as deep as the expansion).
+    let emitted = edge_ids(&s.client.ok("get_graph", json!({ "paths": [SERVICE] })));
     let mut cited = 0;
     for key in ["cochange_expansions", "import_expansions"] {
         for entry in expand[key].as_array().unwrap() {

@@ -210,12 +210,9 @@ fn acceptance_2_two_hop_route_and_separate_typed_facts() {
     assert_eq!(edges[0]["to"], SERVICE);
     assert_eq!(edges[1]["from"], SERVICE);
     assert_eq!(edges[1]["to"], REPO);
-    assert_eq!(
-        edges[0].as_object().map(|o| o.len()),
-        Some(3),
-        "{}",
-        edges[0]
-    );
+    for edge in edges {
+        assert_eq!(edge.as_object().map(|o| o.len()), Some(3), "{edge}");
+    }
     let hop_ids: Vec<&str> = edges
         .iter()
         .map(|e| e["edge_id"].as_str().expect("hop edge_id"))

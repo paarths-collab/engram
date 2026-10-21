@@ -31,7 +31,7 @@ natural-language task. That path exists (`predict_impact`) but is marked
 
 Supporting tools (stable): `find_existing_implementation(concept)`,
 `get_verification_plan(changed_files)`, `get_review_history(path?, task?)`,
-`get_graph(paths, max_hops?, kinds?, snapshot?)` (see [`get_graph`](#get_graph)).
+`get_graph(paths, max_hops?, kinds?, max_edges?, max_nodes?, snapshot?)` (see [`get_graph`](#get_graph)).
 
 Paths are repo-relative. Each argument is validated: `budget_tokens` must be an
 integer >= 1, `max_hops` an integer 1 or 2, and `snapshot` a string. Invalid
@@ -165,8 +165,13 @@ for example `"evidence_ids": ["e_<16 hex digits>"]` and
     `{"basis": "cochange_strength", "strength", "count", "anchor"}` (the
     strongest cited row). Import: `{"basis": "import_hops", "hops", "weight"}`
     (0.6 for one hop, 0.35 for two).
-  - Every cited id is an id [`get_graph`](#get_graph) emits for the same anchors
-    in the same snapshot (with `max_hops` at least as large as the one used here).
+  - A cited id is an id [`get_graph`](#get_graph) emits for the same anchors in
+    the same snapshot, but the guarantee is conditional: the id is present only
+    when the graph's `limits.truncated` is `false` **and** its `max_hops` is at
+    least the hop the id was cited at. `get_graph` defaults to `max_hops` 2, the
+    same as this tool, so at default arguments a 2-hop dependent's outer-hop id
+    is listed; with `max_hops` 1 it is not. A cap can also cut a cited edge, and
+    `limits.truncated` is then `true`.
     Anchors in `likely_files` and the entries of `predict_impact`'s search hits
     carry neither field. Search evidence has no `score_components`: its
     per-signal scores are not kept, only the fused `score` and the `signals` list.
@@ -327,6 +332,20 @@ reason, and `edge_id` inside each `edges[]` entry. A hop's id equals the id
 stored row it reports, not to the direction of the question: asking
 `(a, b)` or `(b, a)` yields the same two ids.
 
+The `direction` of a reason is relative to the question (`source_to_target` is
+the row from the `source` you asked about to the `target`), so the same stored
+row is labelled `source_to_target` when asked `(a, b)` and `target_to_source`
+when asked `(b, a)`. [`get_graph`](#get_graph) has no question: its co-change
+`direction` is always the stored row direction `source_to_target`, with
+`source` and `target` being the row's own `path_a` and `path_b`. The same
+`edge_id` can therefore carry different `direction` labels in the two tools; the
+id identifies the stored fact, the label is a reading of it.
+
+When two import routes of equal length connect the pair, the route reported is
+the one through the alphabetically first intermediate file at each step, so the
+same snapshot gives the same chain (and ids) whatever order the index stored
+its rows in.
+
 ### Errors
 
 Each of these is a tool error (`isError: true`) with a message in the text:
@@ -386,9 +405,11 @@ Request:
 
 | Argument | Meaning |
 |---|---|
-| `paths: string[]` | Anchor files (required, non-empty). Each must be an indexed file, else a tool error in the style of `explain_connection`. Order and repeats do not matter. |
-| `max_hops?: 1..2` (default 1) | Import distance followed from the anchors. 1 returns every import edge touching an anchor; 2 also returns the edges touching those neighbours. Co-change edges are always anchor-to-partner. Outside 1..2 is an error. |
+| `paths: string[]` | Anchor files (required, non-empty). Each must be an indexed file, else a tool error in the style of `explain_connection`; this differs from `expand_connections`, which silently ignores a path it does not know. More distinct paths than `max_nodes` is an error, refused before any path is looked up. Order and repeats do not matter. |
+| `max_hops?: 1..2` (default 2) | Import distance followed from the anchors. 1 returns every import edge touching an anchor; 2 also returns the edges touching those neighbours. The default matches `expand_connections`, so what an expansion cites is listed (see the citation condition under [`expand_connections`](#expand_connections)). Co-change edges are always anchor-to-partner. Outside 1..2 is an error. |
 | `kinds?: ("import" \| "cochange")[]` | Which kinds to return; default both. Empty or unknown values are an error. |
+| `max_edges?: 1..500` (default 500) | Return at most this many edges. It can only lower the hard cap. An integer outside 1..500, or a non-integer, is an error. |
+| `max_nodes?: 1..200` (default 200) | Return at most this many nodes (anchors always stay, so it must be at least the number of distinct anchors). It can only lower the hard cap. An integer outside 1..200, or a non-integer, is an error. |
 | `snapshot?: string` | As elsewhere: a different current snapshot is reported in `snapshot_mismatch`; the answer is always from the current one. |
 
 There is no `budget_tokens`: the hard caps below are the bound.
@@ -447,7 +468,7 @@ on the standard fixture; trimmed to two nodes and two of the edges):
     }
   ],
   "limits": {
-    "cochange_per_anchor": 50,
+    "cochange_per_anchor": 25,
     "max_edges": 500,
     "max_nodes": 200,
     "omitted_edges": 0,
@@ -463,12 +484,12 @@ on the standard fixture; trimmed to two nodes and two of the edges):
       "min_count": 2
     },
     "commits_scanned": 11,
-    "import_max_hops": 1,
+    "import_max_hops": 2,
     "kinds": [
       "import",
       "cochange"
     ],
-    "note": "Facts only, not a ranking and not a call graph: import edges are heuristic module-name matches (single hop, either direction, from the anchors out to 1 hop(s)); co-change edges are stored git-history rows between each anchor and its strongest partners (last 2000 commits, pairs sharing at least 2 commits, commits touching more than 30 files ignored). Symbol-level call edges are not recorded. Absence of an edge means none was recorded within this scope."
+    "note": "Facts only, not a ranking and not a call graph: import edges are heuristic module-name matches (single hop, either direction, from the anchors out to 2 hop(s)); co-change edges are stored git-history rows between each anchor and its strongest partners (last 2000 commits, pairs sharing at least 2 commits, commits touching more than 30 files ignored). Symbol-level call edges are not recorded. Absence of an edge means none was recorded within this scope."
   }
 }
 ```
@@ -486,16 +507,29 @@ on the standard fixture; trimmed to two nodes and two of the edges):
     `opportunities_source` / `opportunities_target` (non-bulk commits in the
     window that touched each file; `null` on an index that predates them or
     whose history walk failed, never a silent zero). For each partner of an anchor both rows are listed when both exist;
-    `direction` is always `source_to_target`.
+    `direction` is always the stored row direction `source_to_target`, never
+    relative to a question (see [Reasons](#reasons) for how
+    `explain_connection` labels the same row).
   - Import and co-change facts about one pair are separate edges.
-- `limits`: `max_nodes` 200, `max_edges` 500, `cochange_per_anchor` 50 (rows
-  read per anchor, strongest first by strength, then count, then path).
-  `truncated` is `true` when anything was cut, and then `omitted_edges` counts
-  the facts that exist but are absent (co-change rows past the per-anchor limit,
-  edges touching a file past the node cap, edges past the edge cap) and
-  `omitted_nodes` the neighbouring files past the node cap; `reason` says which.
-  Anchors are always kept; neighbours are kept nearest first then by path; edges
-  nearest an anchor first. Nothing is cut silently.
+- `limits`: `max_nodes` (200, or the lower value asked for), `max_edges` (500,
+  or lower), `cochange_per_anchor` 25 (partners read per anchor, strongest
+  first by strength, then count, then path; the partner's row back is read with
+  its partner). `truncated` is `true` when anything was cut.
+  - `omitted_edges` is exact. The unit is one edge: one directed co-change row
+    or one import edge. Emitted `edges` plus `omitted_edges` equals the number
+    of edges the same call returns with every cap removed. It counts co-change
+    rows past the per-anchor limit (both the hidden partners' own rows and their
+    rows back, since the stored table holds each pair in both directions), edges
+    touching a file past the node cap, and edges past the edge cap.
+  - `omitted_nodes` counts neighbouring files past the node cap. A co-change
+    partner hidden by the per-anchor limit is never added as a node, so it is
+    not counted in `omitted_nodes`; its rows are counted in `omitted_edges`.
+  - `reason` says which caps cut what. Anchors are always kept; neighbours are
+    kept nearest first then by path; edges nearest an anchor first (co-change
+    rows, then imports, ties in output order). Nothing is cut silently.
+  - The work is bounded as well as the answer: import edges are counted as they
+    are walked, but only the edges that survive `max_edges` are built, so a file
+    with thousands of importers costs a count, not thousands of edges.
 - `scope`: what was searched (kinds, `import_max_hops`, the co-change window,
   `commits_scanned`, `bulk_commits_excluded`, and a note). A missing edge means
   none was recorded within it.
@@ -505,7 +539,10 @@ on the standard fixture; trimmed to two nodes and two of the edges):
 
 Ids in `evidence_ids` ([`expand_connections`](#expand_connections)) and on
 `explain_connection` reasons are drawn from the same function, so for one
-snapshot they can be looked up here.
+snapshot they can be looked up here. They are guaranteed to be listed only when
+`limits.truncated` is `false` and `max_hops` is at least the hop the id was
+cited at (a 2-hop dependent cites a second-hop edge that a `max_hops` 1 graph
+does not hold).
 
 ## The pack object
 
@@ -677,8 +714,8 @@ the index becomes `Ready`.
   historically changed together with the files, not tests that failed together.
 - `get_review_history(path?, task?)`: raw, unsummarized reviewer comments, with
   `pr_number` and `pr_merged`, at most 10 per call. Pass `path`, `task`, or both.
-- `get_graph(paths, max_hops?, kinds?, snapshot?)`: raw graph facts with citable
-  edge ids; see [`get_graph`](#get_graph).
+- `get_graph(paths, max_hops?, kinds?, max_edges?, max_nodes?, snapshot?)`: raw graph
+  facts with citable edge ids; see [`get_graph`](#get_graph).
 
 ## Roadmap / not implemented
 

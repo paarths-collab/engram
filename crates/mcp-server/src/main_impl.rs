@@ -5,7 +5,7 @@ use crate::mcp::{serve, ToolHandler};
 use crate::watcher::SharedHealth;
 use engram_repo_map::store::Store;
 use engram_retrieval::budget::{self, PackPlan};
-use engram_retrieval::{Engine, GraphCaps, GraphKinds};
+use engram_retrieval::{Engine, GraphCaps, GraphKinds, GRAPH_MAX_EDGES, GRAPH_MAX_NODES};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -458,7 +458,7 @@ impl ToolHandler for Engram {
             },
             {
                 "name": "get_graph",
-                "description": "SUPPORTING tool: the raw graph FACTS around some files, for citing and for checking a recommendation. Not a ranking and not a call graph: it lists recorded edges, it does not score files. Edges are of two kinds only: `import` (single-hop, heuristic module-name resolution, `resolver: \"heuristic_module_segments\"`, `resolution_status: \"candidate\"`, never compiler-verified; always `source` = importer, `target` = imported, in either direction around an anchor, `hops: 1`) and `cochange` (a stored git-history row `source -> target` with commit `count`, `strength` relative to the commits touching `source`, the `window` it was built under, and `opportunities_source`/`opportunities_target`; the row back from a partner is its own edge with its own numbers). Symbol-level call edges are NOT recorded. Every edge has an `edge_id` (`e_` + 16 hex digits, derived from the snapshot and the edge; stable within a snapshot, changes with it, 64-bit so not globally unique): the same ids that `expand_connections` lists in `evidence_ids` and `explain_connection` reports on its reasons and per-hop `edges`. `nodes` are the anchors plus neighbours (`distance` = import hops from the nearest anchor, 1 for co-change partners). With `max_hops` 1 (default) you get every import edge touching an anchor; 2 also adds the edges touching those neighbours. Output is deterministic: nodes by path, edges by (kind, source, target, direction). Bounded, never silently: `limits` gives `max_nodes` (200), `max_edges` (500), the per-anchor co-change read limit (50), whether the result is `truncated`, and the exact `omitted_edges` / `omitted_nodes`. `scope` states what was searched, so a missing edge means none was recorded within it. Returns an error for any path that is not an indexed file. There is no `budget_tokens`: the caps are the bound.",
+                "description": "SUPPORTING tool: the raw graph FACTS around some files, for citing and for checking a recommendation. Not a ranking and not a call graph: it lists recorded edges, it does not score files. Edges are of two kinds only: `import` (single-hop, heuristic module-name resolution, `resolver: \"heuristic_module_segments\"`, `resolution_status: \"candidate\"`, never compiler-verified; always `source` = importer, `target` = imported, in either direction around an anchor, `hops: 1`) and `cochange` (a stored git-history row `source -> target` with commit `count`, `strength` relative to the commits touching `source`, the `window` it was built under, and `opportunities_source`/`opportunities_target`; the row back from a partner is its own edge with its own numbers). Symbol-level call edges are NOT recorded. Every edge has an `edge_id` (`e_` + 16 hex digits, derived from the snapshot and the edge; stable within a snapshot, changes with it, 64-bit so not globally unique): the same ids that `expand_connections` lists in `evidence_ids` and `explain_connection` reports on its reasons and per-hop `edges`. `nodes` are the anchors plus neighbours (`distance` = import hops from the nearest anchor, 1 for co-change partners). `max_hops` defaults to 2, the same as expand_connections: 1 gives every import edge touching an anchor; 2 (default) also adds the edges touching those neighbours. CITED IDS: an `edge_id` that expand_connections or explain_connection cites is guaranteed to be among these edges only when `limits.truncated` is false and `max_hops` is at least the hop it was cited at (a 2-hop dependent cites a second-hop edge that a `max_hops` 1 graph does not hold; a cap can cut a cited edge, which `limits.truncated` then reports). The `direction` of a co-change edge here is always the stored row direction (`source_to_target`), whereas the `direction` on an explain_connection reason is relative to the pair as you asked it; the same `edge_id` can therefore carry different direction labels in the two tools (the id identifies the stored fact). Unlike expand_connections, which silently ignores a path it does not know, this tool returns an error for any path that is not an indexed file. Output is deterministic: nodes by path, edges by (kind, source, target, direction). Bounded, never silently: `limits` gives `max_nodes` (default and ceiling 200), `max_edges` (default and ceiling 500; pass lower values of either to get a smaller answer), the per-anchor co-change read limit (25 partners), whether the result is `truncated`, and the exact `omitted_edges` / `omitted_nodes`. `omitted_edges` is exact: emitted edges plus `omitted_edges` equals every edge (one directed co-change row or one import edge) the same call returns with no cap, counting the reverse rows of co-change partners hidden by the per-anchor limit; `omitted_nodes` counts neighbouring files past the node cap (a partner hidden by the per-anchor limit is never added as a node). `scope` states what was searched, so a missing edge means none was recorded within it. There is no `budget_tokens`: the caps are the bound.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -468,7 +468,9 @@ impl ToolHandler for Engram {
                             "minItems": 1,
                             "description": "Repo-relative paths of the anchor files, e.g. ['app/service.py']. Every path must be an indexed file."
                         },
-                        "max_hops": { "type": "integer", "minimum": 1, "maximum": 2, "default": 1, "description": "Import distance to follow from the anchors (1 = edges touching an anchor, 2 = also edges touching their direct neighbours). Co-change edges are always anchor-to-partner. Values outside 1..=2 are an error." },
+                        "max_hops": { "type": "integer", "minimum": 1, "maximum": 2, "default": 2, "description": "Import distance to follow from the anchors (1 = edges touching an anchor, 2 = also edges touching their direct neighbours). Default 2, the same as expand_connections, so the edges an expansion cites are present (unless `limits.truncated`). Co-change edges are always anchor-to-partner. Values outside 1..=2 are an error." },
+                        "max_edges": { "type": "integer", "minimum": 1, "maximum": 500, "default": 500, "description": "Return at most this many edges. Can only lower the hard cap of 500; values outside 1..=500 or non-integers are an error. Edges cut by it are counted in `limits.omitted_edges`." },
+                        "max_nodes": { "type": "integer", "minimum": 1, "maximum": 200, "default": 200, "description": "Return at most this many nodes (anchors always stay, so it must be at least the number of distinct anchors). Can only lower the hard cap of 200; values outside 1..=200 or non-integers are an error. Files cut by it are counted in `limits.omitted_nodes`." },
                         "kinds": {
                             "type": "array",
                             "items": { "type": "string", "enum": ["import", "cochange"] },
@@ -704,14 +706,19 @@ impl Engram {
             }
             "get_graph" => {
                 let requested_snapshot = snapshot_arg(args)?;
-                let max_hops = max_hops_arg(args)?.unwrap_or(1);
+                let max_hops = max_hops_arg(args)?.unwrap_or(2);
                 let kinds = kinds_arg(args)?;
                 let paths = graph_paths_arg(args)?;
+                let caps = GraphCaps {
+                    max_nodes: bounded_arg(args, "max_nodes", GRAPH_MAX_NODES)?,
+                    max_edges: bounded_arg(args, "max_edges", GRAPH_MAX_EDGES)?,
+                    ..GraphCaps::default()
+                };
                 self.ensure_engine()?;
                 let engine = self.engine.as_ref().unwrap();
                 let store = self.store.as_ref().unwrap();
                 let facts = engine
-                    .graph_facts(store, &paths, max_hops, kinds, GraphCaps::default())
+                    .graph_facts(store, &paths, max_hops, kinds, caps)
                     .map_err(|e| e.to_string())?;
                 let mut result = serde_json::to_value(&facts).map_err(|e| e.to_string())?;
                 if let Some(requested) = requested_snapshot {
@@ -831,6 +838,21 @@ fn max_hops_arg(args: &Value) -> Result<Option<usize>, String> {
                 .map_err(|_| format!("max_hops {n} does not fit in usize")),
             _ => Err(format!(
                 "max_hops must be an integer between 1 and 2, got {v}"
+            )),
+        },
+    }
+}
+
+/// A `get_graph` bound (`max_nodes`, `max_edges`): absent or null means the
+/// ceiling; otherwise an integer in `1..=ceiling`. It can lower the cap, never
+/// raise it.
+fn bounded_arg(args: &Value, name: &str, ceiling: usize) -> Result<usize, String> {
+    match args.get(name) {
+        None | Some(Value::Null) => Ok(ceiling),
+        Some(v) => match v.as_u64().and_then(|n| usize::try_from(n).ok()) {
+            Some(n) if (1..=ceiling).contains(&n) => Ok(n),
+            _ => Err(format!(
+                "{name} must be an integer between 1 and {ceiling}, got {v}"
             )),
         },
     }
@@ -1951,7 +1973,16 @@ mod tests {
         let props = &tool["inputSchema"]["properties"];
         assert_eq!(props["paths"]["type"], "array");
         assert_eq!(props["max_hops"]["maximum"], 2);
-        assert_eq!(props["max_hops"]["default"], 1);
+        assert_eq!(props["max_hops"]["default"], 2);
+        assert_eq!(props["max_edges"]["maximum"], 500);
+        assert_eq!(props["max_edges"]["default"], 500);
+        assert_eq!(props["max_nodes"]["maximum"], 200);
+        assert_eq!(props["max_nodes"]["default"], 200);
+        assert!(
+            description.contains("limits.truncated")
+                && description.contains("is at least the hop it was cited at"),
+            "{description}"
+        );
         assert_eq!(
             props["kinds"]["items"]["enum"],
             json!(["import", "cochange"])
@@ -2036,6 +2067,133 @@ mod tests {
                 .expect_err(&format!("{args} must be rejected"));
             assert!(err.contains(needle), "{args}: {err}");
         }
+    }
+
+    fn edge_ids_of(graph: &Value) -> std::collections::BTreeSet<String> {
+        graph["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["edge_id"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn get_graph_defaults_to_the_expansion_depth_so_what_it_cites_is_listed() {
+        let (_repo, mut engram) = fan_repo();
+        // chain_c -> chain_b -> chain_a: chain_c is a 2-hop dependent.
+        let anchor = json!({ "paths": ["app/chain_a.py"] });
+        let expanded = engram.call_tool("expand_connections", &anchor).unwrap();
+        let mut cited = std::collections::BTreeSet::new();
+        for key in ["cochange_expansions", "import_expansions"] {
+            for entry in expanded[key].as_array().unwrap() {
+                for id in entry["evidence_ids"].as_array().unwrap() {
+                    cited.insert(id.as_str().unwrap().to_owned());
+                }
+            }
+        }
+        assert_eq!(cited.len(), 2, "chain_b's edge and chain_c's outer hop");
+
+        // (a) At default arguments the graph has both hops, nothing cut.
+        let default = engram.call_tool("get_graph", &anchor).unwrap();
+        assert_eq!(default["scope"]["import_max_hops"], 2);
+        assert_eq!(default["limits"]["truncated"], false);
+        assert!(cited.is_subset(&edge_ids_of(&default)), "{default}");
+
+        // (b) With max_hops 1 the outer-hop id is absent, without truncation.
+        let one = engram
+            .call_tool(
+                "get_graph",
+                &json!({ "paths": ["app/chain_a.py"], "max_hops": 1 }),
+            )
+            .unwrap();
+        assert_eq!(one["limits"]["truncated"], false);
+        let one_ids = edge_ids_of(&one);
+        let missing: Vec<_> = cited.difference(&one_ids).collect();
+        assert_eq!(missing.len(), 1, "{missing:?}");
+
+        // (c) A cap that cuts a cited edge is reported as truncation.
+        let cut = engram
+            .call_tool(
+                "get_graph",
+                &json!({ "paths": ["app/chain_a.py"], "max_edges": 1 }),
+            )
+            .unwrap();
+        assert!(!cited.is_subset(&edge_ids_of(&cut)));
+        assert_eq!(cut["limits"]["truncated"], true);
+        assert_eq!(cut["limits"]["omitted_edges"], 1);
+    }
+
+    #[test]
+    fn get_graph_max_edges_and_max_nodes_only_lower_the_hard_caps() {
+        let (_repo, mut engram) = fan_repo();
+        let anchor = |extra: Value| {
+            let mut args = json!({ "paths": ["app/anchor.py"] });
+            for (k, v) in extra.as_object().unwrap() {
+                args[k] = v.clone();
+            }
+            args
+        };
+        for (arg, bad) in [
+            ("max_edges", json!(0)),
+            ("max_edges", json!(501)),
+            ("max_edges", json!(-1)),
+            ("max_edges", json!(1.5)),
+            ("max_edges", json!(10.0)),
+            ("max_edges", json!("10")),
+            ("max_edges", json!(true)),
+            ("max_nodes", json!(0)),
+            ("max_nodes", json!(201)),
+            ("max_nodes", json!(2.5)),
+            ("max_nodes", json!([5])),
+        ] {
+            let err = engram
+                .call_tool("get_graph", &anchor(json!({ arg: bad.clone() })))
+                .expect_err(&format!("{arg}={bad} must be rejected"));
+            assert!(err.contains(arg), "{arg}={bad}: {err}");
+        }
+
+        let full = engram.call_tool("get_graph", &anchor(json!({}))).unwrap();
+        let (edges, nodes) = (
+            full["edges"].as_array().unwrap().len(),
+            full["nodes"].as_array().unwrap().len(),
+        );
+        // 12 co-change rows, 12 direct importers, and top -> mid (2 hops).
+        assert_eq!((edges, nodes), (25, 26));
+        assert_eq!(full["limits"]["truncated"], false);
+        // The ceilings themselves, and null, are the defaults.
+        for same in [
+            json!({ "max_edges": 500, "max_nodes": 200 }),
+            json!({ "max_edges": null, "max_nodes": null }),
+        ] {
+            assert_eq!(engram.call_tool("get_graph", &anchor(same)).unwrap(), full);
+        }
+
+        // Lowering works, and the counts stay exact.
+        let few = engram
+            .call_tool("get_graph", &anchor(json!({ "max_edges": 10 })))
+            .unwrap();
+        assert_eq!(few["edges"].as_array().unwrap().len(), 10);
+        assert_eq!(few["limits"]["max_edges"], 10);
+        assert_eq!(few["limits"]["truncated"], true);
+        assert_eq!(few["limits"]["omitted_edges"], edges - 10);
+        let small = engram
+            .call_tool("get_graph", &anchor(json!({ "max_nodes": 5 })))
+            .unwrap();
+        assert_eq!(small["nodes"].as_array().unwrap().len(), 5);
+        assert_eq!(small["limits"]["max_nodes"], 5);
+        assert_eq!(small["limits"]["omitted_nodes"], nodes - 5);
+        let kept = small["edges"].as_array().unwrap().len();
+        assert_eq!(small["limits"]["omitted_edges"], edges - kept);
+
+        // More anchors than max_nodes is refused outright.
+        let err = engram
+            .call_tool(
+                "get_graph",
+                &json!({ "paths": ["app/anchor.py", "app/mid.py"], "max_nodes": 1 }),
+            )
+            .expect_err("two anchors do not fit in one node");
+        assert!(err.contains("node cap"), "{err}");
     }
 
     #[test]

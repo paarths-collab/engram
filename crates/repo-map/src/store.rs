@@ -1192,6 +1192,44 @@ impl Store {
         })
     }
 
+    /// How many directed co-change rows the neighbourhood of `anchors` holds in
+    /// all, read or not: every row `anchor -> partner` whose partner is an
+    /// indexed file other than the anchor, plus every row `partner -> anchor`
+    /// whose forward row `anchor -> partner` exists (the reverse row a graph
+    /// lists with it). A row reachable from two anchors counts once. This is the
+    /// number of co-change facts a graph of `anchors` holds with no limit
+    /// applied, so `total - listed` is exactly what a limit hid.
+    pub fn cochange_fact_count(&self, anchors: &[String]) -> Result<usize> {
+        if anchors.is_empty() {
+            return Ok(0);
+        }
+        // One bound variable per anchor, used twice below.
+        anyhow::ensure!(
+            anchors.len() <= 400,
+            "at most 400 anchors per co-change count, got {}",
+            anchors.len()
+        );
+        let marks = vec!["?"; anchors.len()].join(",");
+        let sql = format!(
+            "SELECT COUNT(*) FROM (
+                 SELECT c.path_a AS a, c.path_b AS b
+                 FROM cochange c JOIN files f ON f.path = c.path_b
+                 WHERE c.path_a IN ({marks}) AND c.path_b <> c.path_a
+                 UNION
+                 SELECT r.path_a, r.path_b
+                 FROM cochange r
+                 JOIN cochange c ON c.path_a = r.path_b AND c.path_b = r.path_a
+                 JOIN files f ON f.path = r.path_a
+                 WHERE r.path_b IN ({marks}) AND r.path_a <> r.path_b
+             )"
+        );
+        let bound = anchors.iter().chain(anchors.iter());
+        let n: i64 = self
+            .conn
+            .query_row(&sql, rusqlite::params_from_iter(bound), |r| r.get(0))?;
+        Ok(usize::try_from(n).unwrap_or(0))
+    }
+
     /// The single directed co-change row `a -> b`, looked up by primary key.
     /// Unlike [`Store::cochange_for`] this is not ranked or capped, so a weak
     /// pair is found as reliably as a strong one. `b -> a` is a separate row.
@@ -1744,6 +1782,49 @@ mod tests {
         // The reverse row was never recorded; direction matters.
         assert!(store.cochange_pair("weak.rs", "a.rs").unwrap().is_none());
         assert!(store.cochange_pair("a.rs", "nope.rs").unwrap().is_none());
+    }
+
+    #[test]
+    fn cochange_fact_count_counts_each_listed_row_once_and_reverse_rows_with_their_forward() {
+        let repo = TempRepo::new();
+        let mut store = repo.store();
+        store
+            .upsert_files(&["a.rs", "b.rs", "c.rs", "d.rs"].map(file))
+            .expect("files are indexed");
+        let row = |a: &str, b: &str| CoChange {
+            path_a: a.to_owned(),
+            path_b: b.to_owned(),
+            count: 3,
+            strength: 0.5,
+        };
+        store
+            .replace_cochange(&[
+                // a <-> b both ways, a -> c forward only, d -> a reverse only,
+                // a -> deleted.rs (not indexed), and c <-> d unrelated to a.
+                row("a.rs", "b.rs"),
+                row("b.rs", "a.rs"),
+                row("a.rs", "c.rs"),
+                row("d.rs", "a.rs"),
+                row("a.rs", "deleted.rs"),
+                row("c.rs", "d.rs"),
+                row("d.rs", "c.rs"),
+            ])
+            .unwrap();
+        let anchors =
+            |names: &[&str]| -> Vec<String> { names.iter().map(|n| (*n).to_owned()).collect() };
+        // a: a->b, a->c, and the reverse b->a (its forward exists); d->a has
+        // no forward a->d, and deleted.rs is not a file.
+        assert_eq!(store.cochange_fact_count(&anchors(&["a.rs"])).unwrap(), 3);
+        // a and b together: b->a is both b's forward row and a's reverse row.
+        assert_eq!(
+            store
+                .cochange_fact_count(&anchors(&["a.rs", "b.rs"]))
+                .unwrap(),
+            3
+        );
+        // d: d->a, d->c forward; reverse c->d exists with forward d->c.
+        assert_eq!(store.cochange_fact_count(&anchors(&["d.rs"])).unwrap(), 3);
+        assert_eq!(store.cochange_fact_count(&[]).unwrap(), 0);
     }
 
     #[test]

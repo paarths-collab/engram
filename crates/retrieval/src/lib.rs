@@ -17,7 +17,7 @@ use engram_domain::{
 };
 use engram_repo_map::graph::{CodeGraph, EdgeKind, ImportSearch};
 use engram_repo_map::store::Store;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
@@ -118,16 +118,17 @@ const COCHANGE_SCAN_LIMIT: usize = 100_000;
 const IMPORT_RESOLUTION: &str = "heuristic";
 const IMPORT_RESOLVER: &str = "heuristic_module_segments";
 
-/// Default bounds of [`Engine::graph_facts`] (`get_graph`).
+/// Hard bounds of [`Engine::graph_facts`] (`get_graph`); the `max_nodes` and
+/// `max_edges` arguments can only lower them.
 pub const GRAPH_MAX_NODES: usize = 200;
 pub const GRAPH_MAX_EDGES: usize = 500;
-/// Co-change rows read per anchor. Far above the 5 per anchor the
+/// Co-change partners read per anchor. Well above the 5 per anchor the
 /// recommendations keep, and ordered the same way, so every co-change edge a
 /// recommendation cites is inside it.
-pub const GRAPH_COCHANGE_PER_ANCHOR: usize = 50;
+pub const GRAPH_COCHANGE_PER_ANCHOR: usize = 25;
 
-/// The hard bounds of one [`Engine::graph_facts`] call. The defaults are the
-/// ones `get_graph` serves; tests lower them to exercise truncation.
+/// The bounds of one [`Engine::graph_facts`] call. The defaults are the hard
+/// ones `get_graph` serves; `get_graph` and the tests can lower them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GraphCaps {
     pub max_nodes: usize,
@@ -1054,8 +1055,22 @@ impl Engine {
     ///
     /// Every edge carries the content-derived id the recommendations and
     /// `explain_connection` cite it by. Output order is deterministic: nodes
-    /// by path, edges by (kind, source, target, direction). When a cap cuts
-    /// anything, `limits` says so with exact counts; nothing is cut silently.
+    /// by path, edges by (kind, source, target, direction).
+    ///
+    /// Accounting. The unit is one emitted edge, i.e. one directed co-change
+    /// row or one import edge. `omitted_edges` is exactly the number of edges
+    /// the same call would have emitted with every cap removed, minus the
+    /// number it did emit: co-change rows past the per-anchor limit (and the
+    /// reverse rows of those partners), edges touching a file past the node
+    /// cap, and edges past the edge cap. `omitted_nodes` counts neighbouring
+    /// files past the node cap; a partner hidden by the per-anchor co-change
+    /// limit is never added as a node, so it is not counted there, only
+    /// through its edges. Nothing is cut silently.
+    ///
+    /// The work is bounded as well as the answer: the anchor count is checked
+    /// before any anchor is looked up, and import edges are counted as they
+    /// are walked but only the `max_edges` that survive the cut are ever built.
+    ///
     /// Errors for a path that is not an indexed file, an empty anchor list,
     /// more anchors than `caps.max_nodes`, or `max_hops` outside `1..=2`.
     pub fn graph_facts(
@@ -1081,9 +1096,8 @@ impl Engine {
         if anchors.is_empty() {
             anyhow::bail!("at least one anchor path is required");
         }
-        for path in &anchors {
-            self.require_indexed(path)?;
-        }
+        // Checked before any anchor is looked up, so an oversized request is
+        // refused without touching the index.
         if anchors.len() > caps.max_nodes {
             anyhow::bail!(
                 "{} anchor paths exceed the {}-node cap; pass fewer paths",
@@ -1091,63 +1105,44 @@ impl Engine {
                 caps.max_nodes
             );
         }
+        for path in &anchors {
+            self.require_indexed(path)?;
+        }
+        let anchor_set: HashSet<&str> = anchors.iter().map(String::as_str).collect();
 
-        const IMPORT_DIRECTION: &str = "source_imports_target";
-        const COCHANGE_DIRECTION: &str = "source_to_target";
-        // (kind, source, target, direction): the output order, and dedup.
-        type Key = (&'static str, String, String, &'static str);
-        // Edge plus the import distance it was found at (0 = touches an anchor).
-        let mut edges: BTreeMap<Key, (usize, GraphEdge)> = BTreeMap::new();
-        let mut dist: BTreeMap<String, usize> = anchors.iter().map(|a| (a.clone(), 0)).collect();
-
+        // Import neighbourhood: BFS levels over import edges in either
+        // direction. `levels[d]` is sorted, so every walk below is in a
+        // deterministic order.
+        let mut import_dist: HashMap<String, usize> =
+            anchors.iter().map(|a| (a.clone(), 0)).collect();
+        let mut levels: Vec<Vec<String>> = vec![anchors.clone()];
         if kinds.import {
-            let mut add = |importer: &str, imported: &str, depth: usize| {
-                let key: Key = (
-                    "import",
-                    importer.to_owned(),
-                    imported.to_owned(),
-                    IMPORT_DIRECTION,
-                );
-                edges.entry(key).or_insert_with(|| {
-                    (
-                        depth,
-                        GraphEdge::Import {
-                            edge_id: import_edge_id(&self.snapshot, &[importer, imported]),
-                            source: importer.to_owned(),
-                            target: imported.to_owned(),
-                            direction: ImportDirection::SourceImportsTarget,
-                            hops: 1,
-                            resolver: IMPORT_RESOLVER,
-                            resolution_status: "candidate",
-                        },
-                    )
-                });
-            };
-            let mut frontier: Vec<String> = anchors.clone();
             for depth in 0..max_hops {
                 let mut next: BTreeSet<String> = BTreeSet::new();
-                for node in &frontier {
-                    let outgoing = self.graph.import_targets(node);
-                    let incoming = self.graph.import_sources(node);
-                    for imported in &outgoing {
-                        add(node, imported, depth);
-                    }
-                    for importer in &incoming {
-                        add(importer, node, depth);
-                    }
-                    for other in outgoing.into_iter().chain(incoming) {
-                        if !dist.contains_key(&other) {
-                            dist.insert(other.clone(), depth + 1);
+                for node in &levels[depth] {
+                    for other in self
+                        .graph
+                        .import_targets(node)
+                        .into_iter()
+                        .chain(self.graph.import_sources(node))
+                    {
+                        if !import_dist.contains_key(&other) {
+                            import_dist.insert(other.clone(), depth + 1);
                             next.insert(other);
                         }
                     }
                 }
-                frontier = next.into_iter().collect();
+                levels.push(next.into_iter().collect());
             }
         }
+        let mut dist: BTreeMap<String, usize> =
+            import_dist.iter().map(|(p, d)| (p.clone(), *d)).collect();
 
+        // Co-change facts: each anchor's strongest rows plus the partner's
+        // row back, keyed (source, target).
         let totals = store.cochange_totals()?;
-        let mut cochange_beyond_limit = 0usize;
+        let mut cochange: BTreeMap<(String, String), GraphEdge> = BTreeMap::new();
+        let mut cochange_total = 0usize;
         if kinds.cochange {
             let window = cochange_window();
             let mut opportunities: HashMap<String, Option<u32>> = HashMap::new();
@@ -1161,7 +1156,6 @@ impl Engine {
             };
             for anchor in &anchors {
                 let neighbors = store.cochange_neighbors(anchor, caps.cochange_per_anchor)?;
-                cochange_beyond_limit += neighbors.total.saturating_sub(neighbors.rows.len());
                 for row in neighbors.rows {
                     let partner = row.path_b.clone();
                     if partner == *anchor || !self.by_path.contains_key(&partner) {
@@ -1170,13 +1164,8 @@ impl Engine {
                     // The anchor's own row, and the partner's row back to it.
                     let reverse = store.cochange_pair(&partner, anchor)?;
                     for stored in std::iter::once(row).chain(reverse) {
-                        let key: Key = (
-                            "cochange",
-                            stored.path_a.clone(),
-                            stored.path_b.clone(),
-                            COCHANGE_DIRECTION,
-                        );
-                        if edges.contains_key(&key) {
+                        let key = (stored.path_a.clone(), stored.path_b.clone());
+                        if cochange.contains_key(&key) {
                             continue;
                         }
                         let edge = GraphEdge::Cochange {
@@ -1194,52 +1183,139 @@ impl Engine {
                             strength: stored.strength,
                             window,
                         };
-                        edges.insert(key, (0, edge));
+                        cochange.insert(key, edge);
                     }
                     dist.entry(partner)
                         .and_modify(|d| *d = (*d).min(1))
                         .or_insert(1);
                 }
             }
+            // Every such row there is, read or not: the total the hidden
+            // count is taken against.
+            cochange_total = store.cochange_fact_count(&anchors)?;
         }
+        let cochange_hidden = cochange_total.saturating_sub(cochange.len());
 
         // Node cap: anchors always stay; neighbours are kept nearest first,
         // then by path, so the same cut is made on every run.
         let mut neighbors: Vec<(&String, &usize)> = dist
             .iter()
-            .filter(|(path, _)| !anchors.contains(path))
+            .filter(|(path, _)| !anchor_set.contains(path.as_str()))
             .collect();
         neighbors.sort_by(|a, b| a.1.cmp(b.1).then_with(|| a.0.cmp(b.0)));
         let node_room = caps.max_nodes - anchors.len();
         let omitted_nodes = neighbors.len().saturating_sub(node_room);
-        let kept: BTreeSet<&String> = anchors
+        let kept: BTreeSet<&str> = anchors
             .iter()
-            .chain(neighbors.iter().take(node_room).map(|(path, _)| *path))
+            .map(String::as_str)
+            .chain(
+                neighbors
+                    .iter()
+                    .take(node_room)
+                    .map(|(path, _)| path.as_str()),
+            )
             .collect();
 
-        // Edge caps: first drop edges touching a node that did not make it,
-        // then keep the nearest max_edges (ties by the output order).
-        let candidate_total = edges.len();
-        let mut candidates: Vec<(usize, Key, GraphEdge)> = edges
+        // Edge caps. First drop edges touching a node that did not make it,
+        // then keep the nearest `max_edges` (co-change rows, all at distance
+        // 0, before imports at the same distance; ties by the output order).
+        let cochange_found = cochange.len();
+        let mut cochange_kept: Vec<GraphEdge> = cochange
             .into_iter()
-            .filter(|(key, _)| kept.contains(&key.1) && kept.contains(&key.2))
-            .map(|(key, (depth, edge))| (depth, key, edge))
+            .filter(|((source, target), _)| {
+                kept.contains(source.as_str()) && kept.contains(target.as_str())
+            })
+            .map(|(_, edge)| edge)
             .collect();
-        let dropped_by_node_cap = candidate_total - candidates.len();
-        candidates.sort_by_key(|(depth, ..)| *depth);
-        let dropped_by_edge_cap = candidates.len().saturating_sub(caps.max_edges);
-        candidates.truncate(caps.max_edges);
-        candidates.sort_by(|a, b| a.1.cmp(&b.1));
-        let emitted: Vec<GraphEdge> = candidates.into_iter().map(|(_, _, edge)| edge).collect();
+        let cochange_dropped_by_node_cap = cochange_found - cochange_kept.len();
+        let cochange_dropped_by_edge_cap = cochange_kept.len().saturating_sub(caps.max_edges);
+        cochange_kept.truncate(caps.max_edges);
 
-        let omitted_edges = cochange_beyond_limit + dropped_by_node_cap + dropped_by_edge_cap;
+        // Imports are walked once more, counting every edge and holding only
+        // the best `import_room` of them: a hub with thousands of importers
+        // costs a counter, not thousands of built edges. An edge belongs to
+        // the endpoint nearer to the anchors (the smaller path when equally
+        // near), so each is seen exactly once.
+        let import_room = caps.max_edges - cochange_kept.len();
+        let mut import_total = 0usize;
+        let mut import_dropped_by_node_cap = 0usize;
+        let mut import_candidates = 0usize;
+        let mut best: BinaryHeap<(usize, String, String)> = BinaryHeap::new();
+        if kinds.import {
+            for (depth, level) in levels.iter().enumerate().take(max_hops) {
+                for node in level {
+                    let outgoing = self.graph.import_targets(node);
+                    let incoming = self.graph.import_sources(node);
+                    let seen = outgoing
+                        .iter()
+                        .map(|imported| (node, imported, imported))
+                        .chain(incoming.iter().map(|importer| (importer, node, importer)));
+                    for (importer, imported, other) in seen {
+                        let other_depth = import_dist.get(other).copied().unwrap_or(usize::MAX);
+                        let owned = other_depth > depth
+                            || (other_depth == depth && node.as_str() < other.as_str());
+                        if !owned {
+                            continue;
+                        }
+                        import_total += 1;
+                        if !(kept.contains(importer.as_str()) && kept.contains(imported.as_str())) {
+                            import_dropped_by_node_cap += 1;
+                            continue;
+                        }
+                        import_candidates += 1;
+                        if import_room == 0 {
+                            continue;
+                        }
+                        let candidate = (depth, importer.as_str(), imported.as_str());
+                        if best.len() < import_room {
+                            best.push((depth, importer.clone(), imported.clone()));
+                        } else if best.peek().is_some_and(|worst| {
+                            candidate < (worst.0, worst.1.as_str(), worst.2.as_str())
+                        }) {
+                            best.pop();
+                            best.push((depth, importer.clone(), imported.clone()));
+                        }
+                    }
+                }
+            }
+        }
+        let import_dropped_by_edge_cap = import_candidates - best.len();
+        let mut imports: Vec<(String, String)> = best
+            .into_iter()
+            .map(|(_, importer, imported)| (importer, imported))
+            .collect();
+        imports.sort();
+
+        let mut emitted: Vec<GraphEdge> = cochange_kept;
+        emitted.extend(
+            imports
+                .into_iter()
+                .map(|(importer, imported)| GraphEdge::Import {
+                    edge_id: import_edge_id(&self.snapshot, &[&importer, &imported]),
+                    source: importer,
+                    target: imported,
+                    direction: ImportDirection::SourceImportsTarget,
+                    hops: 1,
+                    resolver: IMPORT_RESOLVER,
+                    resolution_status: "candidate",
+                }),
+        );
+
+        let dropped_by_node_cap = cochange_dropped_by_node_cap + import_dropped_by_node_cap;
+        let dropped_by_edge_cap = cochange_dropped_by_edge_cap + import_dropped_by_edge_cap;
+        let omitted_edges = cochange_hidden + dropped_by_node_cap + dropped_by_edge_cap;
+        debug_assert_eq!(
+            emitted.len() + omitted_edges,
+            cochange_total + import_total,
+            "emitted + omitted must be every fact there is"
+        );
         let truncated = omitted_edges > 0 || omitted_nodes > 0;
         let reason = if truncated {
             let mut parts = Vec::new();
-            if cochange_beyond_limit > 0 {
+            if cochange_hidden > 0 {
                 parts.push(format!(
-                    "{cochange_beyond_limit} co-change row(s) past the per-anchor read limit \
-                     of {}",
+                    "{cochange_hidden} co-change row(s) past the per-anchor limit of {} partners \
+                     (including the reverse rows of the hidden partners)",
                     caps.cochange_per_anchor
                 ));
             }
@@ -1271,8 +1347,8 @@ impl Engine {
             .map(|path| {
                 let language = Language::from_path(path);
                 GraphNode {
-                    path: (*path).clone(),
-                    role: if anchors.contains(path) {
+                    path: (*path).to_owned(),
+                    role: if anchor_set.contains(path) {
                         GraphNodeRole::Anchor
                     } else {
                         GraphNodeRole::Neighbor
@@ -2507,9 +2583,71 @@ fn second() {
         );
     }
 
+    /// What the history walk stores: every pair in both directions, the row
+    /// back carrying its own strength (relative to its own source's commits).
+    fn mirrored(forward: Vec<engram_domain::CoChange>) -> Vec<engram_domain::CoChange> {
+        let back: Vec<engram_domain::CoChange> = forward
+            .iter()
+            .map(|e| {
+                cochange(
+                    &e.path_b,
+                    &e.path_a,
+                    e.count,
+                    e.count as f32 / (e.count as f32 + 4.0),
+                )
+            })
+            .collect();
+        forward.into_iter().chain(back).collect()
+    }
+
+    /// A real repository where `app/anchor.py` co-changed with `partners`
+    /// files, partner `i` in `partners + 2 - i` commits (strictly decreasing),
+    /// and `importers` files import the anchor. The walk that indexing runs
+    /// turns this into the table production holds. `None` when `git` is
+    /// unavailable.
+    fn partner_history_repo(tag: &str, partners: usize, importers: usize) -> Option<TempRepo> {
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .map(|o| !o.status.success())
+            .unwrap_or(true)
+        {
+            eprintln!("SKIPPED: git is not available");
+            return None;
+        }
+        let repo = TempRepo::new(tag);
+        let dir = repo.0.as_path();
+        std::fs::create_dir_all(dir.join("app")).unwrap();
+        run_git(dir, &["init", "-q"]);
+        let write = |name: &str, body: &str| {
+            std::fs::write(dir.join("app").join(name), body).unwrap();
+        };
+        for i in 0..importers {
+            write(
+                &format!("imp{i:02}.py"),
+                "from app.anchor import anchor\n\ndef use(): return anchor()\n",
+            );
+        }
+        for round in 0..=partners + 1 {
+            write("anchor.py", &format!("def anchor(): return {round}\n"));
+            for i in 0..partners {
+                if round == 0 || partners + 1 - i >= round {
+                    write(
+                        &format!("p{i:02}.py"),
+                        &format!("def p{i}(): return {round}\n"),
+                    );
+                }
+            }
+            run_git(dir, &["add", "app"]);
+            run_git(dir, &["commit", "-q", "-m", &format!("round {round}")]);
+        }
+        Some(repo)
+    }
+
     /// One anchor, `partners` indexed files it co-changed with (strengths
-    /// strictly decreasing, so the ranking is unambiguous) and `importers`
-    /// indexed files that import it.
+    /// strictly decreasing, so the ranking is unambiguous; each pair stored in
+    /// both directions, as production stores it) and `importers` indexed files
+    /// that import it.
     fn fan_fixture(tag: &str, partners: usize, importers: usize) -> (TempRepo, Store, Engine) {
         use engram_domain::{FileRecord, Language};
         let repo = TempRepo::new(tag);
@@ -2548,7 +2686,7 @@ fn second() {
                 )
             })
             .collect();
-        store.replace_cochange(&edges).unwrap();
+        store.replace_cochange(&mirrored(edges)).unwrap();
         let engine = Engine::build(&repo.0, &mut store).expect("build engine");
         (repo, store, engine)
     }
@@ -3355,22 +3493,24 @@ fn second() {
 
     #[test]
     fn caps_truncate_graph_facts_with_exact_omitted_counts() {
-        // A hub: 12 co-change partners and 6 importers, 18 edges, 19 files.
+        // A hub: 12 co-change partners (both directions, like production) and
+        // 6 importers: 24 co-change rows + 6 imports = 30 edges, 19 files.
         let (_repo, store, engine) = fan_fixture("graph-caps", 12, 6);
         let full = capped(&engine, &store, GraphCaps::default());
-        assert_eq!((full.nodes.len(), full.edges.len()), (19, 18));
+        assert_eq!((full.nodes.len(), full.edges.len()), (19, 30));
         assert!(!full.limits.truncated);
         assert_eq!(full.limits.reason, "complete: no cap cut anything");
         let full_ids = graph_ids(&full);
 
-        // Co-change read limit: 5 of 12 rows read, so 7 are hidden and counted.
+        // Co-change read limit: 5 of 12 partners read, so 7 partners are
+        // hidden and each hides two rows (its own and its row back): 14.
         let facts = capped(&engine, &store, caps(200, 500, 5));
-        assert_eq!((facts.nodes.len(), facts.edges.len()), (12, 11));
+        assert_eq!((facts.nodes.len(), facts.edges.len()), (12, 16));
         assert!(facts.limits.truncated);
-        assert_eq!(facts.limits.omitted_edges, 7);
+        assert_eq!(facts.limits.omitted_edges, 14);
         assert_eq!(facts.limits.omitted_nodes, 0);
         assert!(
-            facts.limits.reason.contains("7 co-change row(s)"),
+            facts.limits.reason.contains("14 co-change row(s)"),
             "{}",
             facts.limits.reason
         );
@@ -3380,8 +3520,10 @@ fn second() {
             .edges
             .iter()
             .filter_map(|e| match e {
-                GraphEdge::Cochange { target, .. } => Some(target.as_str()),
-                GraphEdge::Import { .. } => None,
+                GraphEdge::Cochange { source, target, .. } if source == "app/anchor.py" => {
+                    Some(target.as_str())
+                }
+                _ => None,
             })
             .collect();
         assert_eq!(
@@ -3396,25 +3538,26 @@ fn second() {
         );
 
         // Node cap: 10 nodes = the anchor + 9 neighbours, nearest then by path
-        // (the 6 importers, then p00..p02). The 9 co-change edges to p03..p11
-        // lose an endpoint and are counted; so are the 9 omitted files.
+        // (the 6 importers, then p00..p02). The 18 co-change rows to and from
+        // p03..p11 lose an endpoint and are counted; so are the 9 files.
         let facts = capped(&engine, &store, caps(10, 500, 50));
-        assert_eq!((facts.nodes.len(), facts.edges.len()), (10, 9));
+        assert_eq!((facts.nodes.len(), facts.edges.len()), (10, 12));
         assert_eq!(facts.limits.omitted_nodes, 9);
-        assert_eq!(facts.limits.omitted_edges, 9);
+        assert_eq!(facts.limits.omitted_edges, 18);
         assert!(facts.limits.truncated);
         let node_paths: Vec<&str> = facts.nodes.iter().map(|n| n.path.as_str()).collect();
         assert!(node_paths.contains(&"app/p02.py") && !node_paths.contains(&"app/p03.py"));
         assert!(graph_ids(&facts).is_subset(&full_ids));
 
-        // Edge cap: all 18 candidates touch the anchor, so ties fall back to
-        // (kind, source, target) order: the first 7 are co-change p00..p06.
+        // Edge cap: all 30 candidates touch the anchor, so ties fall back to
+        // (kind, source, target) order: the first 7 are the anchor's rows to
+        // p00..p06.
         let facts = capped(&engine, &store, caps(200, 7, 50));
         assert_eq!((facts.nodes.len(), facts.edges.len()), (19, 7));
-        assert_eq!(facts.limits.omitted_edges, 11);
+        assert_eq!(facts.limits.omitted_edges, 23);
         assert_eq!(facts.limits.omitted_nodes, 0);
         assert!(
-            facts.limits.reason.contains("11 edge(s)"),
+            facts.limits.reason.contains("23 edge(s)"),
             "{}",
             facts.limits.reason
         );
@@ -3428,12 +3571,324 @@ fn second() {
             caps(4, 3, 2),
         ] {
             let f = capped(&engine, &store, c);
-            assert_eq!(f.edges.len() + f.limits.omitted_edges, 18, "{c:?}");
+            assert_eq!(f.edges.len() + f.limits.omitted_edges, 30, "{c:?}");
             assert!(
                 f.nodes.len() <= c.max_nodes && f.edges.len() <= c.max_edges,
                 "{c:?}"
             );
         }
+    }
+
+    /// Caps nothing can reach in these fixtures: the reference "no caps" run.
+    fn raised() -> GraphCaps {
+        caps(1000, 100_000, 100_000)
+    }
+
+    /// Under every cap in a grid, `emitted + omitted_edges` is exactly the
+    /// number of edges the same call emits with the caps raised.
+    fn assert_exact_accounting(engine: &Engine, store: &Store, anchors: &[&str], hops: usize) {
+        let anchors: Vec<String> = anchors.iter().map(|a| (*a).to_owned()).collect();
+        let run = |c: GraphCaps| {
+            engine
+                .graph_facts(store, &anchors, hops, GraphKinds::default(), c)
+                .unwrap()
+        };
+        let full = run(raised());
+        assert!(!full.limits.truncated, "{}", full.limits.reason);
+        assert_eq!(full.limits.omitted_edges, 0);
+        let total = full.edges.len();
+        assert!(total > 0);
+        let full_ids = graph_ids(&full);
+        assert_eq!(full_ids.len(), total, "every edge once");
+        for c in [
+            caps(200, 500, 1),
+            caps(200, 500, 3),
+            caps(200, 500, 5),
+            caps(200, 500, 25),
+            caps(200, 5, 25),
+            caps(200, 1, 100),
+            caps(8, 500, 100),
+            caps(8, 6, 3),
+            caps(3, 500, 2),
+            caps(anchors.len(), 500, 100),
+            caps(anchors.len(), 1, 1),
+            caps(200, 500, 100_000),
+        ] {
+            if c.max_nodes < anchors.len() {
+                continue;
+            }
+            let f = run(c);
+            assert_eq!(
+                f.edges.len() + f.limits.omitted_edges,
+                total,
+                "{anchors:?} hops {hops} {c:?}: {}",
+                f.limits.reason
+            );
+            assert_eq!(
+                f.limits.truncated,
+                f.limits.omitted_edges + f.limits.omitted_nodes > 0,
+                "{c:?}"
+            );
+            assert!(
+                f.edges.len() <= c.max_edges && f.nodes.len() <= c.max_nodes,
+                "{c:?}"
+            );
+            assert!(graph_ids(&f).is_subset(&full_ids), "{c:?}");
+            assert_eq!(graph_ids(&f).len(), f.edges.len(), "every edge once");
+            if c.cochange_per_anchor >= 100 {
+                // Nothing was hidden by the per-anchor limit, so every file is
+                // either listed or counted.
+                assert_eq!(
+                    f.nodes.len() + f.limits.omitted_nodes,
+                    full.nodes.len(),
+                    "{c:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn omitted_edges_is_exact_on_a_symmetric_cochange_table() {
+        // The fixture stores every pair in both directions, as the history
+        // walk does, so a partner hidden by the per-anchor limit also hides the
+        // row back from it.
+        let (_repo, mut store, engine) = fan_fixture("graph-exact", 12, 6);
+        for hops in [1, 2] {
+            assert_exact_accounting(&engine, &store, &["app/anchor.py"], hops);
+        }
+        // Several anchors that are partners of each other and share partners.
+        let mut forward: Vec<engram_domain::CoChange> = (0..12)
+            .map(|i| cochange("app/anchor.py", &format!("app/p{i:02}.py"), 40 - i, 0.9))
+            .collect();
+        forward.extend(
+            (6..12).map(|i| cochange("app/other.py", &format!("app/p{i:02}.py"), 20 + i, 0.5)),
+        );
+        forward.push(cochange("app/anchor.py", "app/other.py", 9, 0.3));
+        store.replace_cochange(&mirrored(forward)).unwrap();
+        for hops in [1, 2] {
+            assert_exact_accounting(&engine, &store, &["app/anchor.py", "app/other.py"], hops);
+            assert_exact_accounting(&engine, &store, &["app/p07.py", "app/other.py"], hops);
+        }
+        // A lone reverse row (no forward row from the anchor) is not a fact of
+        // the anchor's neighbourhood until the anchor's own row exists.
+        store
+            .replace_cochange(&[cochange("app/p00.py", "app/anchor.py", 5, 0.5)])
+            .unwrap();
+        let facts = all_graph(&engine, &store, &["app/anchor.py"], 1);
+        assert!(!facts
+            .edges
+            .iter()
+            .any(|e| matches!(e, GraphEdge::Cochange { .. })));
+        assert_eq!(facts.limits.omitted_edges, 0);
+    }
+
+    #[test]
+    fn omitted_edges_is_exact_on_a_history_built_by_the_real_walk() {
+        let Some(repo) = partner_history_repo("graph-exact-git", 9, 3) else {
+            return;
+        };
+        let (store, engine) = engine_over(&repo);
+        // The walk wrote both directions of every pair that co-changed.
+        let both = store.cochange_pair("app/anchor.py", "app/p00.py").unwrap();
+        let back = store.cochange_pair("app/p00.py", "app/anchor.py").unwrap();
+        assert!(both.is_some() && back.is_some(), "{both:?} {back:?}");
+        let rows = all_graph(&engine, &store, &["app/anchor.py"], 1);
+        let cochange_rows = rows
+            .edges
+            .iter()
+            .filter(|e| matches!(e, GraphEdge::Cochange { .. }))
+            .count();
+        assert_eq!(cochange_rows, 18, "9 partners, both directions");
+        for hops in [1, 2] {
+            assert_exact_accounting(&engine, &store, &["app/anchor.py"], hops);
+            assert_exact_accounting(&engine, &store, &["app/anchor.py", "app/p03.py"], hops);
+        }
+    }
+
+    #[test]
+    fn a_hub_with_many_importers_is_counted_exactly_and_only_the_best_edges_are_built() {
+        // 4 partners (8 co-change rows) and 300 importers of the anchor.
+        let (_repo, store, engine) = fan_fixture("graph-hub", 4, 300);
+        let full = capped(&engine, &store, caps(400, 100_000, 100));
+        assert_eq!(full.edges.len(), 8 + 300);
+        assert!(!full.limits.truncated);
+        let mut importers: Vec<String> = (0..300).map(|i| format!("app/imp{i:02}.py")).collect();
+        importers.sort();
+        let imports_of = |f: &GraphFacts| -> Vec<String> {
+            f.edges
+                .iter()
+                .filter_map(|e| match e {
+                    GraphEdge::Import { source, .. } => Some(source.clone()),
+                    GraphEdge::Cochange { .. } => None,
+                })
+                .collect()
+        };
+
+        // Edge cap 5: only co-change rows fit; every import is still counted.
+        let few = capped(&engine, &store, caps(400, 5, 25));
+        assert_eq!(few.edges.len(), 5);
+        assert!(imports_of(&few).is_empty());
+        assert_eq!(few.limits.omitted_edges, 303);
+        assert_eq!(few.limits.omitted_nodes, 0);
+
+        // Edge cap 12: the 8 co-change rows, then the 4 imports first in path
+        // order (the same cut on every run).
+        let some = capped(&engine, &store, caps(400, 12, 25));
+        assert_eq!(some.edges.len(), 12);
+        assert_eq!(imports_of(&some), importers[..4].to_vec());
+        assert_eq!(some.limits.omitted_edges, 296);
+        assert_eq!(
+            serde_json::to_string(&some).unwrap(),
+            serde_json::to_string(&capped(&engine, &store, caps(400, 12, 25))).unwrap()
+        );
+
+        // Node cap 200 as well: 199 neighbours are kept, nearest then by path,
+        // which here is the first 199 importers and none of the partners. The
+        // 8 co-change rows and the importer edges of the 101 files past the
+        // cap are counted with the edges past the edge cap; the total holds.
+        let both = capped(&engine, &store, caps(200, 12, 25));
+        assert_eq!(both.nodes.len(), 200);
+        assert_eq!(both.limits.omitted_nodes, 304 - 199);
+        assert_eq!(both.edges.len(), 12);
+        assert_eq!(imports_of(&both), importers[..12].to_vec());
+        assert_eq!(both.edges.len() + both.limits.omitted_edges, 308);
+
+        assert_exact_accounting(&engine, &store, &["app/anchor.py"], 2);
+    }
+
+    #[test]
+    fn graph_facts_refuse_too_many_anchors_before_looking_any_of_them_up() {
+        let (_repo, store, engine) = connection_fixture("graph-anchor-cap");
+        // None of these is an indexed file; the count is what is refused.
+        let anchors: Vec<String> = (0..5).map(|i| format!("app/ghost{i}.py")).collect();
+        let err = engine
+            .graph_facts(&store, &anchors, 1, GraphKinds::default(), caps(4, 500, 25))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("node cap") && !err.contains("not an indexed"),
+            "{err}"
+        );
+    }
+
+    /// A repository where `alpha` reaches `gamma` by two routes of equal
+    /// length, through `beta1` and `beta2`. `order` is the order the import
+    /// rows are written in; the chain must not depend on it.
+    fn diamond(tag: &str, order: &[(&str, &[&str])]) -> (TempRepo, Store, Engine) {
+        use engram_domain::{FileRecord, Language};
+        let repo = TempRepo::new(tag);
+        std::fs::create_dir_all(repo.0.join("app")).unwrap();
+        let mut files = Vec::new();
+        for n in ["alpha", "beta1", "beta2", "gamma"] {
+            std::fs::write(
+                repo.0.join(format!("app/{n}.py")),
+                format!("def {n}(): pass\n"),
+            )
+            .unwrap();
+            files.push(FileRecord {
+                path: format!("app/{n}.py"),
+                language: Language::Python,
+                size_bytes: 10,
+                is_test: false,
+            });
+        }
+        let mut store = Store::open(&repo.0).expect("open store");
+        store.upsert_files(&files).expect("upsert files");
+        for (file, targets) in order {
+            let targets: Vec<String> = targets.iter().map(|t| (*t).to_owned()).collect();
+            store
+                .replace_imports_for_file(&format!("app/{file}.py"), &targets)
+                .unwrap();
+        }
+        let engine = Engine::build(&repo.0, &mut store).expect("build engine");
+        (repo, store, engine)
+    }
+
+    #[test]
+    fn equal_length_import_routes_are_chosen_the_same_way_whatever_the_row_order() {
+        let forward: [(&str, &[&str]); 3] = [
+            ("alpha", &["beta1", "beta2"]),
+            ("beta1", &["gamma"]),
+            ("beta2", &["gamma"]),
+        ];
+        let reversed: [(&str, &[&str]); 3] = [
+            ("beta2", &["gamma"]),
+            ("beta1", &["gamma"]),
+            ("alpha", &["beta2", "beta1"]),
+        ];
+        let observe = |tag: &str, order: &[(&str, &[&str])]| {
+            let (_repo, mut store, mut engine) = diamond(tag, order);
+            let explained = engine
+                .explain_connection(&mut store, "app/alpha.py", "app/gamma.py")
+                .unwrap();
+            let route = route_ids(&explained);
+            let v = serde_json::to_value(&explained).unwrap();
+            let chain = v["reasons"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["type"] == "import_edge")
+                .unwrap()["chain"]
+                .clone();
+            let impact = engine
+                .impact_from_files(&mut store, &["app/gamma.py".to_owned()])
+                .unwrap();
+            let alpha = impact
+                .import_expansions
+                .iter()
+                .find(|p| p.path == "app/alpha.py")
+                .expect("alpha depends on gamma in two hops")
+                .evidence_ids
+                .clone();
+            (engine.snapshot_id().to_owned(), chain, route, alpha)
+        };
+        let a = observe("diamond-forward", &forward);
+        let b = observe("diamond-reversed", &reversed);
+        assert_eq!(a, b, "row order must not change the route or its ids");
+        // And it is the alphabetically first of the equal routes.
+        assert_eq!(
+            a.1,
+            serde_json::json!(["app/alpha.py", "app/beta1.py", "app/gamma.py"])
+        );
+        assert_eq!(
+            a.3,
+            vec![
+                import_edge_id(&a.0, &["app/alpha.py", "app/beta1.py"]),
+                import_edge_id(&a.0, &["app/beta1.py", "app/gamma.py"]),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_cited_id_is_in_the_graph_only_while_the_hops_reach_it_and_nothing_cut_it() {
+        let (_repo, mut store, mut engine) = connection_fixture("cite-conditional");
+        let anchors = vec!["app/gamma.py".to_owned()];
+        let impact = engine.impact_from_files(&mut store, &anchors).unwrap();
+        let cited = cited_ids(&impact);
+        let snapshot = engine.snapshot_id().to_owned();
+        let outer = import_edge_id(&snapshot, &["app/alpha.py", "app/beta.py"]);
+        assert!(cited.contains(&outer), "alpha cites its outer hop");
+
+        // (a) With max_hops 2, the depth the expansion used, nothing is cut
+        // and every cited id is present.
+        let two = all_graph(&engine, &store, &["app/gamma.py"], 2);
+        assert!(!two.limits.truncated);
+        assert!(cited.iter().all(|id| graph_ids(&two).contains(id)));
+
+        // (b) With max_hops 1 the outer-hop id is absent, and the graph does
+        // not claim to be truncated: the guarantee needs max_hops >= the hop.
+        let one = all_graph(&engine, &store, &["app/gamma.py"], 1);
+        assert!(!graph_ids(&one).contains(&outer));
+        assert!(!one.limits.truncated);
+
+        // (c) A cap that cuts a cited edge is reported as truncation.
+        let cut = engine
+            .graph_facts(&store, &anchors, 2, GraphKinds::default(), caps(200, 1, 25))
+            .unwrap();
+        assert_eq!(cut.edges.len(), 1);
+        assert!(cited.iter().any(|id| !graph_ids(&cut).contains(id)));
+        assert!(cut.limits.truncated);
+        assert_eq!(cut.limits.omitted_edges, 1);
     }
 
     #[test]

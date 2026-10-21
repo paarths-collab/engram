@@ -14,17 +14,29 @@ release tags.
   change with it; being 64-bit they are not globally unique.
   `explain_connection` reports an `edge_id` on every reason and on each hop of
   an import route (`edges[].edge_id`, the id of that single edge).
-- **`get_graph(paths, max_hops?, kinds?, snapshot?)`**, a supporting tool that
-  returns the raw recorded facts around anchor files: single-hop heuristic
-  import edges (importer to imported) and stored co-change rows, independent of
-  the recommendation caps. Deterministic order; hard caps (200 nodes, 500 edges,
-  50 co-change rows per anchor) with truncation always disclosed in `limits`
-  (`omitted_edges`, `omitted_nodes`, `reason`). It is not a call graph:
-  symbol-level call edges are not implemented.
+- **`get_graph(paths, max_hops?, kinds?, max_edges?, max_nodes?, snapshot?)`**, a
+  supporting tool that returns the raw recorded facts around anchor files:
+  single-hop heuristic import edges (importer to imported) and stored co-change
+  rows, independent of the recommendation caps. `max_hops` defaults to 2, like
+  `expand_connections`. Deterministic order; hard caps (200 nodes, 500 edges,
+  25 co-change partners per anchor) with truncation always disclosed in `limits`
+  (`omitted_edges`, `omitted_nodes`, `reason`). `max_edges` (1..500) and
+  `max_nodes` (1..200) can only lower the caps; more anchors than `max_nodes` is
+  refused before any is looked up. `omitted_edges` is exact: emitted plus
+  omitted equals the edges the call returns with no cap, one directed co-change
+  row or one import edge each, counting the reverse rows of partners hidden by
+  the per-anchor limit; `omitted_nodes` counts neighbours past the node cap (a
+  partner hidden by the per-anchor limit is never a node). Imports past the
+  edge budget are counted, not built. It is not a call graph: symbol-level call
+  edges are not implemented. It errors on an unknown path, where
+  `expand_connections` silently ignores one.
 - **Recommendations cite their evidence.** `expand_connections` entries gain
   `evidence_ids` (the co-change row ids, or the id of every import hop back to
-  an anchor) and `score_components` (the numbers behind `confidence`). Every
-  cited id is an id `get_graph` emits for the same anchors in the same snapshot.
+  an anchor) and `score_components` (the numbers behind `confidence`). A cited
+  id is an id `get_graph` emits for the same anchors in the same snapshot only
+  when `limits.truncated` is false and `max_hops` is at least the hop it was
+  cited at (`get_graph` defaults to 2, like `expand_connections`; a cap can cut a
+  cited edge).
   Search evidence is unchanged: its per-signal scores are not kept, so it has no
   `score_components`.
 - **Co-change completeness facts.** Each co-change reason in
@@ -114,6 +126,14 @@ release tags.
 - For equal confidence, `likely_files` in `expand_connections` is ordered by path.
 
 ### Fixed
+- **Equal-length import routes are deterministic.** The graph is built from
+  edges sorted by (importer, imported), and traversals visit parents and seeds
+  in path order, so `expand_connections` and `explain_connection` report the same
+  chain and the same `evidence_ids` for one snapshot whatever order the index
+  stored its rows in (the alphabetically first of the equal routes).
+- **`get_graph` accounting.** `omitted_edges` now counts the reverse rows of
+  co-change partners hidden by the per-anchor limit (the stored table is
+  symmetric), so emitted plus omitted is exactly the edges returned with no cap.
 - **`database is locked` during startup.** The busy timeout is now set before
   any other statement (it used to follow the journal-mode switch and schema
   creation) and raised to 10 seconds, and write transactions take the write lock
