@@ -10,7 +10,7 @@
 //! agent is already editing) and ask whether the deterministic graph — the
 //! co-change table (git history fact) and the import graph (static-analysis
 //! fact) — recovers the *other* files that changed in the same commit. There
-//! is no prediction step here: `find_connected_files` only returns files
+//! is no prediction step here: `expand_connections` only returns files
 //! linked to the anchor by a concrete recorded edge. The co-change graph is
 //! built with a temporal cutoff (`--history-commits` older commits, skipping
 //! the evaluation window) so it cannot see the future it is being asked to
@@ -200,7 +200,7 @@ fn run_benchmark2_connection_recovery(
     println!(
         "No text, no guessing: history is built ONLY from the {history_commits} commits older \
          than the {eval_commits}-commit evaluation window (temporal cutoff — the co-change \
-         graph cannot see the future it's being asked to recover). `find_connected_files` is \
+         graph cannot see the future it's being asked to recover). `expand_connections` is \
          called with one changed file as the anchor; we check whether the co-change graph and \
          import graph recover the other files that changed in the same commit.\n"
     );
@@ -209,7 +209,7 @@ fn run_benchmark2_connection_recovery(
     // history_commits older ones. Overwrite the store's cochange table with
     // this restricted history before building the graph.
     let history = cochange::build_from(repo, eval_commits, history_commits);
-    store.replace_cochange(&history.edges)?;
+    history.record_into(store)?;
     eprintln!(
         "[evals] leakage-free co-change graph: {} edges (from commits {}..{})",
         history.edges.len(),

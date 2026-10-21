@@ -96,7 +96,7 @@ fn call_tool_caught(handler: &mut dyn ToolHandler, name: &str, args: &Value) -> 
         Ok(Ok(result)) => json!({
             "content": [{
                 "type": "text",
-                "text": serde_json::to_string_pretty(&result).unwrap_or_default()
+                "text": engram_retrieval::budget::render(&result)
             }],
             "isError": false
         }),

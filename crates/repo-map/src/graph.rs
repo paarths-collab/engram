@@ -9,7 +9,7 @@ use crate::imports::{crate_manifest_for, module_needles, package_name};
 use crate::store::Store;
 use anyhow::Result;
 use petgraph::graph::{DiGraph, NodeIndex};
-use petgraph::Direction::Incoming;
+use petgraph::Direction::{Incoming, Outgoing};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 
@@ -28,6 +28,10 @@ pub struct GraphHit {
     pub path: String,
     pub hops: usize,
     pub kind: EdgeKind,
+    /// The route the traversal took, hit first, seed last: each file depends
+    /// on the next (`hops + 1` entries). For import traversal, `chain[i]`
+    /// imports `chain[i + 1]`.
+    pub chain: Vec<String>,
 }
 
 /// Directed code graph: an edge `src -> dst` means `src` depends on `dst`
@@ -116,6 +120,12 @@ impl CodeGraph {
             }
         }
 
+        // Insertion order decides which of two equal-length routes a search
+        // finds first, and the order of `store.all_imports()` is the order of
+        // SQLite rows. Sorting by (from, to, kind) makes the graph, and so the
+        // routes it reports, the same for the same snapshot.
+        edges.sort_by(|a, b| (&a.0, &a.1, a.2 as u8).cmp(&(&b.0, &b.1, b.2 as u8)));
+        edges.dedup();
         Ok(Self::from_edges(edges))
     }
 
@@ -139,30 +149,53 @@ impl CodeGraph {
     ) -> Vec<GraphHit> {
         let mut visited: HashSet<NodeIndex> = HashSet::new();
         let mut queue: VecDeque<(NodeIndex, usize)> = VecDeque::new();
-        for s in seeds {
+        // Visited in path order, so which seed reaches a file first (and the
+        // order of the hits) does not depend on how the caller listed them.
+        let mut ordered: Vec<&String> = seeds.iter().collect();
+        ordered.sort();
+        for s in ordered {
             if let Some(&n) = self.idx.get(s) {
                 if visited.insert(n) {
                     queue.push_back((n, 0));
                 }
             }
         }
+        let mut routes: HashMap<NodeIndex, Vec<String>> = queue
+            .iter()
+            .map(|(n, _)| (*n, vec![self.rev[n.index()].clone()]))
+            .collect();
         let mut hits: Vec<GraphHit> = Vec::new();
         while let Some((node, hops)) = queue.pop_front() {
             if hops >= max_hops {
                 continue;
             }
-            for edge in self.g.edges_directed(node, Incoming) {
-                let kind = *edge.weight();
-                if !kinds.contains(&kind) {
-                    continue;
-                }
-                use petgraph::visit::EdgeRef;
-                let src = edge.source();
+            // Equal-length routes: the dependent is reached through the
+            // alphabetically first parent, whatever order the edges were
+            // inserted in.
+            let mut incoming: Vec<(NodeIndex, EdgeKind)> = self
+                .g
+                .edges_directed(node, Incoming)
+                .filter(|edge| kinds.contains(edge.weight()))
+                .map(|edge| {
+                    use petgraph::visit::EdgeRef;
+                    (edge.source(), *edge.weight())
+                })
+                .collect();
+            incoming.sort_by(|a, b| {
+                self.rev[a.0.index()]
+                    .cmp(&self.rev[b.0.index()])
+                    .then_with(|| (a.1 as u8).cmp(&(b.1 as u8)))
+            });
+            for (src, kind) in incoming {
                 if visited.insert(src) {
+                    let mut chain = vec![self.rev[src.index()].clone()];
+                    chain.extend(routes.get(&node).cloned().unwrap_or_default());
+                    routes.insert(src, chain.clone());
                     hits.push(GraphHit {
                         path: self.rev[src.index()].clone(),
                         hops: hops + 1,
                         kind,
+                        chain,
                     });
                     queue.push_back((src, hops + 1));
                 }
@@ -170,6 +203,128 @@ impl CodeGraph {
         }
         hits
     }
+
+    /// Whether `path` is a node of the graph.
+    pub fn contains(&self, path: &str) -> bool {
+        self.idx.contains_key(path)
+    }
+
+    /// Files `path` imports (one hop, outgoing import edges), sorted and
+    /// de-duplicated. Empty for a path not in the graph.
+    pub fn import_targets(&self, path: &str) -> Vec<String> {
+        self.import_neighbours(path, Outgoing)
+    }
+
+    /// Files that import `path` (one hop, incoming import edges), sorted and
+    /// de-duplicated. Empty for a path not in the graph.
+    pub fn import_sources(&self, path: &str) -> Vec<String> {
+        self.import_neighbours(path, Incoming)
+    }
+
+    fn import_neighbours(&self, path: &str, dir: petgraph::Direction) -> Vec<String> {
+        use petgraph::visit::EdgeRef;
+        let Some(&n) = self.idx.get(path) else {
+            return Vec::new();
+        };
+        let mut out: Vec<String> = self
+            .g
+            .edges_directed(n, dir)
+            .filter(|e| *e.weight() == EdgeKind::Imports)
+            .map(|e| {
+                let other = if dir == Outgoing {
+                    e.target()
+                } else {
+                    e.source()
+                };
+                self.rev[other.index()].clone()
+            })
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// Shortest import chain `from -> ... -> to` of at most `max_hops` import
+    /// edges, following edges in their own direction (`from` imports the next
+    /// file, and so on). Returns every file on the chain, endpoints included,
+    /// so a 2-hop result names the intermediate file. `None` when `from == to`,
+    /// either file is not in the graph, or no chain within the bound exists.
+    /// Only [`EdgeKind::Imports`] edges are followed. See [`Self::import_search`]
+    /// for the variant that distinguishes "no chain" from "stopped at the bound".
+    pub fn import_path(&self, from: &str, to: &str, max_hops: usize) -> Option<Vec<String>> {
+        match self.import_search(from, to, max_hops) {
+            ImportSearch::Found(chain) => Some(chain),
+            _ => None,
+        }
+    }
+
+    /// Like [`Self::import_path`], but reports whether a negative answer is
+    /// conclusive. `BeyondBound` means no chain was found within `max_hops`
+    /// yet import edges lead to files not explored at the bound, so a longer
+    /// chain cannot be ruled out.
+    pub fn import_search(&self, from: &str, to: &str, max_hops: usize) -> ImportSearch {
+        use petgraph::visit::EdgeRef;
+        let (Some(&start), Some(&goal)) = (self.idx.get(from), self.idx.get(to)) else {
+            return ImportSearch::None;
+        };
+        if start == goal {
+            return ImportSearch::None;
+        }
+        let mut pred: HashMap<NodeIndex, NodeIndex> = HashMap::new();
+        let mut visited: HashSet<NodeIndex> = HashSet::from([start]);
+        let mut queue: VecDeque<(NodeIndex, usize)> = VecDeque::from([(start, 0)]);
+        let mut frontier_remains = false;
+        while let Some((node, hops)) = queue.pop_front() {
+            // Sorted by path so the first shortest chain found is the same
+            // whatever order the edges were inserted in.
+            let mut outgoing: Vec<NodeIndex> = self
+                .g
+                .edges_directed(node, Outgoing)
+                .filter(|edge| *edge.weight() == EdgeKind::Imports)
+                .map(|edge| edge.target())
+                .collect();
+            outgoing.sort_by(|a, b| self.rev[a.index()].cmp(&self.rev[b.index()]));
+            for next in outgoing {
+                if visited.contains(&next) {
+                    continue;
+                }
+                if hops >= max_hops {
+                    // An unexplored import edge past the bound.
+                    frontier_remains = true;
+                    continue;
+                }
+                visited.insert(next);
+                pred.insert(next, node);
+                if next == goal {
+                    let mut chain = vec![self.rev[goal.index()].clone()];
+                    let mut cur = goal;
+                    while let Some(&p) = pred.get(&cur) {
+                        chain.push(self.rev[p.index()].clone());
+                        cur = p;
+                    }
+                    chain.reverse();
+                    return ImportSearch::Found(chain);
+                }
+                queue.push_back((next, hops + 1));
+            }
+        }
+        if frontier_remains {
+            ImportSearch::BeyondBound
+        } else {
+            ImportSearch::None
+        }
+    }
+}
+
+/// Outcome of a bounded directed import search.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImportSearch {
+    /// Shortest chain, endpoints included.
+    Found(Vec<String>),
+    /// The reachable import neighbourhood was exhausted; no chain exists.
+    None,
+    /// No chain within the bound, but imports continue past it.
+    BeyondBound,
 }
 
 /// Candidate module keys contained in a normalized import target `a/b/c`:
@@ -208,6 +363,35 @@ mod tests {
     }
 
     #[test]
+    fn dependents_carry_the_route_back_to_the_seed() {
+        let g = CodeGraph::from_edges([
+            e("a.rs", "b.rs", EdgeKind::Imports),
+            e("b.rs", "c.rs", EdgeKind::Imports),
+        ]);
+        let hits = g.dependents(&["c.rs".to_string()], &[EdgeKind::Imports], 2);
+        let chain_of = |p: &str| hits.iter().find(|h| h.path == p).unwrap().chain.clone();
+        assert_eq!(chain_of("b.rs"), vec!["b.rs", "c.rs"]);
+        assert_eq!(chain_of("a.rs"), vec!["a.rs", "b.rs", "c.rs"]);
+    }
+
+    #[test]
+    fn import_neighbours_are_one_hop_sorted_deduplicated_and_import_only() {
+        let g = CodeGraph::from_edges([
+            e("m.rs", "z.rs", EdgeKind::Imports),
+            e("m.rs", "b.rs", EdgeKind::Imports),
+            e("m.rs", "b.rs", EdgeKind::Imports),
+            e("m.rs", "co.rs", EdgeKind::CoChange),
+            e("y.rs", "m.rs", EdgeKind::Imports),
+            e("x.rs", "m.rs", EdgeKind::Imports),
+            e("far.rs", "z.rs", EdgeKind::Imports),
+        ]);
+        assert_eq!(g.import_targets("m.rs"), vec!["b.rs", "z.rs"]);
+        assert_eq!(g.import_sources("m.rs"), vec!["x.rs", "y.rs"]);
+        assert!(g.import_targets("nope.rs").is_empty());
+        assert!(g.contains("m.rs") && !g.contains("nope.rs"));
+    }
+
+    #[test]
     fn max_hops_bounds_traversal() {
         let g = CodeGraph::from_edges([
             e("a.rs", "b.rs", EdgeKind::Imports),
@@ -228,6 +412,72 @@ mod tests {
         let imports_only = g.dependents(&["c.rs".to_string()], &[EdgeKind::Imports], 3);
         assert_eq!(imports_only.len(), 1);
         assert_eq!(imports_only[0].path, "b.rs");
+    }
+
+    #[test]
+    fn import_path_follows_imports_and_names_the_intermediate() {
+        let g = CodeGraph::from_edges([
+            e("a.rs", "b.rs", EdgeKind::Imports),
+            e("b.rs", "c.rs", EdgeKind::Imports),
+            e("c.rs", "d.rs", EdgeKind::Imports),
+        ]);
+        assert_eq!(
+            g.import_path("a.rs", "b.rs", 2),
+            Some(vec!["a.rs".into(), "b.rs".into()])
+        );
+        assert_eq!(
+            g.import_path("a.rs", "c.rs", 2),
+            Some(vec!["a.rs".into(), "b.rs".into(), "c.rs".into()])
+        );
+        // Beyond the hop bound, against the edge direction, same node, unknown node.
+        assert_eq!(g.import_path("a.rs", "d.rs", 2), None);
+        assert_eq!(g.import_path("c.rs", "a.rs", 2), None);
+        assert_eq!(g.import_path("a.rs", "a.rs", 2), None);
+        assert_eq!(g.import_path("a.rs", "zzz.rs", 2), None);
+    }
+
+    #[test]
+    fn import_path_ignores_cochange_edges_and_prefers_the_shortest_chain() {
+        let g = CodeGraph::from_edges([
+            e("a.rs", "c.rs", EdgeKind::CoChange),
+            e("a.rs", "b.rs", EdgeKind::Imports),
+            e("b.rs", "c.rs", EdgeKind::Imports),
+            e("a.rs", "x.rs", EdgeKind::Imports),
+            e("x.rs", "y.rs", EdgeKind::Imports),
+            e("y.rs", "c.rs", EdgeKind::Imports),
+            e("a.rs", "c.rs", EdgeKind::Imports),
+        ]);
+        // The direct import beats the 2-hop chain; the CoChange edge alone
+        // would not have counted.
+        assert_eq!(
+            g.import_path("a.rs", "c.rs", 2),
+            Some(vec!["a.rs".into(), "c.rs".into()])
+        );
+        let g = CodeGraph::from_edges([e("a.rs", "c.rs", EdgeKind::CoChange)]);
+        assert_eq!(g.import_path("a.rs", "c.rs", 2), None);
+    }
+
+    #[test]
+    fn import_search_tells_exhausted_from_stopped_at_the_bound() {
+        let g = CodeGraph::from_edges([
+            e("a.rs", "b.rs", EdgeKind::Imports),
+            e("b.rs", "c.rs", EdgeKind::Imports),
+            e("c.rs", "d.rs", EdgeKind::Imports),
+            e("x.rs", "y.rs", EdgeKind::Imports),
+        ]);
+        // d is 3 hops away: the bound cut the search short, not the graph.
+        assert_eq!(
+            g.import_search("a.rs", "d.rs", 2),
+            ImportSearch::BeyondBound
+        );
+        assert!(matches!(
+            g.import_search("a.rs", "d.rs", 3),
+            ImportSearch::Found(_)
+        ));
+        // a's whole import neighbourhood is explored and y.rs is not in it.
+        assert_eq!(g.import_search("a.rs", "y.rs", 5), ImportSearch::None);
+        // The reverse direction has nothing to explore at all.
+        assert_eq!(g.import_search("d.rs", "a.rs", 2), ImportSearch::None);
     }
 
     #[test]
@@ -341,5 +591,51 @@ mod tests {
             2,
         );
         assert_eq!(dependents.len(), 1, "{dependents:?}");
+    }
+
+    #[test]
+    fn equal_length_routes_are_the_same_whatever_order_the_edges_were_inserted_in() {
+        // a -> b1 -> c and a -> b2 -> c: two routes of two hops.
+        let edges = [
+            e("a.rs", "b1.rs", EdgeKind::Imports),
+            e("a.rs", "b2.rs", EdgeKind::Imports),
+            e("b1.rs", "c.rs", EdgeKind::Imports),
+            e("b2.rs", "c.rs", EdgeKind::Imports),
+        ];
+        let mut reversed = edges.clone();
+        reversed.reverse();
+        let mut shuffled = edges.clone();
+        shuffled.swap(0, 3);
+        shuffled.swap(1, 2);
+        let route = |order: &[(String, String, EdgeKind)]| {
+            let g = CodeGraph::from_edges(order.to_vec());
+            (
+                g.dependents(&["c.rs".to_owned()], &[EdgeKind::Imports], 2),
+                g.import_path("a.rs", "c.rs", 2),
+                g.import_search("a.rs", "c.rs", 2),
+            )
+        };
+        let reference = route(&edges);
+        assert_eq!(reference, route(&reversed));
+        assert_eq!(reference, route(&shuffled));
+        // The alphabetically first of the equal routes, from both ends.
+        let chain = ["a.rs", "b1.rs", "c.rs"].map(str::to_owned).to_vec();
+        assert_eq!(reference.1, Some(chain.clone()));
+        let a = reference.0.iter().find(|h| h.path == "a.rs").unwrap();
+        assert_eq!(a.chain, chain);
+    }
+
+    #[test]
+    fn seed_order_does_not_change_which_seed_reaches_a_file() {
+        let g = CodeGraph::from_edges([
+            e("x.rs", "s1.rs", EdgeKind::Imports),
+            e("x.rs", "s2.rs", EdgeKind::Imports),
+        ]);
+        let seeds_a = ["s1.rs".to_owned(), "s2.rs".to_owned()];
+        let seeds_b = ["s2.rs".to_owned(), "s1.rs".to_owned()];
+        assert_eq!(
+            g.dependents(&seeds_a, &[EdgeKind::Imports], 1),
+            g.dependents(&seeds_b, &[EdgeKind::Imports], 1)
+        );
     }
 }
