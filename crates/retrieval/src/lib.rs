@@ -557,6 +557,13 @@ impl Engine {
                 .then_with(|| a.0.cmp(&b.0))
         });
         let beyond_first_cap = ranked.len().saturating_sub(top_k);
+        // The best of the cut candidates, by path, so the pack can name them.
+        let beyond_paths: Vec<String> = ranked
+            .iter()
+            .skip(top_k)
+            .take(budget::MAX_OMITTED_LISTED)
+            .map(|(i, _, _)| self.docs[*i].path.clone())
+            .collect();
         ranked.truncate(top_k);
 
         // lazy Tier-1: ensure symbols exist for top hits, then attach best symbols
@@ -674,10 +681,17 @@ impl Engine {
         packets.sort_by(budget::compare_packets);
         let cap = (top_k + 3).min(packets.len());
         let cap_dropped = packets.split_off(cap);
+        // A path that came back as evidence (a symbol hit can re-find a file
+        // the first cap cut) is not an omission.
+        let beyond_first_cap_paths = beyond_paths
+            .into_iter()
+            .filter(|path| !packets.iter().chain(&cap_dropped).any(|p| &p.path == path))
+            .collect();
         Ok(SearchOutcome {
             packets,
             cap_dropped,
             beyond_first_cap,
+            beyond_first_cap_paths,
         })
     }
 
@@ -1101,6 +1115,10 @@ pub struct SearchOutcome {
     /// usually has some, and `pack.truncated`/`omitted_count` read `true` / `> 0`
     /// even with no budget.
     pub beyond_first_cap: usize,
+    /// The paths of the best of those candidates (rank order, at most
+    /// `budget::MAX_OMITTED_LISTED`, without any that came back as evidence), so
+    /// that the pack can name some of what it cut instead of only counting it.
+    pub beyond_first_cap_paths: Vec<String>,
 }
 
 /// A symbol's `(start, end)` line span, or `None` for the zero spans a
@@ -2096,7 +2114,12 @@ fn second() {
     #[test]
     fn search_order_is_total_and_ignores_the_order_files_were_indexed_in() {
         let render = |outcome: &SearchOutcome| {
-            serde_json::to_string(&(&outcome.packets, &outcome.cap_dropped)).unwrap()
+            serde_json::to_string(&(
+                &outcome.packets,
+                &outcome.cap_dropped,
+                &outcome.beyond_first_cap_paths,
+            ))
+            .unwrap()
         };
         let (_a, mut store_a, mut engine_a) = tied_corpus("tied-forward", false);
         let first = engine_a
@@ -2193,10 +2216,27 @@ fn second() {
                 outcome.beyond_first_cap > 0,
                 "{tag}: the first cap should bite"
             );
+            // ... and the best of what it cut is named, never a path that was
+            // returned as evidence.
+            assert!(
+                !outcome.beyond_first_cap_paths.is_empty()
+                    && outcome.beyond_first_cap_paths.len()
+                        <= outcome.beyond_first_cap.min(budget::MAX_OMITTED_LISTED),
+                "{tag}: {:?}",
+                outcome.beyond_first_cap_paths
+            );
+            for path in &outcome.beyond_first_cap_paths {
+                assert!(outcome
+                    .packets
+                    .iter()
+                    .chain(&outcome.cap_dropped)
+                    .all(|p| &p.path != path));
+            }
             let bytes = serde_json::to_string(&(
                 &outcome.packets,
                 &outcome.cap_dropped,
                 outcome.beyond_first_cap,
+                &outcome.beyond_first_cap_paths,
             ))
             .unwrap();
             let ranked = engine

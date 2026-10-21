@@ -10,6 +10,42 @@ use engram_domain::{
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
 use std::path::Path;
+use std::time::{Duration, Instant};
+
+/// How long a connection waits for another writer's lock before giving up with
+/// "database is locked". Indexing, the file watcher and request handlers each
+/// open their own connection to the same file, so brief contention is normal.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Whether `e` is SQLite saying another connection holds a lock it needs
+/// (`SQLITE_BUSY` / `SQLITE_LOCKED`).
+fn is_lock_contention(e: &anyhow::Error) -> bool {
+    matches!(
+        e.downcast_ref::<rusqlite::Error>(),
+        Some(rusqlite::Error::SqliteFailure(f, _))
+            if matches!(
+                f.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+    )
+}
+
+/// Run `attempt` until it succeeds, fails for a reason other than lock
+/// contention, or `deadline` passes. The busy timeout does not cover every
+/// case (a journal-mode switch, or a lock upgrade that would deadlock, is
+/// refused at once), so those are retried here with a short, growing sleep.
+fn retry_while_busy<T>(deadline: Instant, mut attempt: impl FnMut() -> Result<T>) -> Result<T> {
+    let mut pause = Duration::from_millis(1);
+    loop {
+        match attempt() {
+            Err(e) if is_lock_contention(&e) && Instant::now() < deadline => {
+                std::thread::sleep(pause);
+                pause = (pause * 2).min(Duration::from_millis(50));
+            }
+            other => return other,
+        }
+    }
+}
 
 /// Identity of one embedded chunk: the file, and the one-based line its span
 /// starts at. `0` is reserved for the whole-file fallback used when a file has
@@ -42,10 +78,35 @@ impl Store {
         let dir = repo_root.join(".engram");
         std::fs::create_dir_all(&dir)?;
         let conn = Connection::open(dir.join("engram.db"))?;
-        conn.execute_batch(
-            r#"
-            PRAGMA journal_mode = WAL;
-            PRAGMA busy_timeout = 5000;
+        // First, before any statement: switching to WAL and creating the schema
+        // both need a lock another connection may hold at this very moment.
+        conn.busy_timeout(BUSY_TIMEOUT)?;
+        // Several connections open a brand-new cache at the same moment (the
+        // index thread, the watcher, the request handler). SQLite reports
+        // SQLITE_BUSY at once, without consulting the busy timeout, when two of
+        // them race to switch the journal mode or when a lock upgrade could
+        // deadlock, so both steps below are retried until this deadline.
+        let deadline = Instant::now() + BUSY_TIMEOUT;
+        retry_while_busy(deadline, || {
+            conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get::<_, String>(0))
+                .map_err(anyhow::Error::from)
+        })?;
+        // Schema, migrations and the version check are one write transaction:
+        // an opener that loses the race waits on the busy handler for the
+        // winner's commit and then finds everything already in place.
+        retry_while_busy(deadline, || Self::initialise(&conn, parser_version))?;
+        Ok(Store { conn })
+    }
+
+    /// Create the schema, migrate an older database, and reconcile the parser
+    /// version, all inside one `BEGIN IMMEDIATE` transaction. Everything here
+    /// is idempotent, and the stored version is re-read inside the
+    /// transaction, so concurrent first-opens initialise exactly once and none
+    /// of them repeats or undoes another's work.
+    fn initialise(conn: &Connection, parser_version: u32) -> Result<()> {
+        Self::in_immediate_tx(conn, |conn| {
+            conn.execute_batch(
+                r#"
             CREATE TABLE IF NOT EXISTS files (
                 path TEXT PRIMARY KEY,
                 language TEXT NOT NULL,
@@ -152,44 +213,87 @@ impl Store {
             CREATE INDEX IF NOT EXISTS idx_review_comments_path ON review_comments(path);
             CREATE INDEX IF NOT EXISTS idx_review_comments_pr ON review_comments(pr_number);
             "#,
-        )?;
-        Self::migrate(&conn);
-        Self::reconcile_parser_version(&conn, parser_version)?;
-        Ok(Store { conn })
+            )?;
+            Self::migrate(conn);
+            Self::reset_derived_data_on_mismatch(conn, parser_version)
+        })
+    }
+
+    /// Run `body` inside `BEGIN IMMEDIATE ... COMMIT`, rolling back when it (or
+    /// the commit) fails. Taking the write lock up front makes a contended
+    /// opener wait on the busy handler instead of failing at a lock upgrade.
+    fn in_immediate_tx(
+        conn: &Connection,
+        body: impl FnOnce(&Connection) -> Result<()>,
+    ) -> Result<()> {
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        match body(conn).and_then(|()| conn.execute_batch("COMMIT").map_err(Into::into)) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
     }
 
     /// Discard derived data if the database was written under a different
     /// parser/config version (see [`PARSER_CONFIG_VERSION`]). A brand-new
     /// database has nothing to discard and just records the version.
-    fn reconcile_parser_version(conn: &Connection, version: u32) -> Result<()> {
-        use rusqlite::OptionalExtension;
-        let stored: Option<String> = conn
-            .query_row(
-                "SELECT value FROM meta WHERE key = ?1",
-                params![PARSER_VERSION_KEY],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if stored.as_deref() == Some(version.to_string().as_str()) {
+    ///
+    /// Runs inside the open-time `BEGIN IMMEDIATE` transaction (see
+    /// [`Store::initialise`]), and the stored value is read inside it: of
+    /// several connections that opened at the same moment and all saw the
+    /// mismatch, only the first to take the write lock wipes; the rest find the
+    /// version already updated and must not discard what the first has since
+    /// written. The wipe and the version bump commit together, so a crash
+    /// midway cannot leave the derived data wiped but the old version recorded,
+    /// which would trust the empty tables.
+    fn reset_derived_data_on_mismatch(conn: &Connection, version: u32) -> Result<()> {
+        if Self::stored_parser_version(conn)?.as_deref() == Some(version.to_string().as_str()) {
             return Ok(());
         }
-        // One transaction: a crash midway must not leave the derived data
-        // wiped but the old version recorded, which would trust the empty tables.
-        let tx = conn.unchecked_transaction()?;
-        tx.execute_batch(
+        conn.execute_batch(
             "DELETE FROM symbols;
              DELETE FROM file_imports;
              DELETE FROM vectors;
              DELETE FROM chunk_vectors;
              UPDATE files SET tier1_done = 0;",
         )?;
-        tx.execute(
+        conn.execute(
             "INSERT INTO meta (key, value) VALUES (?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = ?2",
             params![PARSER_VERSION_KEY, version.to_string()],
         )?;
-        tx.commit()?;
         Ok(())
+    }
+
+    fn stored_parser_version(conn: &Connection) -> Result<Option<String>> {
+        Ok(conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                params![PARSER_VERSION_KEY],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// [`Store::reset_derived_data_on_mismatch`] in a transaction of its own,
+    /// for tests that drive it on a connection that is not being opened.
+    #[cfg(test)]
+    fn reset_if_still_mismatched(conn: &Connection, version: u32) -> Result<()> {
+        Self::in_immediate_tx(conn, |conn| {
+            Self::reset_derived_data_on_mismatch(conn, version)
+        })
+    }
+
+    /// A write transaction that takes the write lock up front. A deferred one
+    /// that reads first and writes later fails at the upgrade with an immediate
+    /// "database is locked" (the busy timeout does not apply) whenever another
+    /// connection committed in between; taking the lock first waits instead.
+    fn write_tx(&mut self) -> Result<rusqlite::Transaction<'_>> {
+        Ok(self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?)
     }
 
     /// Bring a database created by an older Engram up to the current schema.
@@ -261,7 +365,7 @@ impl Store {
     /// Store the last-commit unix timestamp for files touched in git history.
     /// Paths not present in the files table are silently skipped.
     pub fn update_recency(&mut self, recency: &HashMap<String, i64>) -> Result<()> {
-        let tx = self.conn.transaction()?;
+        let tx = self.write_tx()?;
         for (path, ts) in recency {
             tx.execute(
                 "UPDATE files SET last_commit_ts = ?2 WHERE path = ?1",
@@ -296,7 +400,7 @@ impl Store {
 
     /// Upsert embeddings: `(path, content_hash, raw_bytes)`.
     pub fn upsert_vectors(&mut self, rows: &[(String, String, Vec<u8>)]) -> Result<()> {
-        let tx = self.conn.transaction()?;
+        let tx = self.write_tx()?;
         for (path, hash, data) in rows {
             tx.execute(
                 "INSERT INTO vectors (path, hash, data) VALUES (?1, ?2, ?3)
@@ -338,7 +442,7 @@ impl Store {
         &mut self,
         rows: &[(String, usize, String, Vec<u8>)],
     ) -> Result<()> {
-        let tx = self.conn.transaction()?;
+        let tx = self.write_tx()?;
         for (path, start_line, hash, data) in rows {
             tx.execute(
                 "INSERT INTO chunk_vectors (path, start_line, hash, data) VALUES (?1, ?2, ?3, ?4)
@@ -365,7 +469,7 @@ impl Store {
             })?;
             rows.filter_map(Result::ok).collect()
         };
-        let tx = self.conn.transaction()?;
+        let tx = self.write_tx()?;
         for key in existing {
             if !keep.contains(&key) {
                 tx.execute(
@@ -385,7 +489,7 @@ impl Store {
             let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
             rows.filter_map(Result::ok).collect()
         };
-        let tx = self.conn.transaction()?;
+        let tx = self.write_tx()?;
         for path in existing {
             if !keep.contains(&path) {
                 tx.execute("DELETE FROM vectors WHERE path = ?1", params![path])?;
@@ -418,7 +522,7 @@ impl Store {
         if stale.is_empty() {
             return Ok(0);
         }
-        let tx = self.conn.transaction()?;
+        let tx = self.write_tx()?;
         for path in &stale {
             Self::delete_file_rows(&tx, path)?;
         }
@@ -458,7 +562,7 @@ impl Store {
         let dir = path.trim_end_matches('/');
         let range_start = format!("{dir}/");
         let range_end = format!("{dir}0");
-        let tx = self.conn.transaction()?;
+        let tx = self.write_tx()?;
         let mut removed = 0;
         for table in [
             "files",
@@ -517,7 +621,7 @@ impl Store {
 
     /// Replace the changed files recorded for a PR, including their diffs.
     pub fn replace_pr_files(&mut self, pr_number: i64, files: &[PrFileChange]) -> Result<()> {
-        let tx = self.conn.transaction()?;
+        let tx = self.write_tx()?;
         tx.execute(
             "DELETE FROM pr_files WHERE pr_number = ?1",
             params![pr_number],
@@ -543,7 +647,7 @@ impl Store {
 
     /// Replace the commit list recorded for a PR.
     pub fn replace_pr_commits(&mut self, pr_number: i64, commits: &[PrCommit]) -> Result<()> {
-        let tx = self.conn.transaction()?;
+        let tx = self.write_tx()?;
         tx.execute(
             "DELETE FROM pr_commits WHERE pr_number = ?1",
             params![pr_number],
@@ -573,7 +677,7 @@ impl Store {
         pr_number: i64,
         comments: &[IngestedComment],
     ) -> Result<()> {
-        let tx = self.conn.transaction()?;
+        let tx = self.write_tx()?;
         tx.execute(
             "DELETE FROM review_comments WHERE pr_number = ?1",
             params![pr_number],
@@ -694,7 +798,7 @@ impl Store {
     /// Replace the import targets recorded for a file. Targets are normalized
     /// (see [`crate::imports::normalize_target`]) before storage; empties dropped.
     pub fn replace_imports_for_file(&mut self, path: &str, targets: &[String]) -> Result<()> {
-        let tx = self.conn.transaction()?;
+        let tx = self.write_tx()?;
         tx.execute("DELETE FROM file_imports WHERE path = ?1", params![path])?;
         for raw in targets {
             let target = crate::imports::normalize_target(raw);
@@ -781,7 +885,7 @@ impl Store {
     /// neither be served nor mistaken for current.
     pub fn upsert_fingerprinted(&mut self, files: &[ScannedFile]) -> Result<()> {
         use rusqlite::OptionalExtension;
-        let tx = self.conn.transaction()?;
+        let tx = self.write_tx()?;
         for scanned in files {
             let f = &scanned.record;
             let old: Option<(i64, Option<i64>, Option<String>)> = tx
@@ -866,7 +970,7 @@ impl Store {
     /// for when its contents can no longer be read: the old rows describe text
     /// that is gone, and the file should be retried rather than trusted empty.
     pub fn clear_extracted(&mut self, path: &str) -> Result<()> {
-        let tx = self.conn.transaction()?;
+        let tx = self.write_tx()?;
         tx.execute("DELETE FROM symbols WHERE path = ?1", params![path])?;
         tx.execute("DELETE FROM file_imports WHERE path = ?1", params![path])?;
         tx.execute(
@@ -878,7 +982,7 @@ impl Store {
     }
 
     pub fn replace_symbols_for_file(&mut self, path: &str, symbols: &[SymbolRecord]) -> Result<()> {
-        let tx = self.conn.transaction()?;
+        let tx = self.write_tx()?;
         tx.execute("DELETE FROM symbols WHERE path = ?1", params![path])?;
         for s in symbols {
             tx.execute(
@@ -903,7 +1007,7 @@ impl Store {
     }
 
     pub fn replace_cochange(&mut self, edges: &[CoChange]) -> Result<()> {
-        let tx = self.conn.transaction()?;
+        let tx = self.write_tx()?;
         tx.execute("DELETE FROM cochange", [])?;
         for e in edges {
             tx.execute(
@@ -1722,7 +1826,7 @@ mod tests {
         let conn = Connection::open(repo.0.join(".engram").join("engram.db")).unwrap();
         // The symbols wipe runs before the statement that fails.
         conn.execute_batch("DROP TABLE vectors;").unwrap();
-        assert!(Store::reconcile_parser_version(&conn, PARSER_CONFIG_VERSION + 1).is_err());
+        assert!(Store::reset_if_still_mismatched(&conn, PARSER_CONFIG_VERSION + 1).is_err());
         let symbols: i64 = conn
             .query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))
             .unwrap();
@@ -1735,6 +1839,180 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stored, PARSER_CONFIG_VERSION.to_string());
+    }
+
+    #[test]
+    fn a_second_handle_that_saw_a_stale_mismatch_does_not_wipe_what_the_first_wrote() {
+        let repo = TempRepo::new();
+        drop(repo.store());
+        let changed = PARSER_CONFIG_VERSION + 1;
+        // Handle B opened first and is about to act on a mismatch it already saw...
+        let b = Connection::open(repo.0.join(".engram").join("engram.db")).unwrap();
+        assert_ne!(
+            Store::stored_parser_version(&b).unwrap().as_deref(),
+            Some(changed.to_string().as_str())
+        );
+        // ...but handle A got there first: it wiped, recorded the new version,
+        // and re-extracted a file under it.
+        {
+            let mut a = Store::open_with_parser_version(&repo.0, changed).unwrap();
+            a.upsert_files(&[file("a.rs")]).unwrap();
+            a.replace_symbols_for_file("a.rs", &[symbol("a.rs", "thing")])
+                .unwrap();
+        }
+        // B takes the lock, re-reads, sees the updated key and leaves the data.
+        Store::reset_if_still_mismatched(&b, changed).unwrap();
+        drop(b);
+        let store = Store::open_with_parser_version(&repo.0, changed).unwrap();
+        assert_eq!(store.symbols_for_path("a.rs").unwrap().len(), 1);
+        assert!(store.is_tier1_done("a.rs"));
+    }
+
+    #[test]
+    fn concurrent_opens_and_writes_from_several_threads_all_succeed() {
+        use std::sync::{Arc, Barrier};
+        const THREADS: usize = 6;
+        let repo = TempRepo::new();
+        let root = Arc::new(repo.0.clone());
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let root = Arc::clone(&root);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || -> Result<()> {
+                    // All threads race to create and configure the same new
+                    // database file, then to write to it.
+                    barrier.wait();
+                    let mut store = Store::open(&root)?;
+                    for i in 0..40 {
+                        let path = format!("t{t}/f{i}.rs");
+                        store.upsert_files(&[file(&path)])?;
+                        store.replace_symbols_for_file(&path, &[symbol(&path, "thing")])?;
+                    }
+                    Ok(())
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join()
+                .expect("thread panicked")
+                .expect("no `database is locked`");
+        }
+        let store = repo.store();
+        assert_eq!(store.all_files().unwrap().len(), THREADS * 40);
+    }
+
+    #[test]
+    fn many_threads_opening_one_fresh_cache_all_succeed_and_initialise_it_once() {
+        use std::sync::{Arc, Barrier};
+        const THREADS: usize = 8;
+        const ITERATIONS: usize = 30;
+        for iteration in 0..ITERATIONS {
+            // A new directory each time: the race is over a cache that does not
+            // exist yet (journal-mode switch, schema creation, version record).
+            let repo = TempRepo::new();
+            let root = Arc::new(repo.0.clone());
+            let barrier = Arc::new(Barrier::new(THREADS));
+            let handles: Vec<_> = (0..THREADS)
+                .map(|_| {
+                    let root = Arc::clone(&root);
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || -> Result<(String, String)> {
+                        barrier.wait();
+                        let store = Store::open(&root)?;
+                        let stored = Store::stored_parser_version(&store.conn)?
+                            .expect("an opened cache records its version");
+                        let mode: String =
+                            store
+                                .conn
+                                .query_row("PRAGMA journal_mode", [], |r| r.get(0))?;
+                        Ok((stored, mode))
+                    })
+                })
+                .collect();
+            for h in handles {
+                let (stored, mode) = h
+                    .join()
+                    .expect("thread panicked")
+                    .unwrap_or_else(|e| panic!("iteration {iteration}: open failed: {e:#}"));
+                assert_eq!(
+                    stored,
+                    PARSER_CONFIG_VERSION.to_string(),
+                    "iteration {iteration}"
+                );
+                assert_eq!(mode, "wal", "iteration {iteration}");
+            }
+        }
+    }
+
+    #[test]
+    fn opens_wait_for_a_writer_holding_the_lock_and_then_succeed() {
+        use std::sync::{Arc, Barrier};
+        const THREADS: usize = 4;
+        const HOLD: Duration = Duration::from_millis(400);
+        let repo = TempRepo::new();
+        drop(repo.store());
+        // Another handle takes the write lock and keeps it for a moment.
+        let writer = Connection::open(repo.0.join(".engram").join("engram.db")).unwrap();
+        writer.busy_timeout(BUSY_TIMEOUT).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let root = Arc::new(repo.0.clone());
+        let barrier = Arc::new(Barrier::new(THREADS + 1));
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let root = Arc::clone(&root);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || -> Result<Duration> {
+                    barrier.wait();
+                    let started = Instant::now();
+                    Store::open(&root)?;
+                    Ok(started.elapsed())
+                })
+            })
+            .collect();
+        barrier.wait();
+        std::thread::sleep(HOLD);
+        writer.execute_batch("COMMIT").unwrap();
+        for h in handles {
+            let waited = h
+                .join()
+                .expect("thread panicked")
+                .expect("an open waits for the writer instead of failing");
+            assert!(waited < BUSY_TIMEOUT, "bounded wait, took {waited:?}");
+        }
+    }
+
+    #[test]
+    fn opens_racing_a_writer_on_a_fresh_cache_succeed() {
+        use std::sync::{Arc, Barrier};
+        const THREADS: usize = 4;
+        for _ in 0..10 {
+            let repo = TempRepo::new();
+            let root = Arc::new(repo.0.clone());
+            let barrier = Arc::new(Barrier::new(THREADS + 1));
+            let openers: Vec<_> = (0..THREADS)
+                .map(|_| {
+                    let root = Arc::clone(&root);
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || -> Result<()> {
+                        barrier.wait();
+                        Store::open(&root)?;
+                        Ok(())
+                    })
+                })
+                .collect();
+            // The first handle initialises the cache and writes to it while the
+            // others are still opening.
+            barrier.wait();
+            let mut first = Store::open(&repo.0).expect("first open");
+            for i in 0..20 {
+                first.upsert_files(&[file(&format!("f{i}.rs"))]).unwrap();
+            }
+            for h in openers {
+                h.join().expect("thread panicked").expect("open succeeds");
+            }
+            assert_eq!(repo.store().all_files().unwrap().len(), 20);
+        }
     }
 
     fn hashed(path: &str, mtime: i64, hash: &str) -> ScannedFile {

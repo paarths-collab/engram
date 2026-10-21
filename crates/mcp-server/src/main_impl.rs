@@ -601,7 +601,8 @@ impl Engram {
             }
             (
                 json!({ "task": task, "evidence": outcome.packets, "past_reviews": past_reviews }),
-                budget::search_plan(budget, &outcome.cap_dropped, outcome.beyond_first_cap),
+                budget::search_plan(budget, &outcome.cap_dropped, outcome.beyond_first_cap)
+                    .list_beyond_cap(&outcome.beyond_first_cap_paths),
             )
         };
         // Always answered from the current snapshot; a different one asked for

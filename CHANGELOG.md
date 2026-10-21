@@ -66,6 +66,29 @@ release tags.
 - For equal confidence, `likely_files` in `expand_connections` is ordered by path.
 
 ### Fixed
+- **A budgeted pack always names some of what it omitted.** `pack.omitted` was
+  empty when every result was kept and the only omissions were candidates the
+  search's first cap cut (counted, never named), so `omitted_count` could be
+  positive with nothing listed. The best 20 of those candidates are now listed
+  with reason `below_cap`, and under a budget the list holds at least
+  `min(3, enumerable omissions)` entries whatever room is left, falling back to
+  as many as fit when only the bare `pack` does.
+- **`database is locked` during startup.** The busy timeout is now set before
+  any other statement (it used to follow the journal-mode switch and schema
+  creation) and raised to 10 seconds, and write transactions take the write lock
+  immediately instead of upgrading from a read, which fails at once without
+  waiting. Startup indexing, the watcher and request handlers no longer fail
+  against each other on the shared SQLite file.
+- Two connections opening the store at the same moment can no longer both wipe
+  derived data on a rules-fingerprint mismatch: the reset runs under
+  `BEGIN IMMEDIATE` and re-reads the stored fingerprint inside the transaction.
+- **Concurrent first opens of a new cache no longer fail with `database is locked`.**
+  `Store::open` retries the journal-mode switch (which SQLite refuses at once,
+  without the busy timeout, when two connections race to make it) for up to the
+  busy timeout, and creates the schema, runs migrations and reconciles the
+  rules fingerprint in a single `BEGIN IMMEDIATE` transaction, so the losing
+  opener waits for the winner and finds the cache initialised. An open now
+  waits for a writer that currently holds the write lock, as any other write does.
 - A clippy lint in the cached-vector decoder (`chunks_exact`) is fixed, so the
   code passes newer clippy with `-D warnings`.
 
