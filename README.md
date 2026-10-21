@@ -61,7 +61,7 @@ The server exposes ten tools.
 
 **Supporting:**
 - `find_existing_implementation(concept)` — check for existing code before writing new code, to reuse instead of duplicate
-- `get_graph(paths, max_hops?, kinds?)` — the raw graph facts around some files (heuristic import edges and historical co-change rows), each with a citable `edge_id` that `expand_connections` and `explain_connection` reuse. Facts, not a ranking, and not a call graph: symbol-level call edges are not recorded
+- `get_graph(paths, max_hops?, kinds?, snapshot?, max_edges?, max_nodes?)` — the raw typed facts around some files: `import` edges (heuristic, `candidate`) and `cochange` rows, each with an `edge_id` derived from the snapshot and the edge, which `expand_connections` and `explain_connection` cite. `max_hops` is 1..2 (default 2); `kinds` is `"import"` or `"cochange"`; `max_edges` is 1..500 and `max_nodes` is 1..200 (both default to the hard caps). Caps and omitted counts are disclosed in `limits`. Facts, not a ranking, and not a call graph: symbol-level call edges are not recorded
 - `get_verification_plan(changed_files)` — merged checklist from YAML domain profiles, detected test commands, and tests that historically changed together with these files
 - `get_review_history(path?, task?)` — raw, unsummarized past reviewer comments with PR number and merged status
 
