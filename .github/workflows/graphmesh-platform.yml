@@ -24,36 +24,48 @@ jobs:
           set -euo pipefail
           mkdir -p platform-results
           rustc --version | tee platform-results/rustc.txt
-          cargo test -p engram-repo-map --bin graphmesh-core 2>&1 | tee platform-results/tests.txt
-          cargo clippy -p engram-repo-map --bin graphmesh-core -- -D warnings 2>&1 | tee platform-results/clippy.txt
-          cargo build --release -p engram-repo-map --bin graphmesh-core
+          cargo test --locked -p engram-repo-map --bin graphmesh-core 2>&1 | tee platform-results/tests.txt
+          cargo clippy --locked -p engram-repo-map --bin graphmesh-core -- -D warnings 2>&1 | tee platform-results/clippy.txt
+          cargo build --locked --release -p engram-repo-map --bin graphmesh-core
       - name: Native roundtrip with unicode, restart and corruption handling
         shell: python
         run: |
-          import hashlib, json, os, pathlib, platform, shutil, subprocess, tempfile
+          import hashlib, json, os, pathlib, platform, re, shutil, subprocess, tempfile
           name = 'graphmesh-core.exe' if os.name == 'nt' else 'graphmesh-core'
           binary = pathlib.Path('target/release', name).resolve()
           probe = json.loads(subprocess.check_output([str(binary), '--probe']))
           assert probe['native_storage'] and probe['native_graph_queries']
-          with tempfile.TemporaryDirectory(prefix='graphmesh space ') as directory:
-              db = pathlib.Path(directory, 'state.db')
+          UNICODE = 'caf\u00e9 \U0001f600'
+
+          def rpc(db, requests, eol, ensure_ascii):
+              # Bytes in, bytes out: never rely on the runner locale (Windows defaults to cp1252, not UTF-8).
+              payload = ''.join(json.dumps(r, ensure_ascii=ensure_ascii) + eol for r in requests).encode('utf-8')
+              proc = subprocess.run([str(binary), '--db', str(db)], input=payload, capture_output=True, check=True, timeout=30)
+              assert proc.stdout.isascii(), proc.stdout
+              assert b'\r' not in proc.stdout, proc.stdout
+              return [json.loads(row) for row in proc.stdout.decode('ascii').split('\n') if row]
+
+          with tempfile.TemporaryDirectory(prefix='graphmesh space \u00e9 ') as directory:
+              db = pathlib.Path(directory, 'nested', 'state.db')
               requests = [
                   {'id':1,'op':'ping','args':{}},
-                  {'id':2,'op':'cache_put','args':{'key':'unicode','value':{'text':'caf\u00e9 \U0001f600'}}},
+                  {'id':2,'op':'cache_put','args':{'key':'unicode','value':{'text':UNICODE}}},
                   {'id':3,'op':'cache_get','args':{'key':'unicode'}},
                   {'id':4,'op':'extract','args':{'path':'a.rs','language':'Rust','source':'fn hello() {}'}},
                   {'id':5,'op':'snapshots','args':{}}
               ]
-              result = subprocess.run([str(binary),'--db',str(db)],input=''.join(json.dumps(r)+'\n' for r in requests),text=True,capture_output=True,check=True,timeout=30)
-              rows = [json.loads(line) for line in result.stdout.splitlines()]
-              assert len(rows)==5 and all(row['ok'] for row in rows)
-              assert rows[2]['result']['text']=='caf\u00e9 \U0001f600'
-              assert rows[3]['result']['symbols'][0]['name']=='hello'
-              second = subprocess.run([str(binary),'--db',str(db)],input=json.dumps(requests[2])+'\n',text=True,capture_output=True,check=True,timeout=30)
-              assert json.loads(second.stdout)['result']['text']=='caf\u00e9 \U0001f600'
+              rows = rpc(db, requests, '\n', True)
+              assert len(rows) == 5 and all(row['ok'] for row in rows), rows
+              assert rows[2]['result']['text'] == UNICODE
+              assert rows[3]['result']['symbols'][0]['name'] == 'hello'
+              # Restart on the same file, with raw UTF-8 input and CRLF framing.
+              second = rpc(db, [requests[2]], '\r\n', False)
+              assert len(second) == 1 and second[0]['result']['text'] == UNICODE, second
           out = pathlib.Path('platform-results')
+          native_tests = sum(int(n) for n in re.findall(r'test result: ok\. (\d+) passed', (out/'tests.txt').read_text(encoding='utf-8', errors='replace')))
+          assert native_tests >= 7, native_tests
           shutil.copy2(binary,out/name)
-          report = {'platform':platform.system(),'machine':platform.machine(),'python':platform.python_version(),'native_tests':3,'rpc_checks':7,'passed':True,'probe':probe,'binary_sha256':hashlib.sha256(binary.read_bytes()).hexdigest(),'commit':subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()}
+          report = {'platform':platform.system(),'machine':platform.machine(),'python':platform.python_version(),'native_tests':native_tests,'rpc_checks':len(rows)+len(second)+1,'passed':True,'probe':probe,'binary_sha256':hashlib.sha256(binary.read_bytes()).hexdigest(),'commit':subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()}
           (out/'platform.json').write_text(json.dumps(report,indent=2),encoding='utf8')
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
