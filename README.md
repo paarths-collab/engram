@@ -18,35 +18,67 @@ cargo build --release
 # binary at target/release/engram
 ```
 
+## Commands
+- `engram [--repo <path>]` — runs the MCP stdio server for the repo (default: current directory)
+- `engram ingest-github [--limit N]` — ingests GitHub PRs, commits, and review comments into the
+  local store. Needs `ENGRAM_GITHUB_TOKEN` or `GITHUB_TOKEN`, plus an `origin` remote. It fetches at
+  most 100 records per list, so it is not a complete history.
+
 ## Wire into an agent (Claude Code example)
 ```json
 {
   "mcpServers": {
-    "engram": { "command": "/path/to/engram", "args": ["--repo", "."] }
+    "engram": { "command": "/absolute/path/to/engram", "args": ["--repo", "/absolute/path/to/your/repo"] }
   }
 }
 ```
 
+Use an absolute repo path, not `.`. MCP clients start the server from a working directory
+that is not predictable, so a relative path may point at the wrong repository. The repo
+directory must be writable: Engram caches its index in `<repo>/.engram/engram.db`.
+
 Drop into CLAUDE.md / AGENTS.md:
 ```
 Before implementing any task:
-1. Call engram get_task_context with the task description
-2. If you already know which file(s) you're touching, call engram find_connected_files
-   with those paths instead of predict_impact — it returns only files linked by
-   recorded facts (co-change history, import graph), not a guess.
-3. Otherwise call engram predict_impact before modifying files
+1. Call engram search_context with the task description to find the relevant files, symbols, and tests
+2. Call engram expand_connections with the file(s) you already know you're touching, to get
+   files linked by recorded facts (co-change history, import graph), not a guess
+3. Call engram explain_connection on any suggested file to see the fact behind the link
 4. Call engram find_existing_implementation before writing any new function/class/service
-5. Call engram get_verification_plan after making changes, before opening a PR
-6. Call engram get_review_history on a file before changing it, to see past reviewer comments
+5. Call engram get_review_history on a file before changing it, to see past reviewer comments
+6. Call engram get_verification_plan after making changes, before opening a PR
 ```
 
+If you have no anchor file yet, `predict_impact(task)` (experimental) is a text-driven guess.
+
 ## Tools
-- `get_task_context(task)` — hybrid (BM25+vector+symbol) evidence for a task, plus past reviewer comments on the matched files
-- `find_existing_implementation(concept)` — check before writing new code, to reuse instead of duplicate
-- `predict_impact(task)` — text-driven impact guess; use when there's no anchor file yet
-- `find_connected_files(files)` — **deterministic, no prediction**: given anchor file(s) you already know you're changing, returns only files linked by recorded facts (co-change graph, import graph). Prefer this over `predict_impact` whenever you have concrete anchors — see `docs/benchmarks.md` Benchmark 2 for why.
-- `get_verification_plan(changed_files)` — merged checklist from YAML domain profiles + detected test commands + historically co-failing tests
-- `get_review_history(path, task)` — raw, unsummarized past reviewer comments with PR number and merged status
+The server exposes nine tools.
+
+**Canonical** (the public API, see [`docs/CONTRACT.md`](docs/CONTRACT.md)):
+- `search_context(query)` — hybrid (BM25 + vector + symbol) search for files, symbols, tests, and definitions relevant to a task, with past reviewer comments on matched files
+- `expand_connections(paths)` — deterministic: given anchor file(s), returns only files linked to them by recorded facts (co-change graph, import graph). Prefer this whenever you have concrete anchors — see `docs/benchmarks.md` Benchmark 2
+- `explain_connection(source, target)` — the recorded fact behind a connection between two files
+
+**Supporting:**
+- `find_existing_implementation(concept)` — check for existing code before writing new code, to reuse instead of duplicate
+- `get_verification_plan(changed_files)` — merged checklist from YAML domain profiles, detected test commands, and tests that historically changed together with these files
+- `get_review_history(path?, task?)` — raw, unsummarized past reviewer comments with PR number and merged status
+
+**Deprecated aliases** (kept for compatibility; use the canonical name):
+- `get_task_context(task)` — alias for `search_context`
+- `find_connected_files(files)` — alias for `expand_connections`
+
+**Experimental:**
+- `predict_impact(task)` — text-driven impact guess; use only when there's no anchor file
+
+The `historically_co_failing_tests` key in `get_verification_plan` output is a legacy name. It
+lists tests that historically changed together with the files, not tests that failed together.
+
+## Embeddings
+The default embedder is hashed n-grams: character-trigram and token features hashed into a
+fixed-size vector. It is lexical and subword-based, not a learned semantic model. It works well
+on identifiers that share structure (`RetryPolicy` and `retry_policy`), but it will not match
+synonyms with no shared characters.
 
 ## What's inside
 - Tier-0 inventory: file walk, language + test detection (crates/repo-map/inventory.rs)
@@ -56,7 +88,7 @@ Before implementing any task:
   language but has no grammar yet, so it falls in that second group.
 - Co-change graph from `git log` history + in-memory `petgraph` graph layer for
   multi-hop traversal (crates/repo-map/graph.rs) — see docs/adr/0001
-- Hybrid retrieval: Tantivy BM25 + hashed-ngram vectors + symbol boost + path match +
+- Hybrid retrieval: Tantivy BM25 + hashed-ngram vectors (lexical/subword, see Embeddings) + symbol boost + path match +
   recency + doc/changelog demotion + stopword filtering, weighted score fusion (crates/retrieval)
 - Vector store persisted to SQLite (content-hash keyed; unchanged files skip re-embedding)
 - Incremental reindex: file-watcher (save → reparse just that file) + git-HEAD watcher
@@ -66,10 +98,10 @@ Before implementing any task:
   with the hunk and timestamp they were left against (crates/connectors-github).
   The timestamps are what let a push be attributed to the review comment that
   prompted it — the basis for mining a repo's house rules from its own history.
-- Benchmark harness: file-prediction Recall@k and leakage-free connection-recovery
-  eval (crates/evals) — see docs/benchmarks.md
+- Benchmark harness: file-prediction Recall@k and connection-recovery eval with a
+  temporal co-change split (crates/evals) — see docs/benchmarks.md
 - SQLite store in .engram/engram.db; background indexing on server start
-- Hand-rolled MCP stdio server, six tools (crates/mcp-server)
+- Hand-rolled MCP stdio server, nine tools (crates/mcp-server)
 
 ## Scoring config
 Fusion weights, doc/changelog demotions, and recency are externalized to
@@ -85,14 +117,15 @@ built-in defaults (retrieval/src/weights.rs).
 
 ## Benchmarks
 See `docs/benchmarks.md`. Headline: given one anchor file, the deterministic
-graph (`find_connected_files`) recovers **58% of the files that actually
-changed alongside it** (Recall@10) on langchain-ai/langchain, with a
-leakage-free temporal split — no text, no LLM, no guessing.
+graph (`expand_connections`) recovers **58% of the files that actually
+changed alongside it** (Recall@10) on langchain-ai/langchain. The co-change split is temporal
+(leakage-free); the import graph is built at the evaluated repo's current HEAD. No text, no LLM,
+no guessing.
 
-## Next
-- Root-cause engine (explain_failure): combine CI failure logs + diff + history
+## Roadmap (not implemented)
+- Root-cause engine (`explain_failure`): combine CI failure logs + diff + history
 - Real embeddings (fastembed-rs) behind the existing `Embedder` trait
-- Learning loop: submit_outcome + deterministic feedback scoring
+- Learning loop (`submit_outcome`) + deterministic feedback scoring
 
 ## License
 
