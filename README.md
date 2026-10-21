@@ -52,7 +52,7 @@ Before implementing any task:
 If you have no anchor file yet, `predict_impact(task)` (experimental) is a text-driven guess.
 
 ## Tools
-The server exposes nine tools.
+The server exposes ten tools.
 
 **Canonical** (the public API, see [`docs/CONTRACT.md`](docs/CONTRACT.md)):
 - `search_context(query)` — hybrid (BM25 + vector + symbol) search for files, symbols, tests, and definitions relevant to a task, with past reviewer comments on matched files
@@ -61,6 +61,7 @@ The server exposes nine tools.
 
 **Supporting:**
 - `find_existing_implementation(concept)` — check for existing code before writing new code, to reuse instead of duplicate
+- `get_graph(paths, max_hops?, kinds?)` — the raw graph facts around some files (heuristic import edges and historical co-change rows), each with a citable `edge_id` that `expand_connections` and `explain_connection` reuse. Facts, not a ranking, and not a call graph: symbol-level call edges are not recorded
 - `get_verification_plan(changed_files)` — merged checklist from YAML domain profiles, detected test commands, and tests that historically changed together with these files
 - `get_review_history(path?, task?)` — raw, unsummarized past reviewer comments with PR number and merged status
 
@@ -101,7 +102,7 @@ synonyms with no shared characters.
 - Benchmark harness: file-prediction Recall@k and connection-recovery eval with a
   temporal co-change split (crates/evals) — see docs/benchmarks.md
 - SQLite store in .engram/engram.db; background indexing on server start
-- Hand-rolled MCP stdio server, nine tools (crates/mcp-server)
+- Hand-rolled MCP stdio server, ten tools (crates/mcp-server)
 
 ## Scoring config
 Fusion weights, doc/changelog demotions, and recency are externalized to

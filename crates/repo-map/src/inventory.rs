@@ -130,29 +130,9 @@ pub fn mtime_ns(meta: &std::fs::Metadata) -> Option<i64> {
     i64::try_from(since_epoch.as_nanos()).ok()
 }
 
-/// FNV-1a, 64-bit. A change fingerprint, not a security boundary: stable
-/// across platforms and releases, with no dependency.
-pub struct Fnv64(u64);
-
-impl Default for Fnv64 {
-    fn default() -> Self {
-        Fnv64(0xcbf2_9ce4_8422_2325)
-    }
-}
-
-impl Fnv64 {
-    pub fn write(&mut self, bytes: &[u8]) {
-        for b in bytes {
-            self.0 ^= u64::from(*b);
-            self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-    }
-
-    /// Lowercase 16-digit hex of the digest.
-    pub fn finish_hex(&self) -> String {
-        format!("{:016x}", self.0)
-    }
-}
+// The FNV-1a implementation lives in the domain crate so every crate can use it
+// (edge ids hash with it too); it stays reachable here for the store.
+pub use engram_domain::Fnv64;
 
 /// Content fingerprint of a byte string (see [`Fnv64`]).
 pub fn hash_bytes(bytes: &[u8]) -> String {

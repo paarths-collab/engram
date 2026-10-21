@@ -17,6 +17,16 @@ use std::path::Path;
 /// no extracted symbols.
 pub type ChunkKey = (String, usize);
 
+/// Result of [`Store::cochange_neighbors`].
+#[derive(Debug, Clone)]
+pub struct CoChangeNeighbors {
+    /// The strongest rows, at most the requested limit, in a total order.
+    pub rows: Vec<CoChange>,
+    /// Every row from the path to an indexed file, including those past the
+    /// limit.
+    pub total: usize,
+}
+
 pub struct Store {
     pub conn: Connection,
 }
@@ -1098,6 +1108,42 @@ impl Store {
         Ok(rows.filter_map(Result::ok).collect())
     }
 
+    /// The strongest co-change rows `path -> partner` whose partner is an
+    /// indexed file, at most `limit`, ordered by strength descending, then
+    /// shared-commit count descending, then partner path ascending (a total
+    /// order), plus how many such rows exist in all. Unlike
+    /// [`Store::cochange_for`] the order is fully determined by the query, so
+    /// the cut at `limit` is the same on every run, and the caller can say
+    /// exactly how many rows the limit hid (`total - rows.len()`).
+    pub fn cochange_neighbors(&self, path: &str, limit: usize) -> Result<CoChangeNeighbors> {
+        let total: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM cochange c JOIN files f ON f.path = c.path_b
+             WHERE c.path_a = ?1",
+            params![path],
+            |r| r.get(0),
+        )?;
+        let mut stmt = self.conn.prepare(
+            "SELECT c.path_a, c.path_b, c.count, c.strength
+             FROM cochange c JOIN files f ON f.path = c.path_b
+             WHERE c.path_a = ?1
+             ORDER BY c.strength DESC, c.count DESC, c.path_b ASC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![path, limit as i64], |r| {
+            Ok(CoChange {
+                path_a: r.get(0)?,
+                path_b: r.get(1)?,
+                count: r.get::<_, i64>(2)? as u32,
+                strength: r.get(3)?,
+            })
+        })?;
+        let rows: Vec<CoChange> = rows.collect::<rusqlite::Result<_>>()?;
+        Ok(CoChangeNeighbors {
+            rows,
+            total: usize::try_from(total).unwrap_or(0),
+        })
+    }
+
     /// The single directed co-change row `a -> b`, looked up by primary key.
     /// Unlike [`Store::cochange_for`] this is not ranked or capped, so a weak
     /// pair is found as reliably as a strong one. `b -> a` is a separate row.
@@ -1650,6 +1696,50 @@ mod tests {
         // The reverse row was never recorded; direction matters.
         assert!(store.cochange_pair("weak.rs", "a.rs").unwrap().is_none());
         assert!(store.cochange_pair("a.rs", "nope.rs").unwrap().is_none());
+    }
+
+    #[test]
+    fn cochange_neighbors_are_totally_ordered_limited_and_counted() {
+        let repo = TempRepo::new();
+        let mut store = repo.store();
+        let names = ["a.rs", "m1.rs", "m2.rs", "m3.rs", "m4.rs", "weak.rs"];
+        store
+            .upsert_files(&names.map(file))
+            .expect("files are indexed");
+        let row = |b: &str, count: u32, strength: f32| CoChange {
+            path_a: "a.rs".to_owned(),
+            path_b: b.to_owned(),
+            count,
+            strength,
+        };
+        store
+            .replace_cochange(&[
+                row("m3.rs", 5, 0.5),
+                row("m1.rs", 5, 0.5),
+                row("m2.rs", 9, 0.5),
+                row("weak.rs", 2, 0.1),
+                row("m4.rs", 7, 0.7),
+                // Not an indexed file: neither returned nor counted.
+                row("deleted.rs", 9, 0.99),
+            ])
+            .unwrap();
+
+        let all = store.cochange_neighbors("a.rs", 100).unwrap();
+        let order: Vec<&str> = all.rows.iter().map(|r| r.path_b.as_str()).collect();
+        // strength desc, then count desc, then path asc.
+        assert_eq!(order, ["m4.rs", "m2.rs", "m1.rs", "m3.rs", "weak.rs"]);
+        assert_eq!(all.total, 5);
+
+        let cut = store.cochange_neighbors("a.rs", 2).unwrap();
+        let order: Vec<&str> = cut.rows.iter().map(|r| r.path_b.as_str()).collect();
+        assert_eq!(order, ["m4.rs", "m2.rs"]);
+        assert_eq!(
+            cut.total, 5,
+            "the limit hides rows but does not hide that they exist"
+        );
+
+        let none = store.cochange_neighbors("weak.rs", 10).unwrap();
+        assert!(none.rows.is_empty() && none.total == 0);
     }
 
     fn sized(path: &str, size_bytes: u64) -> FileRecord {

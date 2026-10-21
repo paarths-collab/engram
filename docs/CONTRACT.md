@@ -30,7 +30,8 @@ natural-language task. That path exists (`predict_impact`) but is marked
 | `explain_connection` | `source: string`, `target: string` | Every recorded fact linking two indexed files, with its direction, scope and status. A direct pairwise lookup. |
 
 Supporting tools (stable): `find_existing_implementation(concept)`,
-`get_verification_plan(changed_files)`, `get_review_history(path?, task?)`.
+`get_verification_plan(changed_files)`, `get_review_history(path?, task?)`,
+`get_graph(paths, max_hops?, kinds?, snapshot?)` (see [`get_graph`](#get_graph)).
 
 Paths are repo-relative. Each argument is validated: `budget_tokens` must be an
 integer >= 1, `max_hops` an integer 1 or 2, and `snapshot` a string. Invalid
@@ -51,13 +52,13 @@ breaks; they will be removed in a future release. The aliases also accept
 ## Common response fields
 
 Responses from the index-backed tools (`search_context`, `expand_connections`,
-`explain_connection`, `find_existing_implementation`, `predict_impact` and the
-two aliases) carry these fields when they apply:
+`explain_connection`, `get_graph`, `find_existing_implementation`,
+`predict_impact` and the two aliases) carry these fields when they apply:
 
 | Field | Present | Meaning |
 |---|---|---|
 | `snapshot` | always, on index-backed tools | Id of the index the answer was computed from (see [Snapshot id](#snapshot-id)). |
-| `snapshot_mismatch` | `search_context`, `expand_connections` and aliases, when the `snapshot` argument differs from the current one | `{ "requested": "...", "current": "..." }`. The answer still comes from the current snapshot. |
+| `snapshot_mismatch` | `search_context`, `expand_connections`, `get_graph` and aliases, when the `snapshot` argument differs from the current one | `{ "requested": "...", "current": "..." }`. The answer still comes from the current snapshot. |
 | `index_warnings` | when results may be out of date | Array of plain-text warnings (see [Index state](#index-state)). |
 | `index_state` | only when results may be stale | `{ "status": "ready", "stale": true, "generation": n, "snapshot": "..." }`. |
 | `pack` | `search_context`, `expand_connections` and aliases | Budget and omission report (see [The pack object](#the-pack-object)). |
@@ -136,6 +137,12 @@ Response (from the transcript; `pack` is not in that capture, see below):
 
 (Trimmed: the transcript also lists three more co-change entries at 40%.)
 
+(The capture predates edge ids: current responses also carry `evidence_ids` and
+`score_components` on each `cochange_expansions` and `import_expansions` entry,
+for example `"evidence_ids": ["e_<16 hex digits>"]` and
+`"score_components": {"basis": "cochange_strength", "strength": 0.8, "count": 8,
+"anchor": "app/service.py"}`.)
+
 - `likely_files` holds the anchors that are in the index, at confidence 1.0.
   Paths not in the index are ignored; they do not produce an error.
 - `cochange_expansions` are files that changed with an anchor in the recorded
@@ -147,6 +154,24 @@ Response (from the transcript; `pack` is not in that capture, see below):
 - Ordering: `pack.ordering` = `confidence_desc,path_asc`. Equal-confidence
   `likely_files` are in path order.
 - `max_hops` outside 1..2 is an error.
+- Recommendations cite their evidence (see [Edge ids](#edge-ids)). Each
+  `cochange_expansions` and `import_expansions` entry carries:
+  - `evidence_ids`: the ids of the recorded edges the entry rests on. For a
+    co-change entry, the stored row from every anchor that kept it among its top
+    5; for an import entry, one id per hop of the import route back to an anchor
+    (a 2-hop dependent cites both of its single-hop edges). Sorted for
+    co-change, in route order for imports.
+  - `score_components`: the numbers `confidence` was taken from. Co-change:
+    `{"basis": "cochange_strength", "strength", "count", "anchor"}` (the
+    strongest cited row). Import: `{"basis": "import_hops", "hops", "weight"}`
+    (0.6 for one hop, 0.35 for two).
+  - Every cited id is an id [`get_graph`](#get_graph) emits for the same anchors
+    in the same snapshot (with `max_hops` at least as large as the one used here).
+    Anchors in `likely_files` and the entries of `predict_impact`'s search hits
+    carry neither field. Search evidence has no `score_components`: its
+    per-signal scores are not kept, only the fused `score` and the `signals` list.
+  - Minimal records under a budget omit both fields; their `expansion_handle`
+    still leads to `explain_connection`.
 
 ### Budgeted packs
 
@@ -217,6 +242,10 @@ shortened; the transcript has the full text):
 }
 ```
 
+(The capture predates edge ids: current responses also carry `edge_id` on each
+reason and inside each `edges[]` entry, see [Reasons](#reasons) and
+[Edge ids](#edge-ids).)
+
 ### Top-level fields
 
 - `connected`: `true` when `reasons` is non-empty. `false` only means no
@@ -247,7 +276,8 @@ or `historical_cochange` has:
 | `direction` | `source_imports_target` or `target_imports_source` | `source_to_target` or `target_to_source` |
 | `hops` | 1 or 2 | not present |
 | `chain` | repo-relative paths, endpoints included (`hops + 1` entries) | not present |
-| `edges` | one `{from, to}` per hop, in route order | not present |
+| `edges` | one `{from, to, edge_id}` per hop, in route order; `edge_id` is the id of that single edge | not present |
+| `edge_id` | id of the whole route (equal to its only hop's id for a direct import) | id of the stored row this fact came from |
 | `resolution` | `heuristic` | not present |
 | `resolver` | `heuristic_module_segments` | not present |
 | `resolution_status` | `candidate`: a plausible edge, not compiler-verified | not present |
@@ -258,6 +288,13 @@ or `historical_cochange` has:
 Co-change means the two files changed in the same commits. It does not mean
 one must change with the other.
 
+Edge ids ([Edge ids](#edge-ids)) are additive on this tool: `edge_id` on each
+reason, and `edge_id` inside each `edges[]` entry. A hop's id equals the id
+[`get_graph`](#get_graph) emits for that single import edge, so the hops of a
+2-hop chain are individually citeable. A co-change reason's id belongs to the
+stored row it reports, not to the direction of the question: asking
+`(a, b)` or `(b, a)` yields the same two ids.
+
 ### Errors
 
 Each of these is a tool error (`isError: true`) with a message in the text:
@@ -266,6 +303,177 @@ Each of these is a tool error (`isError: true`) with a message in the text:
   path returned by `search_context` or `expand_connections`.
 - `source` and `target` are the same file.
 - A required argument is missing or empty.
+
+## Edge ids
+
+Every graph fact has a content-derived id so a recommendation can cite exactly
+the fact it rests on, and a client can check the citation.
+
+```
+edge_id = "e_" + 16 lowercase hex digits
+        = FNV-1a-64 over  len-prefixed( "engram-edge-v1", snapshot, kind, source, target )
+                          ‖ count ‖ len-prefixed( each of chain_or_direction )
+```
+
+- Every string is encoded as its byte length (`u64`, little-endian) followed by
+  its UTF-8 bytes; `count` is the number of trailing items (`u64`, little-endian).
+- `kind` is `import` or `cochange`.
+- Import edge: `source` is the importer, `target` the imported file, and the
+  trailing items are the full chain of paths in order. A single hop is the
+  two-element chain `[source, target]`, so a hop has the same id whether it is
+  cited alone (`get_graph`, `evidence_ids`) or as a step of a longer route
+  (`explain_connection` `edges[]`). A whole 2-hop route has its own, different id.
+- Co-change edge: the id belongs to the stored row `source -> target`, with the
+  single trailing item `source_to_target`. The row `target -> source` is a
+  different edge with a different id, whichever way a lookup was phrased.
+- Stability: the same snapshot gives the same ids on any machine and on any run.
+  The id includes the [snapshot id](#snapshot-id), so any content, path,
+  commit or parser-version change gives every edge a new id. Use ids within one
+  snapshot; pass the `snapshot` you cited from to detect that it moved.
+- Collision caveat: the id is a 64-bit hash, not a unique key. Within one
+  snapshot a collision is possible in principle (about one in 2^64 per pair of
+  edges); ids are not unique across snapshots or repositories and must not be
+  used as global identifiers. It is a fingerprint, not a security boundary.
+
+## `get_graph`
+
+A supporting tool: the raw recorded facts around some files. It lists edges; it
+does not rank files, and it is independent of the recommendation caps of
+`expand_connections`.
+
+What it is not: **not a call graph**. The graph facts are heuristic import edges
+(module-name matching, `resolution_status: "candidate"`, never compiler-verified)
+and historical co-change (files that changed in the same commits). Symbol-level
+call edges are not implemented.
+
+Request:
+
+```json
+{ "name": "get_graph", "arguments": { "paths": ["app/service.py"] } }
+```
+
+| Argument | Meaning |
+|---|---|
+| `paths: string[]` | Anchor files (required, non-empty). Each must be an indexed file, else a tool error in the style of `explain_connection`. Order and repeats do not matter. |
+| `max_hops?: 1..2` (default 1) | Import distance followed from the anchors. 1 returns every import edge touching an anchor; 2 also returns the edges touching those neighbours. Co-change edges are always anchor-to-partner. Outside 1..2 is an error. |
+| `kinds?: ("import" \| "cochange")[]` | Which kinds to return; default both. Empty or unknown values are an error. |
+| `snapshot?: string` | As elsewhere: a different current snapshot is reported in `snapshot_mismatch`; the answer is always from the current one. |
+
+There is no `budget_tokens`: the hard caps below are the bound.
+
+Response (from the end-to-end test `get_graph_returns_the_api_service_facts_under_the_ids_explain_reports`
+on the standard fixture; trimmed to two nodes and two of the edges):
+
+```json
+{
+  "snapshot": "0a2d2ba23ebbd0db",
+  "anchors": [
+    "app/service.py"
+  ],
+  "nodes": [
+    {
+      "distance": 1,
+      "is_test": false,
+      "language": "python",
+      "path": "app/api.py",
+      "role": "neighbor"
+    },
+    {
+      "distance": 0,
+      "is_test": false,
+      "language": "python",
+      "path": "app/service.py",
+      "role": "anchor"
+    }
+  ],
+  "edges": [
+    {
+      "direction": "source_imports_target",
+      "edge_id": "e_7d78b9c1bb72fbfe",
+      "hops": 1,
+      "kind": "import",
+      "resolution_status": "candidate",
+      "resolver": "heuristic_module_segments",
+      "source": "app/api.py",
+      "target": "app/service.py"
+    },
+    {
+      "count": 8,
+      "direction": "source_to_target",
+      "edge_id": "e_ce59056d1a703ec0",
+      "kind": "cochange",
+      "opportunities_source": 8,
+      "opportunities_target": 10,
+      "source": "app/api.py",
+      "strength": 1.0,
+      "target": "app/service.py",
+      "window": {
+        "max_commits": 2000,
+        "max_files_per_commit": 30,
+        "min_count": 2
+      }
+    }
+  ],
+  "limits": {
+    "cochange_per_anchor": 50,
+    "max_edges": 500,
+    "max_nodes": 200,
+    "omitted_edges": 0,
+    "omitted_nodes": 0,
+    "reason": "complete: no cap cut anything",
+    "truncated": false
+  },
+  "scope": {
+    "bulk_commits_excluded": 0,
+    "cochange_window": {
+      "max_commits": 2000,
+      "max_files_per_commit": 30,
+      "min_count": 2
+    },
+    "commits_scanned": 11,
+    "import_max_hops": 1,
+    "kinds": [
+      "import",
+      "cochange"
+    ],
+    "note": "Facts only, not a ranking and not a call graph: import edges are heuristic module-name matches (single hop, either direction, from the anchors out to 1 hop(s)); co-change edges are stored git-history rows between each anchor and its strongest partners (last 2000 commits, pairs sharing at least 2 commits, commits touching more than 30 files ignored). Symbol-level call edges are not recorded. Absence of an edge means none was recorded within this scope."
+  }
+}
+```
+
+- `nodes`: the anchors (`role: "anchor"`, `distance` 0) and neighbours
+  (`role: "neighbor"`; `distance` is the import hops from the nearest anchor,
+  1 for co-change partners). `language` is absent for unsupported extensions.
+  Sorted by `path`.
+- `edges`, sorted by (`kind`, `source`, `target`, `direction`), each once:
+  - `import`: `source` imports `target`, one hop (`hops: 1`), found in either
+    direction around an anchor; `direction` is always `source_imports_target`.
+    `resolver` is `heuristic_module_segments`, `resolution_status` is `candidate`.
+  - `cochange`: the stored row `source -> target`: `count`, `strength` (relative
+    to commits touching `source`), the build `window`, and
+    `opportunities_source` / `opportunities_target` (commits in the window that
+    touched each file, `null` on an index that predates them, never a silent
+    zero). For each partner of an anchor both rows are listed when both exist;
+    `direction` is always `source_to_target`.
+  - Import and co-change facts about one pair are separate edges.
+- `limits`: `max_nodes` 200, `max_edges` 500, `cochange_per_anchor` 50 (rows
+  read per anchor, strongest first by strength, then count, then path).
+  `truncated` is `true` when anything was cut, and then `omitted_edges` counts
+  the facts that exist but are absent (co-change rows past the per-anchor limit,
+  edges touching a file past the node cap, edges past the edge cap) and
+  `omitted_nodes` the neighbouring files past the node cap; `reason` says which.
+  Anchors are always kept; neighbours are kept nearest first then by path; edges
+  nearest an anchor first. Nothing is cut silently.
+- `scope`: what was searched (kinds, `import_max_hops`, the co-change window,
+  `commits_scanned`, `bulk_commits_excluded`, and a note). A missing edge means
+  none was recorded within it.
+- Co-change partners that are not indexed files are not listed and not counted.
+- Deterministic: the same snapshot and arguments give identical bytes.
+- Carries `snapshot`, and `index_warnings` / `index_state` when results may be stale.
+
+Ids in `evidence_ids` ([`expand_connections`](#expand_connections)) and on
+`explain_connection` reasons are drawn from the same function, so for one
+snapshot they can be looked up here.
 
 ## The pack object
 
@@ -409,6 +617,8 @@ the index becomes `Ready`.
   historically changed together with the files, not tests that failed together.
 - `get_review_history(path?, task?)`: raw, unsummarized reviewer comments, with
   `pr_number` and `pr_merged`, at most 10 per call. Pass `path`, `task`, or both.
+- `get_graph(paths, max_hops?, kinds?, snapshot?)`: raw graph facts with citable
+  edge ids; see [`get_graph`](#get_graph).
 
 ## Roadmap / not implemented
 
@@ -417,6 +627,8 @@ Not part of this contract. Listed so the gaps are visible:
 - `kinds` filter on `search_context` or `expand_connections`. No tool accepts it.
 - Learned embeddings. The default embedder is hashed n-grams behind the `Embedder` trait.
 - Compiler-level import resolution. Import edges stay heuristic candidates.
+- Symbol-level call edges. `get_graph` is not a call graph: it holds only
+  heuristic import edges and historical co-change.
 - Outcome feedback (`submit_outcome` and scoring from outcomes).
 - GraphMesh snapshot core. It is on a separate branch and is not merged. The release-branch choice is pending.
 - Full GitHub history. On `main`, `engram ingest-github` reads one page of at

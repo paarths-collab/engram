@@ -5,7 +5,7 @@ use crate::mcp::{serve, ToolHandler};
 use crate::watcher::SharedHealth;
 use engram_repo_map::store::Store;
 use engram_retrieval::budget::{self, PackPlan};
-use engram_retrieval::Engine;
+use engram_retrieval::{Engine, GraphCaps, GraphKinds};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -148,6 +148,7 @@ const INDEXED_TOOLS: &[&str] = &[
     "expand_connections",
     "find_connected_files",
     "explain_connection",
+    "get_graph",
 ];
 
 /// The `index_state` object attached to a response when the index is not
@@ -456,6 +457,30 @@ impl ToolHandler for Engram {
                 }
             },
             {
+                "name": "get_graph",
+                "description": "SUPPORTING tool: the raw graph FACTS around some files, for citing and for checking a recommendation. Not a ranking and not a call graph: it lists recorded edges, it does not score files. Edges are of two kinds only: `import` (single-hop, heuristic module-name resolution, `resolver: \"heuristic_module_segments\"`, `resolution_status: \"candidate\"`, never compiler-verified; always `source` = importer, `target` = imported, in either direction around an anchor, `hops: 1`) and `cochange` (a stored git-history row `source -> target` with commit `count`, `strength` relative to the commits touching `source`, the `window` it was built under, and `opportunities_source`/`opportunities_target`; the row back from a partner is its own edge with its own numbers). Symbol-level call edges are NOT recorded. Every edge has an `edge_id` (`e_` + 16 hex digits, derived from the snapshot and the edge; stable within a snapshot, changes with it, 64-bit so not globally unique): the same ids that `expand_connections` lists in `evidence_ids` and `explain_connection` reports on its reasons and per-hop `edges`. `nodes` are the anchors plus neighbours (`distance` = import hops from the nearest anchor, 1 for co-change partners). With `max_hops` 1 (default) you get every import edge touching an anchor; 2 also adds the edges touching those neighbours. Output is deterministic: nodes by path, edges by (kind, source, target, direction). Bounded, never silently: `limits` gives `max_nodes` (200), `max_edges` (500), the per-anchor co-change read limit (50), whether the result is `truncated`, and the exact `omitted_edges` / `omitted_nodes`. `scope` states what was searched, so a missing edge means none was recorded within it. Returns an error for any path that is not an indexed file. There is no `budget_tokens`: the caps are the bound.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "paths": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "minItems": 1,
+                            "description": "Repo-relative paths of the anchor files, e.g. ['app/service.py']. Every path must be an indexed file."
+                        },
+                        "max_hops": { "type": "integer", "minimum": 1, "maximum": 2, "default": 1, "description": "Import distance to follow from the anchors (1 = edges touching an anchor, 2 = also edges touching their direct neighbours). Co-change edges are always anchor-to-partner. Values outside 1..=2 are an error." },
+                        "kinds": {
+                            "type": "array",
+                            "items": { "type": "string", "enum": ["import", "cochange"] },
+                            "minItems": 1,
+                            "description": "Which kinds of edge to return. Default: both."
+                        },
+                        "snapshot": { "type": "string", "description": "A `snapshot` id from an earlier response. If it differs from the current index snapshot the answer still comes from the current snapshot and says so in `snapshot_mismatch`." }
+                    },
+                    "required": ["paths"]
+                }
+            },
+            {
                 "name": "find_connected_files",
                 "description": "DEPRECATED alias of expand_connections (use `paths` instead of `files`). Kept for compatibility; will be removed in a future release.",
                 "inputSchema": {
@@ -677,6 +702,30 @@ impl Engram {
                     "reasons": serde_json::to_value(&explanation.reasons).map_err(|e| e.to_string())?,
                 }))
             }
+            "get_graph" => {
+                let requested_snapshot = snapshot_arg(args)?;
+                let max_hops = max_hops_arg(args)?.unwrap_or(1);
+                let kinds = kinds_arg(args)?;
+                let paths = graph_paths_arg(args)?;
+                self.ensure_engine()?;
+                let engine = self.engine.as_ref().unwrap();
+                let store = self.store.as_ref().unwrap();
+                let facts = engine
+                    .graph_facts(store, &paths, max_hops, kinds, GraphCaps::default())
+                    .map_err(|e| e.to_string())?;
+                let mut result = serde_json::to_value(&facts).map_err(|e| e.to_string())?;
+                if let Some(requested) = requested_snapshot {
+                    if requested != engine.snapshot_id() {
+                        if let Some(obj) = result.as_object_mut() {
+                            obj.insert(
+                                "snapshot_mismatch".to_owned(),
+                                json!({ "requested": requested, "current": engine.snapshot_id() }),
+                            );
+                        }
+                    }
+                }
+                Ok(result)
+            }
             "get_verification_plan" => {
                 self.ensure_store()?;
                 let changed: Vec<String> = args
@@ -785,6 +834,53 @@ fn max_hops_arg(args: &Value) -> Result<Option<usize>, String> {
             )),
         },
     }
+}
+
+/// `kinds` of `get_graph`: absent or null means both; otherwise a non-empty
+/// array of `"import"` / `"cochange"`.
+fn kinds_arg(args: &Value) -> Result<GraphKinds, String> {
+    let bad = |v: &Value| {
+        format!("kinds must be a non-empty array of \"import\" and/or \"cochange\", got {v}")
+    };
+    match args.get("kinds") {
+        None | Some(Value::Null) => Ok(GraphKinds::default()),
+        Some(v) => {
+            let items = v
+                .as_array()
+                .filter(|a| !a.is_empty())
+                .ok_or_else(|| bad(v))?;
+            let mut kinds = GraphKinds {
+                import: false,
+                cochange: false,
+            };
+            for item in items {
+                match item.as_str() {
+                    Some("import") => kinds.import = true,
+                    Some("cochange") => kinds.cochange = true,
+                    _ => return Err(bad(v)),
+                }
+            }
+            Ok(kinds)
+        }
+    }
+}
+
+/// `paths` of `get_graph`: a non-empty array of strings.
+fn graph_paths_arg(args: &Value) -> Result<Vec<String>, String> {
+    let missing = || "missing required argument: paths (array of file paths)".to_owned();
+    let items = args
+        .get("paths")
+        .and_then(Value::as_array)
+        .filter(|a| !a.is_empty())
+        .ok_or_else(missing)?;
+    items
+        .iter()
+        .map(|item| {
+            item.as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| format!("paths must be an array of strings, got {item}"))
+        })
+        .collect()
 }
 
 /// `snapshot`: absent or null means none requested; otherwise a string.
@@ -935,6 +1031,7 @@ mod tests {
                 "explain_connection",
                 json!({ "source": "a.rs", "target": "b.rs" }),
             ),
+            ("get_graph", json!({ "paths": ["a.rs"] })),
             (
                 "get_verification_plan",
                 json!({ "changed_files": ["a.rs"] }),
@@ -1835,6 +1932,110 @@ mod tests {
             .call_tool("search_context", &json!({ "query": "x", "snapshot": 7 }))
             .expect_err("snapshot must be a string");
         assert!(err.contains("snapshot"), "{err}");
+    }
+
+    #[test]
+    fn get_graph_is_advertised_as_a_supporting_tool_without_a_budget() {
+        let repo = TempRepo::new();
+        let engram = Engram::start_with(repo.0.clone(), false, || Ok(()));
+        let tools = engram.list_tools();
+        let tool = tools["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "get_graph")
+            .expect("get_graph is listed");
+        let description = tool["description"].as_str().unwrap();
+        assert!(description.starts_with("SUPPORTING"), "{description}");
+        assert!(description.contains("not a call graph"), "{description}");
+        let props = &tool["inputSchema"]["properties"];
+        assert_eq!(props["paths"]["type"], "array");
+        assert_eq!(props["max_hops"]["maximum"], 2);
+        assert_eq!(props["max_hops"]["default"], 1);
+        assert_eq!(
+            props["kinds"]["items"]["enum"],
+            json!(["import", "cochange"])
+        );
+        assert_eq!(props["snapshot"]["type"], "string");
+        assert!(props.get("budget_tokens").is_none(), "{props}");
+        assert_eq!(tool["inputSchema"]["required"], json!(["paths"]));
+    }
+
+    #[test]
+    fn get_graph_serves_facts_with_the_snapshot_and_validates_its_arguments() {
+        let repo = TempRepo::new();
+        std::fs::write(repo.0.join("a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(repo.0.join("b.rs"), "fn b() {}\n").unwrap();
+        let mut engram = ready_engram(&repo);
+
+        let r = engram
+            .call_tool("get_graph", &json!({ "paths": ["a.rs"] }))
+            .unwrap();
+        let expanded = engram
+            .call_tool("expand_connections", &json!({ "paths": ["a.rs"] }))
+            .unwrap();
+        assert_eq!(r["snapshot"], expanded["snapshot"]);
+        assert_eq!(r["anchors"], json!(["a.rs"]));
+        assert_eq!(r["nodes"][0]["path"], "a.rs");
+        assert_eq!(r["nodes"][0]["role"], "anchor");
+        assert_eq!(r["edges"], json!([]));
+        assert_eq!(r["limits"]["truncated"], false);
+        assert_eq!(r["limits"]["max_nodes"], 200);
+        assert_eq!(r["limits"]["max_edges"], 500);
+        assert!(r.get("snapshot_mismatch").is_none(), "{r}");
+        assert!(r.get("index_state").is_none(), "healthy index: {r}");
+
+        // Another snapshot is flagged, never silently served as requested.
+        let current = r["snapshot"].as_str().unwrap();
+        let stale = engram
+            .call_tool(
+                "get_graph",
+                &json!({ "paths": ["a.rs"], "snapshot": "snap-from-yesterday" }),
+            )
+            .unwrap();
+        assert_eq!(
+            stale["snapshot_mismatch"],
+            json!({ "requested": "snap-from-yesterday", "current": current })
+        );
+        let same = engram
+            .call_tool(
+                "get_graph",
+                &json!({ "paths": ["a.rs"], "snapshot": current }),
+            )
+            .unwrap();
+        assert!(same.get("snapshot_mismatch").is_none(), "{same}");
+
+        // kinds narrows what is searched, and says so.
+        let imports_only = engram
+            .call_tool(
+                "get_graph",
+                &json!({ "paths": ["a.rs"], "kinds": ["import"], "max_hops": 2 }),
+            )
+            .unwrap();
+        assert_eq!(imports_only["scope"]["kinds"], json!(["import"]));
+        assert_eq!(imports_only["scope"]["import_max_hops"], 2);
+
+        for (args, needle) in [
+            (
+                json!({ "paths": ["missing.rs"] }),
+                "not an indexed text file",
+            ),
+            (json!({ "paths": ["a.rs", "missing.rs"] }), "missing.rs"),
+            (json!({}), "paths"),
+            (json!({ "paths": [] }), "paths"),
+            (json!({ "paths": [7] }), "strings"),
+            (json!({ "paths": ["a.rs"], "max_hops": 3 }), "max_hops"),
+            (json!({ "paths": ["a.rs"], "max_hops": 0 }), "max_hops"),
+            (json!({ "paths": ["a.rs"], "kinds": [] }), "kinds"),
+            (json!({ "paths": ["a.rs"], "kinds": ["calls"] }), "kinds"),
+            (json!({ "paths": ["a.rs"], "kinds": "import" }), "kinds"),
+            (json!({ "paths": ["a.rs"], "snapshot": 7 }), "snapshot"),
+        ] {
+            let err = engram
+                .call_tool("get_graph", &args)
+                .expect_err(&format!("{args} must be rejected"));
+            assert!(err.contains(needle), "{args}: {err}");
+        }
     }
 
     #[test]

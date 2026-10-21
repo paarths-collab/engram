@@ -28,6 +28,10 @@ pub struct GraphHit {
     pub path: String,
     pub hops: usize,
     pub kind: EdgeKind,
+    /// The route the traversal took, hit first, seed last: each file depends
+    /// on the next (`hops + 1` entries). For import traversal, `chain[i]`
+    /// imports `chain[i + 1]`.
+    pub chain: Vec<String>,
 }
 
 /// Directed code graph: an edge `src -> dst` means `src` depends on `dst`
@@ -146,6 +150,10 @@ impl CodeGraph {
                 }
             }
         }
+        let mut routes: HashMap<NodeIndex, Vec<String>> = queue
+            .iter()
+            .map(|(n, _)| (*n, vec![self.rev[n.index()].clone()]))
+            .collect();
         let mut hits: Vec<GraphHit> = Vec::new();
         while let Some((node, hops)) = queue.pop_front() {
             if hops >= max_hops {
@@ -159,16 +167,60 @@ impl CodeGraph {
                 use petgraph::visit::EdgeRef;
                 let src = edge.source();
                 if visited.insert(src) {
+                    let mut chain = vec![self.rev[src.index()].clone()];
+                    chain.extend(routes.get(&node).cloned().unwrap_or_default());
+                    routes.insert(src, chain.clone());
                     hits.push(GraphHit {
                         path: self.rev[src.index()].clone(),
                         hops: hops + 1,
                         kind,
+                        chain,
                     });
                     queue.push_back((src, hops + 1));
                 }
             }
         }
         hits
+    }
+
+    /// Whether `path` is a node of the graph.
+    pub fn contains(&self, path: &str) -> bool {
+        self.idx.contains_key(path)
+    }
+
+    /// Files `path` imports (one hop, outgoing import edges), sorted and
+    /// de-duplicated. Empty for a path not in the graph.
+    pub fn import_targets(&self, path: &str) -> Vec<String> {
+        self.import_neighbours(path, Outgoing)
+    }
+
+    /// Files that import `path` (one hop, incoming import edges), sorted and
+    /// de-duplicated. Empty for a path not in the graph.
+    pub fn import_sources(&self, path: &str) -> Vec<String> {
+        self.import_neighbours(path, Incoming)
+    }
+
+    fn import_neighbours(&self, path: &str, dir: petgraph::Direction) -> Vec<String> {
+        use petgraph::visit::EdgeRef;
+        let Some(&n) = self.idx.get(path) else {
+            return Vec::new();
+        };
+        let mut out: Vec<String> = self
+            .g
+            .edges_directed(n, dir)
+            .filter(|e| *e.weight() == EdgeKind::Imports)
+            .map(|e| {
+                let other = if dir == Outgoing {
+                    e.target()
+                } else {
+                    e.source()
+                };
+                self.rev[other.index()].clone()
+            })
+            .collect();
+        out.sort();
+        out.dedup();
+        out
     }
 
     /// Shortest import chain `from -> ... -> to` of at most `max_hops` import
@@ -282,6 +334,35 @@ mod tests {
         let mut got: Vec<(String, usize)> = hits.iter().map(|h| (h.path.clone(), h.hops)).collect();
         got.sort();
         assert_eq!(got, vec![("a.rs".to_string(), 2), ("b.rs".to_string(), 1)]);
+    }
+
+    #[test]
+    fn dependents_carry_the_route_back_to_the_seed() {
+        let g = CodeGraph::from_edges([
+            e("a.rs", "b.rs", EdgeKind::Imports),
+            e("b.rs", "c.rs", EdgeKind::Imports),
+        ]);
+        let hits = g.dependents(&["c.rs".to_string()], &[EdgeKind::Imports], 2);
+        let chain_of = |p: &str| hits.iter().find(|h| h.path == p).unwrap().chain.clone();
+        assert_eq!(chain_of("b.rs"), vec!["b.rs", "c.rs"]);
+        assert_eq!(chain_of("a.rs"), vec!["a.rs", "b.rs", "c.rs"]);
+    }
+
+    #[test]
+    fn import_neighbours_are_one_hop_sorted_deduplicated_and_import_only() {
+        let g = CodeGraph::from_edges([
+            e("m.rs", "z.rs", EdgeKind::Imports),
+            e("m.rs", "b.rs", EdgeKind::Imports),
+            e("m.rs", "b.rs", EdgeKind::Imports),
+            e("m.rs", "co.rs", EdgeKind::CoChange),
+            e("y.rs", "m.rs", EdgeKind::Imports),
+            e("x.rs", "m.rs", EdgeKind::Imports),
+            e("far.rs", "z.rs", EdgeKind::Imports),
+        ]);
+        assert_eq!(g.import_targets("m.rs"), vec!["b.rs", "z.rs"]);
+        assert_eq!(g.import_sources("m.rs"), vec!["x.rs", "y.rs"]);
+        assert!(g.import_targets("nope.rs").is_empty());
+        assert!(g.contains("m.rs") && !g.contains("nope.rs"));
     }
 
     #[test]

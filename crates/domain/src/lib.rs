@@ -2,6 +2,101 @@
 
 use serde::{Deserialize, Serialize};
 
+/// FNV-1a, 64-bit. A change fingerprint, not a security boundary: stable
+/// across platforms and releases, with no dependency.
+pub struct Fnv64(u64);
+
+impl Default for Fnv64 {
+    fn default() -> Self {
+        Fnv64(0xcbf2_9ce4_8422_2325)
+    }
+}
+
+impl Fnv64 {
+    pub fn write(&mut self, bytes: &[u8]) {
+        for b in bytes {
+            self.0 ^= u64::from(*b);
+            self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+
+    /// Lowercase 16-digit hex of the digest.
+    pub fn finish_hex(&self) -> String {
+        format!("{:016x}", self.0)
+    }
+}
+
+/// `kind` of an import edge in [`edge_id`].
+pub const EDGE_KIND_IMPORT: &str = "import";
+/// `kind` of a co-change edge in [`edge_id`].
+pub const EDGE_KIND_COCHANGE: &str = "cochange";
+/// The only `direction` a stored co-change row has: the row's first file is
+/// its source, and its strength is relative to the commits touching it.
+pub const COCHANGE_ROW_DIRECTION: &str = "source_to_target";
+
+/// Content-derived id of one graph fact: `"e_"` + 16 lowercase hex digits.
+///
+/// A 64-bit FNV-1a over a canonical, length-prefixed encoding of, in order:
+/// the format tag `engram-edge-v1`, `snapshot_id`, `kind`, `source`, `target`,
+/// then the number of `chain_or_direction` items and each item. Every string
+/// is written as its byte length (`u64`, little-endian) followed by its bytes,
+/// so no two different inputs encode alike. For an import edge the items are
+/// the full chain of paths in order; for a co-change edge, the direction.
+///
+/// Stable across runs and machines, and a function of the snapshot: any change
+/// to the indexed content gives every edge a new id. It is a 64-bit hash, so
+/// ids are unique within a snapshot with overwhelming but not absolute
+/// probability, and are not globally unique across snapshots or repositories.
+/// A fingerprint to cite a fact by, not a security boundary.
+pub fn edge_id(
+    snapshot_id: &str,
+    kind: &str,
+    source: &str,
+    target: &str,
+    chain_or_direction: &[&str],
+) -> String {
+    let mut h = Fnv64::default();
+    let mut field = |s: &str| {
+        h.write(&(s.len() as u64).to_le_bytes());
+        h.write(s.as_bytes());
+    };
+    field("engram-edge-v1");
+    field(snapshot_id);
+    field(kind);
+    field(source);
+    field(target);
+    h.write(&(chain_or_direction.len() as u64).to_le_bytes());
+    for item in chain_or_direction {
+        h.write(&(item.len() as u64).to_le_bytes());
+        h.write(item.as_bytes());
+    }
+    format!("e_{}", h.finish_hex())
+}
+
+/// [`edge_id`] of an import edge or chain: `chain[0]` imports `chain[1]`, and
+/// so on. A single hop is a two-element chain; its id is the same whether it
+/// is cited alone or as one hop of a longer route.
+pub fn import_edge_id<S: AsRef<str>>(snapshot_id: &str, chain: &[S]) -> String {
+    let items: Vec<&str> = chain.iter().map(AsRef::as_ref).collect();
+    let source = items.first().copied().unwrap_or("");
+    let target = items.last().copied().unwrap_or("");
+    edge_id(snapshot_id, EDGE_KIND_IMPORT, source, target, &items)
+}
+
+/// [`edge_id`] of the stored co-change row `source -> target` (its strength is
+/// relative to commits touching `source`). The id belongs to the row, not to
+/// the question that found it: `a -> b` and `b -> a` are different rows with
+/// different ids whichever way a pairwise lookup was asked.
+pub fn cochange_edge_id(snapshot_id: &str, source: &str, target: &str) -> String {
+    edge_id(
+        snapshot_id,
+        EDGE_KIND_COCHANGE,
+        source,
+        target,
+        &[COCHANGE_ROW_DIRECTION],
+    )
+}
+
 /// A file discovered during Tier-0 inventory.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileRecord {
@@ -119,6 +214,9 @@ pub enum CoChangeDirection {
 pub struct ImportEdge {
     pub from: String,
     pub to: String,
+    /// Id of this single hop (`import_edge_id(snapshot, [from, to])`): the same
+    /// id `get_graph` emits for the edge, whatever route it sits on.
+    pub edge_id: String,
 }
 
 /// The limits the co-change table was built under. A pair that fell outside
@@ -163,6 +261,10 @@ pub enum ConnectionReason {
         resolver: &'static str,
         /// Always `"candidate"`: a plausible edge, not a compiler-verified one.
         resolution_status: &'static str,
+        /// Id of the whole route (`import_edge_id(snapshot, chain)`). For a
+        /// direct import it equals the id of its only hop; for a 2-hop route
+        /// it is distinct, and the hops are cited through `edges[].edge_id`.
+        edge_id: String,
     },
     #[serde(rename = "historical_cochange")]
     CoChange {
@@ -183,6 +285,9 @@ pub enum ConnectionReason {
         opportunities_source: Option<u32>,
         /// Same, for the queried target file.
         opportunities_target: Option<u32>,
+        /// Id of the stored row this fact came from (`cochange_edge_id` of the
+        /// row's own source and target), the id `get_graph` emits for it.
+        edge_id: String,
     },
 }
 
@@ -299,6 +404,140 @@ pub struct ScoredPath {
     pub path: String,
     pub confidence: f32,
     pub reason: String,
+    /// Ids of the recorded edges this recommendation rests on: the co-change
+    /// row(s) from an anchor, or every hop of the import route to an anchor.
+    /// Each is an id `get_graph` emits for the same anchors in the same
+    /// snapshot. Absent for anchors themselves and for search-derived entries.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_ids: Vec<String>,
+    /// The numbers `confidence` was taken from. Absent where there are none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score_components: Option<ScoreComponents>,
+}
+
+/// Where a recommendation's `confidence` came from.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "basis", rename_all = "snake_case")]
+pub enum ScoreComponents {
+    /// `confidence` is the strongest co-change strength among the anchors'
+    /// kept rows for this file.
+    CochangeStrength {
+        strength: f32,
+        /// Commits in which the anchor and this file changed together.
+        count: u32,
+        /// The anchor whose row supplied `strength`.
+        anchor: String,
+    },
+    /// `confidence` is a fixed weight by import distance (0.6 for one hop,
+    /// 0.35 for two).
+    ImportHops { hops: usize, weight: f32 },
+}
+
+/// Whether a node of [`GraphFacts`] was asked for or found around one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphNodeRole {
+    Anchor,
+    Neighbor,
+}
+
+/// One file in a `get_graph` result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GraphNode {
+    pub path: String,
+    pub role: GraphNodeRole,
+    /// Import hops from the nearest anchor (0 for anchors; co-change partners
+    /// are 1), the smallest distance at which the file was reached.
+    pub distance: usize,
+    /// Omitted when the extension is not a supported language.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<&'static str>,
+    pub is_test: bool,
+}
+
+/// One recorded fact in a `get_graph` result. Import and co-change facts are
+/// independent: a file pair can have both, each with its own id.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum GraphEdge {
+    /// `source` imports `target`: one hop, as the import graph resolved it.
+    Import {
+        edge_id: String,
+        source: String,
+        target: String,
+        /// Always `source_imports_target`: `source` is the importer.
+        direction: ImportDirection,
+        /// Always 1: every import edge is a single hop.
+        hops: usize,
+        /// Always `"heuristic_module_segments"`.
+        resolver: &'static str,
+        /// Always `"candidate"`.
+        resolution_status: &'static str,
+    },
+    /// The stored co-change row `source -> target`.
+    Cochange {
+        edge_id: String,
+        source: String,
+        target: String,
+        /// Always `source_to_target`: `strength` is relative to `source`.
+        direction: CoChangeDirection,
+        count: u32,
+        strength: f32,
+        window: CoChangeWindow,
+        /// Commits in the window that touched `source` (the denominator of
+        /// `strength`). `null` when the index predates these totals.
+        opportunities_source: Option<u32>,
+        /// Same, for `target`.
+        opportunities_target: Option<u32>,
+    },
+}
+
+impl GraphEdge {
+    pub fn edge_id(&self) -> &str {
+        match self {
+            GraphEdge::Import { edge_id, .. } | GraphEdge::Cochange { edge_id, .. } => edge_id,
+        }
+    }
+}
+
+/// The bounds a `get_graph` result was produced under, and what they cut.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GraphLimits {
+    pub max_nodes: usize,
+    pub max_edges: usize,
+    /// Most co-change rows read per anchor.
+    pub cochange_per_anchor: usize,
+    pub truncated: bool,
+    /// Facts that exist but are not in `edges`: co-change rows past the
+    /// per-anchor read limit, plus edges dropped by the node and edge caps.
+    pub omitted_edges: usize,
+    /// Neighbouring files that exist but are not in `nodes`.
+    pub omitted_nodes: usize,
+    pub reason: String,
+}
+
+/// What a `get_graph` call searched, so a missing edge is never read as more
+/// than it is.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct GraphScope {
+    pub kinds: Vec<&'static str>,
+    pub import_max_hops: usize,
+    pub cochange_window: CoChangeWindow,
+    pub commits_scanned: Option<u32>,
+    pub bulk_commits_excluded: Option<u32>,
+    pub note: String,
+}
+
+/// Result of `get_graph`: raw recorded facts about the neighbourhood of some
+/// anchor files, independent of recommendation ranking and caps.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct GraphFacts {
+    pub snapshot: String,
+    pub anchors: Vec<String>,
+    pub nodes: Vec<GraphNode>,
+    pub edges: Vec<GraphEdge>,
+    pub limits: GraphLimits,
+    pub scope: GraphScope,
 }
 
 /// A raw human review comment ingested from a pull request. Stored and returned
@@ -396,4 +635,77 @@ pub struct VerificationPlan {
     /// data is co-change history, not test-failure history. It is kept so
     /// existing clients keep working.
     pub historically_co_failing_tests: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Values computed independently of this crate (a separate FNV-1a over the
+    /// documented byte encoding), so a change to the encoding fails here
+    /// rather than quietly re-numbering every id.
+    #[test]
+    fn edge_ids_match_the_documented_encoding() {
+        assert_eq!(
+            import_edge_id("snap1", &["a.py", "b.py"]),
+            "e_5f08b1d2946f9754"
+        );
+        assert_eq!(
+            import_edge_id("snap1", &["a.py", "b.py", "c.py"]),
+            "e_13301a0e24b41fb2"
+        );
+        assert_eq!(
+            cochange_edge_id("snap1", "a.py", "b.py"),
+            "e_9a00c641bdb973d0"
+        );
+        assert_eq!(
+            cochange_edge_id("snap1", "b.py", "a.py"),
+            "e_941ed47f442d546c"
+        );
+        assert_eq!(
+            import_edge_id("snap2", &["a.py", "b.py"]),
+            "e_42d58902cf175f51"
+        );
+    }
+
+    #[test]
+    fn edge_ids_are_16_lowercase_hex_digits_after_a_prefix() {
+        let id = import_edge_id("s", &["x", "y"]);
+        let hex = id.strip_prefix("e_").expect("prefix");
+        assert_eq!(hex.len(), 16);
+        assert!(hex
+            .chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)));
+    }
+
+    #[test]
+    fn length_prefixing_keeps_field_boundaries_distinct() {
+        // Without length prefixes these would concatenate to the same bytes.
+        assert_ne!(
+            edge_id("ab", "c", "d", "e", &[]),
+            edge_id("a", "bc", "d", "e", &[])
+        );
+        assert_ne!(
+            edge_id("s", "import", "a", "bc", &["a", "bc"]),
+            edge_id("s", "import", "a", "bc", &["ab", "c"])
+        );
+    }
+
+    #[test]
+    fn direction_chain_snapshot_and_kind_each_change_the_id() {
+        let base = import_edge_id("s", &["a", "b", "c"]);
+        assert_ne!(base, import_edge_id("s", &["a", "x", "c"]), "chain");
+        assert_ne!(base, import_edge_id("t", &["a", "b", "c"]), "snapshot");
+        assert_ne!(base, import_edge_id("s", &["c", "b", "a"]), "direction");
+        assert_ne!(
+            import_edge_id("s", &["a", "b"]),
+            cochange_edge_id("s", "a", "b"),
+            "kind"
+        );
+        assert_ne!(
+            cochange_edge_id("s", "a", "b"),
+            cochange_edge_id("s", "b", "a"),
+            "cochange direction"
+        );
+    }
 }

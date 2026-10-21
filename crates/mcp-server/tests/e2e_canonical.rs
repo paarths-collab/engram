@@ -204,8 +204,24 @@ fn acceptance_2_two_hop_route_and_separate_typed_facts() {
     assert_eq!(route["chain"], json!([API, SERVICE, REPO]));
     let edges = route["edges"].as_array().expect("edges");
     assert_eq!(edges.len(), 2);
-    assert_eq!(edges[0], json!({ "from": API, "to": SERVICE }));
-    assert_eq!(edges[1], json!({ "from": SERVICE, "to": REPO }));
+    // Each hop keeps its `from`/`to` and gains the id of that single edge (the
+    // one `get_graph` emits for it); the two hops have distinct ids.
+    assert_eq!(edges[0]["from"], API);
+    assert_eq!(edges[0]["to"], SERVICE);
+    assert_eq!(edges[1]["from"], SERVICE);
+    assert_eq!(edges[1]["to"], REPO);
+    assert_eq!(
+        edges[0].as_object().map(|o| o.len()),
+        Some(3),
+        "{}",
+        edges[0]
+    );
+    let hop_ids: Vec<&str> = edges
+        .iter()
+        .map(|e| e["edge_id"].as_str().expect("hop edge_id"))
+        .collect();
+    assert!(hop_ids.iter().all(|id| id.starts_with("e_")), "{hop_ids:?}");
+    assert_ne!(hop_ids[0], hop_ids[1]);
     assert_eq!(route["resolver"], "heuristic_module_segments");
     // A 2-hop route is weaker evidence than a direct import.
     assert!(route["weight"].as_f64().unwrap() < 0.6, "{route}");

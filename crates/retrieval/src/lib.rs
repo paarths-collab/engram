@@ -9,13 +9,15 @@ pub mod weights;
 use anyhow::Result;
 use embed::{cosine, Embedder, HashedNgramEmbedder};
 use engram_domain::{
-    CoChangeDirection, CoChangeWindow, ConnectionExplanation, ConnectionReason, ConnectionScope,
-    ConnectionStatus, DroppedCandidate, EvidenceKind, EvidencePacket, ImpactPrediction,
-    ImportDirection, ImportEdge, ImportSearchOutcome, ScoredPath, SymbolRecord,
+    cochange_edge_id, import_edge_id, CoChangeDirection, CoChangeWindow, ConnectionExplanation,
+    ConnectionReason, ConnectionScope, ConnectionStatus, DroppedCandidate, EvidenceKind,
+    EvidencePacket, GraphEdge, GraphFacts, GraphLimits, GraphNode, GraphNodeRole, GraphScope,
+    ImpactPrediction, ImportDirection, ImportEdge, ImportSearchOutcome, Language, ScoreComponents,
+    ScoredPath, SymbolRecord,
 };
 use engram_repo_map::graph::{CodeGraph, EdgeKind, ImportSearch};
 use engram_repo_map::store::Store;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
@@ -115,6 +117,58 @@ const COCHANGE_SCAN_LIMIT: usize = 100_000;
 /// compiler, so every import fact is labelled with how it was resolved.
 const IMPORT_RESOLUTION: &str = "heuristic";
 const IMPORT_RESOLVER: &str = "heuristic_module_segments";
+
+/// Default bounds of [`Engine::graph_facts`] (`get_graph`).
+pub const GRAPH_MAX_NODES: usize = 200;
+pub const GRAPH_MAX_EDGES: usize = 500;
+/// Co-change rows read per anchor. Far above the 5 per anchor the
+/// recommendations keep, and ordered the same way, so every co-change edge a
+/// recommendation cites is inside it.
+pub const GRAPH_COCHANGE_PER_ANCHOR: usize = 50;
+
+/// The hard bounds of one [`Engine::graph_facts`] call. The defaults are the
+/// ones `get_graph` serves; tests lower them to exercise truncation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GraphCaps {
+    pub max_nodes: usize,
+    pub max_edges: usize,
+    pub cochange_per_anchor: usize,
+}
+
+impl Default for GraphCaps {
+    fn default() -> Self {
+        GraphCaps {
+            max_nodes: GRAPH_MAX_NODES,
+            max_edges: GRAPH_MAX_EDGES,
+            cochange_per_anchor: GRAPH_COCHANGE_PER_ANCHOR,
+        }
+    }
+}
+
+/// Which kinds of edge [`Engine::graph_facts`] returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GraphKinds {
+    pub import: bool,
+    pub cochange: bool,
+}
+
+impl Default for GraphKinds {
+    fn default() -> Self {
+        GraphKinds {
+            import: true,
+            cochange: true,
+        }
+    }
+}
+
+/// The co-change table's build limits, as every co-change fact reports them.
+fn cochange_window() -> CoChangeWindow {
+    CoChangeWindow {
+        max_commits: engram_repo_map::cochange::MAX_COMMITS,
+        min_count: engram_repo_map::cochange::MIN_PAIR_COUNT,
+        max_files_per_commit: engram_repo_map::cochange::MAX_FILES_PER_COMMIT,
+    }
+}
 
 const PREVIEW_BYTES: usize = 400;
 const INDEX_BODY_BYTES: usize = 60_000;
@@ -697,6 +751,8 @@ impl Engine {
                     path: p.path.clone(),
                     confidence: (p.score / max_score).min(1.0),
                     reason: format!("matched task via {}", p.signals.join("+")),
+                    evidence_ids: Vec::new(),
+                    score_components: None,
                 });
                 seeds.push(p.path.clone());
             }
@@ -762,6 +818,8 @@ impl Engine {
                 path: path.clone(),
                 confidence: 1.0,
                 reason: "given as an anchor file".to_string(),
+                evidence_ids: Vec::new(),
+                score_components: None,
             })
             .collect();
         let mut likely_tests: Vec<String> = known
@@ -807,12 +865,7 @@ impl Engine {
         target: &str,
     ) -> Result<ConnectionExplanation> {
         for path in [source, target] {
-            if !self.by_path.contains_key(path) {
-                anyhow::bail!(
-                    "{path} is not an indexed text file in the Engram index; use a \
-                     repo-relative path returned by search_context/expand_connections"
-                );
-            }
+            self.require_indexed(path)?;
         }
         if source == target {
             anyhow::bail!(
@@ -821,11 +874,7 @@ impl Engine {
             );
         }
 
-        let window = CoChangeWindow {
-            max_commits: engram_repo_map::cochange::MAX_COMMITS,
-            min_count: engram_repo_map::cochange::MIN_PAIR_COUNT,
-            max_files_per_commit: engram_repo_map::cochange::MAX_FILES_PER_COMMIT,
-        };
+        let window = cochange_window();
         let mut reasons = Vec::new();
 
         // Completeness facts of the last history walk. `None` (never zero)
@@ -869,6 +918,9 @@ impl Engine {
                     window,
                     opportunities_source,
                     opportunities_target,
+                    // The id of the stored row `from -> to`, not of the
+                    // question: it matches what `get_graph` emits for it.
+                    edge_id: cochange_edge_id(&self.snapshot, from, to),
                 });
             }
         }
@@ -895,8 +947,10 @@ impl Engine {
                         .map(|w| ImportEdge {
                             from: w[0].clone(),
                             to: w[1].clone(),
+                            edge_id: import_edge_id(&self.snapshot, w),
                         })
                         .collect();
+                    let route_id = import_edge_id(&self.snapshot, &chain);
                     reasons.push(ConnectionReason::Import {
                         detail: format!(
                             "{route} (heuristic module-name resolution, not compiler resolution)"
@@ -910,6 +964,7 @@ impl Engine {
                         resolution: IMPORT_RESOLUTION,
                         resolver: IMPORT_RESOLVER,
                         resolution_status: "candidate",
+                        edge_id: route_id,
                     });
                 }
                 ImportSearch::None => outcomes.push(ImportSearchOutcome::NoneWithinBound),
@@ -956,6 +1011,304 @@ impl Engine {
         })
     }
 
+    /// Err unless `path` is a file in this engine's index.
+    fn require_indexed(&self, path: &str) -> Result<()> {
+        if !self.by_path.contains_key(path) {
+            anyhow::bail!(
+                "{path} is not an indexed text file in the Engram index; use a \
+                 repo-relative path returned by search_context/expand_connections"
+            );
+        }
+        Ok(())
+    }
+
+    /// Raw recorded facts about the neighbourhood of `anchors` (`get_graph`).
+    ///
+    /// Independent of recommendation ranking, dedup and per-kind caps: it lists
+    /// edges, it does not rank files.
+    /// - imports: every single-hop import edge, in either direction, incident
+    ///   to an anchor or to a file reached within `max_hops - 1` import hops of
+    ///   one (so `max_hops = 1` is "everything touching an anchor", `2` adds
+    ///   the edges touching those neighbours). Each edge is emitted once as
+    ///   `importer -> imported`.
+    /// - co-change: each anchor's stored rows to its strongest partners (at
+    ///   most `caps.cochange_per_anchor`), plus the reverse row of each partner
+    ///   (its own strength, relative to the partner's commits) when one exists.
+    ///
+    /// Every edge carries the content-derived id the recommendations and
+    /// `explain_connection` cite it by. Output order is deterministic: nodes
+    /// by path, edges by (kind, source, target, direction). When a cap cuts
+    /// anything, `limits` says so with exact counts; nothing is cut silently.
+    /// Errors for a path that is not an indexed file, an empty anchor list,
+    /// more anchors than `caps.max_nodes`, or `max_hops` outside `1..=2`.
+    pub fn graph_facts(
+        &self,
+        store: &Store,
+        anchors: &[String],
+        max_hops: usize,
+        kinds: GraphKinds,
+        caps: GraphCaps,
+    ) -> Result<GraphFacts> {
+        if !(1..=MAX_IMPORT_HOPS).contains(&max_hops) {
+            anyhow::bail!("max_hops must be between 1 and {MAX_IMPORT_HOPS}, got {max_hops}");
+        }
+        if !kinds.import && !kinds.cochange {
+            anyhow::bail!("kinds must include at least one of \"import\", \"cochange\"");
+        }
+        if caps.max_nodes == 0 || caps.max_edges == 0 || caps.cochange_per_anchor == 0 {
+            anyhow::bail!("graph caps must be at least 1");
+        }
+        let mut anchors: Vec<String> = anchors.to_vec();
+        anchors.sort();
+        anchors.dedup();
+        if anchors.is_empty() {
+            anyhow::bail!("at least one anchor path is required");
+        }
+        for path in &anchors {
+            self.require_indexed(path)?;
+        }
+        if anchors.len() > caps.max_nodes {
+            anyhow::bail!(
+                "{} anchor paths exceed the {}-node cap; pass fewer paths",
+                anchors.len(),
+                caps.max_nodes
+            );
+        }
+
+        const IMPORT_DIRECTION: &str = "source_imports_target";
+        const COCHANGE_DIRECTION: &str = "source_to_target";
+        // (kind, source, target, direction): the output order, and dedup.
+        type Key = (&'static str, String, String, &'static str);
+        // Edge plus the import distance it was found at (0 = touches an anchor).
+        let mut edges: BTreeMap<Key, (usize, GraphEdge)> = BTreeMap::new();
+        let mut dist: BTreeMap<String, usize> = anchors.iter().map(|a| (a.clone(), 0)).collect();
+
+        if kinds.import {
+            let mut add = |importer: &str, imported: &str, depth: usize| {
+                let key: Key = (
+                    "import",
+                    importer.to_owned(),
+                    imported.to_owned(),
+                    IMPORT_DIRECTION,
+                );
+                edges.entry(key).or_insert_with(|| {
+                    (
+                        depth,
+                        GraphEdge::Import {
+                            edge_id: import_edge_id(&self.snapshot, &[importer, imported]),
+                            source: importer.to_owned(),
+                            target: imported.to_owned(),
+                            direction: ImportDirection::SourceImportsTarget,
+                            hops: 1,
+                            resolver: IMPORT_RESOLVER,
+                            resolution_status: "candidate",
+                        },
+                    )
+                });
+            };
+            let mut frontier: Vec<String> = anchors.clone();
+            for depth in 0..max_hops {
+                let mut next: BTreeSet<String> = BTreeSet::new();
+                for node in &frontier {
+                    let outgoing = self.graph.import_targets(node);
+                    let incoming = self.graph.import_sources(node);
+                    for imported in &outgoing {
+                        add(node, imported, depth);
+                    }
+                    for importer in &incoming {
+                        add(importer, node, depth);
+                    }
+                    for other in outgoing.into_iter().chain(incoming) {
+                        if !dist.contains_key(&other) {
+                            dist.insert(other.clone(), depth + 1);
+                            next.insert(other);
+                        }
+                    }
+                }
+                frontier = next.into_iter().collect();
+            }
+        }
+
+        let totals = store.cochange_totals()?;
+        let mut cochange_beyond_limit = 0usize;
+        if kinds.cochange {
+            let window = cochange_window();
+            let mut opportunities: HashMap<String, Option<u32>> = HashMap::new();
+            let mut touching = |path: &str| -> Result<Option<u32>> {
+                if let Some(known) = opportunities.get(path) {
+                    return Ok(*known);
+                }
+                let n = store.cochange_commits_touching(path)?;
+                opportunities.insert(path.to_owned(), n);
+                Ok(n)
+            };
+            for anchor in &anchors {
+                let neighbors = store.cochange_neighbors(anchor, caps.cochange_per_anchor)?;
+                cochange_beyond_limit += neighbors.total.saturating_sub(neighbors.rows.len());
+                for row in neighbors.rows {
+                    let partner = row.path_b.clone();
+                    if partner == *anchor || !self.by_path.contains_key(&partner) {
+                        continue;
+                    }
+                    // The anchor's own row, and the partner's row back to it.
+                    let reverse = store.cochange_pair(&partner, anchor)?;
+                    for stored in std::iter::once(row).chain(reverse) {
+                        let key: Key = (
+                            "cochange",
+                            stored.path_a.clone(),
+                            stored.path_b.clone(),
+                            COCHANGE_DIRECTION,
+                        );
+                        if edges.contains_key(&key) {
+                            continue;
+                        }
+                        let edge = GraphEdge::Cochange {
+                            edge_id: cochange_edge_id(
+                                &self.snapshot,
+                                &stored.path_a,
+                                &stored.path_b,
+                            ),
+                            opportunities_source: touching(&stored.path_a)?,
+                            opportunities_target: touching(&stored.path_b)?,
+                            source: stored.path_a,
+                            target: stored.path_b,
+                            direction: CoChangeDirection::SourceToTarget,
+                            count: stored.count,
+                            strength: stored.strength,
+                            window,
+                        };
+                        edges.insert(key, (0, edge));
+                    }
+                    dist.entry(partner)
+                        .and_modify(|d| *d = (*d).min(1))
+                        .or_insert(1);
+                }
+            }
+        }
+
+        // Node cap: anchors always stay; neighbours are kept nearest first,
+        // then by path, so the same cut is made on every run.
+        let mut neighbors: Vec<(&String, &usize)> = dist
+            .iter()
+            .filter(|(path, _)| !anchors.contains(path))
+            .collect();
+        neighbors.sort_by(|a, b| a.1.cmp(b.1).then_with(|| a.0.cmp(b.0)));
+        let node_room = caps.max_nodes - anchors.len();
+        let omitted_nodes = neighbors.len().saturating_sub(node_room);
+        let kept: BTreeSet<&String> = anchors
+            .iter()
+            .chain(neighbors.iter().take(node_room).map(|(path, _)| *path))
+            .collect();
+
+        // Edge caps: first drop edges touching a node that did not make it,
+        // then keep the nearest max_edges (ties by the output order).
+        let candidate_total = edges.len();
+        let mut candidates: Vec<(usize, Key, GraphEdge)> = edges
+            .into_iter()
+            .filter(|(key, _)| kept.contains(&key.1) && kept.contains(&key.2))
+            .map(|(key, (depth, edge))| (depth, key, edge))
+            .collect();
+        let dropped_by_node_cap = candidate_total - candidates.len();
+        candidates.sort_by_key(|(depth, ..)| *depth);
+        let dropped_by_edge_cap = candidates.len().saturating_sub(caps.max_edges);
+        candidates.truncate(caps.max_edges);
+        candidates.sort_by(|a, b| a.1.cmp(&b.1));
+        let emitted: Vec<GraphEdge> = candidates.into_iter().map(|(_, _, edge)| edge).collect();
+
+        let omitted_edges = cochange_beyond_limit + dropped_by_node_cap + dropped_by_edge_cap;
+        let truncated = omitted_edges > 0 || omitted_nodes > 0;
+        let reason = if truncated {
+            let mut parts = Vec::new();
+            if cochange_beyond_limit > 0 {
+                parts.push(format!(
+                    "{cochange_beyond_limit} co-change row(s) past the per-anchor read limit \
+                     of {}",
+                    caps.cochange_per_anchor
+                ));
+            }
+            if omitted_nodes > 0 {
+                parts.push(format!(
+                    "{omitted_nodes} neighbouring file(s) past the {}-node cap",
+                    caps.max_nodes
+                ));
+            }
+            if dropped_by_node_cap > 0 {
+                parts.push(format!(
+                    "{dropped_by_node_cap} edge(s) touching a file past the node cap"
+                ));
+            }
+            if dropped_by_edge_cap > 0 {
+                parts.push(format!(
+                    "{dropped_by_edge_cap} edge(s) past the {}-edge cap (nearest to an anchor \
+                     kept first)",
+                    caps.max_edges
+                ));
+            }
+            format!("truncated: {}", parts.join("; "))
+        } else {
+            "complete: no cap cut anything".to_owned()
+        };
+
+        let nodes: Vec<GraphNode> = kept
+            .iter()
+            .map(|path| {
+                let language = Language::from_path(path);
+                GraphNode {
+                    path: (*path).clone(),
+                    role: if anchors.contains(path) {
+                        GraphNodeRole::Anchor
+                    } else {
+                        GraphNodeRole::Neighbor
+                    },
+                    distance: dist.get(*path).copied().unwrap_or(0),
+                    language: (language != Language::Other).then(|| language.as_str()),
+                    is_test: engram_repo_map::inventory::is_test_path(path),
+                }
+            })
+            .collect();
+
+        let window = cochange_window();
+        let mut scope_kinds = Vec::new();
+        if kinds.import {
+            scope_kinds.push("import");
+        }
+        if kinds.cochange {
+            scope_kinds.push("cochange");
+        }
+        Ok(GraphFacts {
+            snapshot: self.snapshot.clone(),
+            anchors,
+            nodes,
+            edges: emitted,
+            limits: GraphLimits {
+                max_nodes: caps.max_nodes,
+                max_edges: caps.max_edges,
+                cochange_per_anchor: caps.cochange_per_anchor,
+                truncated,
+                omitted_edges,
+                omitted_nodes,
+                reason,
+            },
+            scope: GraphScope {
+                kinds: scope_kinds,
+                import_max_hops: max_hops,
+                cochange_window: window,
+                commits_scanned: totals.map(|(scanned, _)| scanned),
+                bulk_commits_excluded: totals.map(|(_, bulk)| bulk),
+                note: format!(
+                    "Facts only, not a ranking and not a call graph: import edges are \
+                     heuristic module-name matches (single hop, either direction, from the \
+                     anchors out to {max_hops} hop(s)); co-change edges are stored git-history \
+                     rows between each anchor and its strongest partners (last {} commits, \
+                     pairs sharing at least {} commits, commits touching more than {} files \
+                     ignored). Symbol-level call edges are not recorded. Absence of an edge \
+                     means none was recorded within this scope.",
+                    window.max_commits, window.min_count, window.max_files_per_commit
+                ),
+            },
+        })
+    }
+
     /// Shared deterministic expansion: co-change graph (git history fact) +
     /// import graph (static-analysis fact, up to `max_hops` hops), excluding
     /// files already in `seeds`/`likely`. Returns (cochange, imports,
@@ -974,7 +1327,16 @@ impl Engine {
         Vec<DroppedCandidate>,
     )> {
         let mut likely_tests = Vec::new();
-        let mut expansions: HashMap<String, (f32, String)> = HashMap::new();
+        // Per partner: the strongest row's numbers (which set `confidence` and
+        // `reason`), and the id of every kept row from any anchor.
+        struct Expansion {
+            strength: f32,
+            count: u32,
+            anchor: String,
+            reason: String,
+            evidence: Vec<String>,
+        }
+        let mut expansions: HashMap<String, Expansion> = HashMap::new();
         let mut beyond_seed_cap: Vec<String> = Vec::new();
         for seed in seeds {
             // Read every row, order it totally (strength desc, then path), and
@@ -991,14 +1353,22 @@ impl Engine {
                 if self.by_path.contains_key(&edge.path_b) && !seeds.contains(&edge.path_b) {
                     let e = expansions
                         .entry(edge.path_b.clone())
-                        .or_insert((0.0, String::new()));
-                    if edge.strength > e.0 {
-                        *e = (
-                            edge.strength,
-                            format!(
-                                "changes with {seed} in {}% of its commits",
-                                (edge.strength * 100.0) as u32
-                            ),
+                        .or_insert_with(|| Expansion {
+                            strength: 0.0,
+                            count: edge.count,
+                            anchor: seed.clone(),
+                            reason: String::new(),
+                            evidence: Vec::new(),
+                        });
+                    e.evidence
+                        .push(cochange_edge_id(&self.snapshot, seed, &edge.path_b));
+                    if edge.strength > e.strength {
+                        e.strength = edge.strength;
+                        e.count = edge.count;
+                        e.anchor = seed.clone();
+                        e.reason = format!(
+                            "changes with {seed} in {}% of its commits",
+                            (edge.strength * 100.0) as u32
                         );
                     }
                 }
@@ -1017,14 +1387,22 @@ impl Engine {
 
         let mut cochange_expansions: Vec<ScoredPath> = expansions
             .into_iter()
-            .map(|(path, (conf, reason))| {
+            .map(|(path, mut e)| {
                 if engram_repo_map::inventory::is_test_path(&path) {
                     likely_tests.push(path.clone());
                 }
+                e.evidence.sort();
+                e.evidence.dedup();
                 ScoredPath {
                     path,
-                    confidence: conf,
-                    reason,
+                    confidence: e.strength,
+                    reason: e.reason,
+                    evidence_ids: e.evidence,
+                    score_components: Some(ScoreComponents::CochangeStrength {
+                        strength: e.strength,
+                        count: e.count,
+                        anchor: e.anchor,
+                    }),
                 }
             })
             .collect();
@@ -1056,9 +1434,21 @@ impl Engine {
                 likely_tests.push(hit.path.clone());
             }
             let confidence = if hit.hops <= 1 { 0.6 } else { 0.35 };
+            // One id per hop of the route back to an anchor, each the id of
+            // that single import edge.
+            let evidence_ids: Vec<String> = hit
+                .chain
+                .windows(2)
+                .map(|w| import_edge_id(&self.snapshot, w))
+                .collect();
             import_expansions.push(ScoredPath {
                 path: hit.path,
                 confidence,
+                evidence_ids,
+                score_components: Some(ScoreComponents::ImportHops {
+                    hops: hit.hops,
+                    weight: confidence,
+                }),
                 reason: if hit.hops <= 1 {
                     "imports a likely-changed file (1 hop)".to_string()
                 } else {
@@ -1962,12 +2352,27 @@ fn second() {
         assert_eq!(imp["hops"], 2);
         assert_eq!(imp["chain"].as_array().unwrap().len(), 3);
         assert_eq!(imp["chain"][1], "app/ccc.py");
+        // Each hop also carries the id of that single edge: the one
+        // `get_graph` emits for it, not the id of the whole route.
+        let snapshot = engine.snapshot_id();
         assert_eq!(
             imp["edges"],
             serde_json::json!([
-                {"from": "app/bbb.py", "to": "app/ccc.py"},
-                {"from": "app/ccc.py", "to": "app/ddd.py"},
+                {
+                    "from": "app/bbb.py",
+                    "to": "app/ccc.py",
+                    "edge_id": import_edge_id(snapshot, &["app/bbb.py", "app/ccc.py"]),
+                },
+                {
+                    "from": "app/ccc.py",
+                    "to": "app/ddd.py",
+                    "edge_id": import_edge_id(snapshot, &["app/ccc.py", "app/ddd.py"]),
+                },
             ])
+        );
+        assert_eq!(
+            imp["edge_id"],
+            import_edge_id(snapshot, &["app/bbb.py", "app/ccc.py", "app/ddd.py"])
         );
     }
 
@@ -2411,6 +2816,728 @@ fn second() {
         for (tag, bytes, ranked) in &outputs[1..] {
             assert_eq!(bytes, &outputs[0].1, "{tag} differs from natural order");
             assert_eq!(ranked, &outputs[0].2, "{tag}: vector top-k differs");
+        }
+    }
+
+    // ----- edge ids, graph facts and cited evidence -------------------------
+
+    /// A plain (non-git) repository holding exactly `files`, indexed for real
+    /// (tree-sitter imports, content hashes), so the snapshot id follows the
+    /// content.
+    fn plain_repo(tag: &str, files: &[(&str, &str)]) -> TempRepo {
+        let repo = TempRepo::new(tag);
+        for (path, body) in files {
+            let full = repo.0.join(path);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(full, body).unwrap();
+        }
+        repo
+    }
+
+    const CHAIN_FILES: [(&str, &str); 3] = [
+        (
+            "app/alpha.py",
+            "from app.beta import beta\n\ndef alpha(): pass\n",
+        ),
+        (
+            "app/beta.py",
+            "from app.gamma import gamma\n\ndef beta(): pass\n",
+        ),
+        ("app/gamma.py", "def gamma(): pass\n"),
+    ];
+
+    /// The import route in an explanation: (whole-route id, per-hop ids).
+    fn route_ids(ex: &ConnectionExplanation) -> (String, Vec<String>) {
+        let v = serde_json::to_value(ex).unwrap();
+        let imp = v["reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["type"] == "import_edge")
+            .unwrap_or_else(|| panic!("no import reason in {v}"))
+            .clone();
+        (
+            imp["edge_id"].as_str().unwrap().to_owned(),
+            imp["edges"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| e["edge_id"].as_str().unwrap().to_owned())
+                .collect(),
+        )
+    }
+
+    fn graph_ids(facts: &GraphFacts) -> HashSet<String> {
+        facts.edges.iter().map(|e| e.edge_id().to_owned()).collect()
+    }
+
+    fn cited_ids(impact: &ImpactPrediction) -> Vec<String> {
+        impact
+            .cochange_expansions
+            .iter()
+            .chain(&impact.import_expansions)
+            .flat_map(|p| p.evidence_ids.clone())
+            .collect()
+    }
+
+    fn all_graph(engine: &Engine, store: &Store, anchors: &[&str], max_hops: usize) -> GraphFacts {
+        let anchors: Vec<String> = anchors.iter().map(|a| (*a).to_owned()).collect();
+        engine
+            .graph_facts(
+                store,
+                &anchors,
+                max_hops,
+                GraphKinds::default(),
+                GraphCaps::default(),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn edge_ids_are_stable_across_builds_and_change_with_the_snapshot() {
+        let a = plain_repo("ids-a", &CHAIN_FILES);
+        let b = plain_repo("ids-b", &CHAIN_FILES);
+        let (mut store_a, mut engine_a) = engine_over(&a);
+        let (mut store_b, mut engine_b) = engine_over(&b);
+        assert_eq!(engine_a.snapshot_id(), engine_b.snapshot_id());
+
+        let explain = |engine: &mut Engine, store: &mut Store| {
+            engine
+                .explain_connection(store, "app/alpha.py", "app/gamma.py")
+                .unwrap()
+        };
+        let (route_a, hops_a) = route_ids(&explain(&mut engine_a, &mut store_a));
+        let (route_b, hops_b) = route_ids(&explain(&mut engine_b, &mut store_b));
+        assert_eq!(
+            (&route_a, &hops_a),
+            (&route_b, &hops_b),
+            "same repo, same ids"
+        );
+
+        // The id is the documented function of snapshot, kind and route.
+        let snapshot = engine_a.snapshot_id().to_owned();
+        let chain = ["app/alpha.py", "app/beta.py", "app/gamma.py"];
+        assert_eq!(route_a, import_edge_id(&snapshot, &chain));
+        assert_eq!(hops_a[0], import_edge_id(&snapshot, &chain[0..2]));
+        assert_eq!(hops_a[1], import_edge_id(&snapshot, &chain[1..3]));
+        // A route and its hops are different facts with different ids, and a
+        // reversed hop is a different edge again.
+        assert!(!hops_a.contains(&route_a));
+        assert_ne!(
+            hops_a[0],
+            import_edge_id(&snapshot, &["app/beta.py", "app/alpha.py"])
+        );
+
+        // Change one file's content: the snapshot moves, and so does every id.
+        std::fs::write(b.0.join("app/gamma.py"), "def gamma(): return 'changed'\n").unwrap();
+        let (mut store_c, mut engine_c) = engine_over(&b);
+        assert_ne!(engine_c.snapshot_id(), snapshot);
+        let (route_c, hops_c) = route_ids(&explain(&mut engine_c, &mut store_c));
+        assert_ne!(route_c, route_a);
+        assert!(hops_c.iter().all(|id| !hops_a.contains(id)), "{hops_c:?}");
+    }
+
+    #[test]
+    fn explain_hop_ids_are_the_ids_get_graph_emits_for_those_single_edges() {
+        let (_repo, mut store, mut engine) = connection_fixture("hop-ids");
+        let ex = engine
+            .explain_connection(&mut store, "app/alpha.py", "app/gamma.py")
+            .unwrap();
+        let (route, hops) = route_ids(&ex);
+        assert_eq!(hops.len(), 2);
+        // From either end, every hop is in the graph under the same id.
+        for anchor in ["app/alpha.py", "app/gamma.py", "app/beta.py"] {
+            let ids = graph_ids(&all_graph(&engine, &store, &[anchor], 2));
+            assert!(hops.iter().all(|h| ids.contains(h)), "{anchor}: {hops:?}");
+            assert!(!ids.contains(&route), "a whole route is not a graph edge");
+        }
+        // A direct import: the route is its only hop.
+        let direct = engine
+            .explain_connection(&mut store, "app/alpha.py", "app/beta.py")
+            .unwrap();
+        let (route, hops) = route_ids(&direct);
+        assert_eq!(hops, vec![route.clone()]);
+        assert!(graph_ids(&all_graph(&engine, &store, &["app/alpha.py"], 1)).contains(&route));
+    }
+
+    #[test]
+    fn explain_cochange_ids_match_get_graph_in_both_directions() {
+        let (_repo, mut store, mut engine) = connection_fixture("co-ids");
+        store
+            .replace_cochange(&[
+                cochange("app/alpha.py", "app/delta.py", 4, 0.5),
+                cochange("app/delta.py", "app/alpha.py", 4, 0.8),
+            ])
+            .unwrap();
+        let ex = engine
+            .explain_connection(&mut store, "app/alpha.py", "app/delta.py")
+            .unwrap();
+        let v = serde_json::to_value(&ex).unwrap();
+        let by_dir = |dir: &str| -> String {
+            v["reasons"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["type"] == "historical_cochange" && r["direction"] == dir)
+                .unwrap()["edge_id"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        let snapshot = engine.snapshot_id().to_owned();
+        assert_eq!(
+            by_dir("source_to_target"),
+            cochange_edge_id(&snapshot, "app/alpha.py", "app/delta.py")
+        );
+        assert_eq!(
+            by_dir("target_to_source"),
+            cochange_edge_id(&snapshot, "app/delta.py", "app/alpha.py")
+        );
+        assert_ne!(by_dir("source_to_target"), by_dir("target_to_source"));
+
+        // Asked the other way round, the same rows keep the same ids.
+        let swapped = engine
+            .explain_connection(&mut store, "app/delta.py", "app/alpha.py")
+            .unwrap();
+        let swapped = serde_json::to_value(&swapped).unwrap();
+        let ids = |v: &serde_json::Value| -> HashSet<String> {
+            v["reasons"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|r| r["type"] == "historical_cochange")
+                .map(|r| r["edge_id"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        assert_eq!(ids(&v), ids(&swapped));
+
+        // And get_graph emits both rows, from either file as the anchor.
+        for anchor in ["app/alpha.py", "app/delta.py"] {
+            let in_graph = graph_ids(&all_graph(&engine, &store, &[anchor], 1));
+            assert!(ids(&v).is_subset(&in_graph), "{anchor}: {in_graph:?}");
+        }
+    }
+
+    #[test]
+    fn graph_facts_lists_a_direct_import_importer_to_imported() {
+        let (_repo, store, engine) = connection_fixture("graph-direct");
+        let facts = all_graph(&engine, &store, &["app/beta.py"], 1);
+        let imports: Vec<(&str, &str)> = facts
+            .edges
+            .iter()
+            .filter_map(|e| match e {
+                GraphEdge::Import {
+                    source,
+                    target,
+                    hops,
+                    direction,
+                    resolver,
+                    resolution_status,
+                    ..
+                } => {
+                    assert_eq!(*hops, 1);
+                    assert_eq!(*direction, ImportDirection::SourceImportsTarget);
+                    assert_eq!(*resolver, "heuristic_module_segments");
+                    assert_eq!(*resolution_status, "candidate");
+                    Some((source.as_str(), target.as_str()))
+                }
+                GraphEdge::Cochange { .. } => None,
+            })
+            .collect();
+        // alpha imports beta (incoming), beta imports gamma (outgoing); each
+        // once, with the importer as the source.
+        assert_eq!(
+            imports,
+            vec![
+                ("app/alpha.py", "app/beta.py"),
+                ("app/beta.py", "app/gamma.py")
+            ]
+        );
+        assert_eq!(facts.snapshot, engine.snapshot_id());
+        assert_eq!(facts.anchors, vec!["app/beta.py"]);
+        let roles: Vec<(&str, GraphNodeRole, usize)> = facts
+            .nodes
+            .iter()
+            .map(|n| (n.path.as_str(), n.role, n.distance))
+            .collect();
+        assert_eq!(
+            roles,
+            vec![
+                ("app/alpha.py", GraphNodeRole::Neighbor, 1),
+                ("app/beta.py", GraphNodeRole::Anchor, 0),
+                ("app/gamma.py", GraphNodeRole::Neighbor, 1),
+            ]
+        );
+        assert!(!facts.limits.truncated);
+        assert_eq!(facts.limits.omitted_edges + facts.limits.omitted_nodes, 0);
+    }
+
+    #[test]
+    fn a_two_hop_neighbour_appears_only_with_max_hops_two() {
+        let (_repo, store, engine) = connection_fixture("graph-hops");
+        let one = all_graph(&engine, &store, &["app/alpha.py"], 1);
+        let paths =
+            |f: &GraphFacts| -> Vec<String> { f.nodes.iter().map(|n| n.path.clone()).collect() };
+        assert_eq!(paths(&one), vec!["app/alpha.py", "app/beta.py"]);
+        assert_eq!(one.edges.len(), 1, "{:?}", one.edges);
+
+        let two = all_graph(&engine, &store, &["app/alpha.py"], 2);
+        assert_eq!(
+            paths(&two),
+            vec!["app/alpha.py", "app/beta.py", "app/gamma.py"]
+        );
+        let gamma = two.nodes.iter().find(|n| n.path == "app/gamma.py").unwrap();
+        assert_eq!((gamma.role, gamma.distance), (GraphNodeRole::Neighbor, 2));
+        assert_eq!(two.edges.len(), 2, "{:?}", two.edges);
+        // The one-hop result is a subset of the two-hop one, ids and all.
+        assert!(graph_ids(&one).is_subset(&graph_ids(&two)));
+        assert!(engine
+            .graph_facts(
+                &store,
+                &["app/alpha.py".to_owned()],
+                3,
+                GraphKinds::default(),
+                GraphCaps::default()
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn graph_facts_include_a_cochange_pair_the_recommendations_cut() {
+        // Seven strong partners (p00..p06) and `other`, the weakest of all.
+        let (_repo, mut store, mut engine) = fan_fixture("graph-beyond", 7, 0);
+        let mut edges: Vec<_> = (0..7)
+            .map(|i| {
+                cochange(
+                    "app/anchor.py",
+                    &format!("app/p{i:02}.py"),
+                    40,
+                    0.9 - i as f32 * 0.01,
+                )
+            })
+            .collect();
+        edges.push(cochange("app/anchor.py", "app/other.py", 3, 0.12));
+        store.replace_cochange(&edges).unwrap();
+
+        let impact = engine
+            .impact_from_files(&mut store, &["app/anchor.py".to_owned()])
+            .unwrap();
+        let recommended: Vec<&str> = impact
+            .cochange_expansions
+            .iter()
+            .map(|p| p.path.as_str())
+            .collect();
+        assert_eq!(recommended.len(), 5);
+        assert!(!recommended.contains(&"app/other.py"), "{recommended:?}");
+
+        let facts = all_graph(&engine, &store, &["app/anchor.py"], 1);
+        let weak = facts
+            .edges
+            .iter()
+            .find(|e| matches!(e, GraphEdge::Cochange { target, .. } if target == "app/other.py"));
+        let Some(GraphEdge::Cochange {
+            edge_id,
+            count,
+            strength,
+            source,
+            direction,
+            ..
+        }) = weak
+        else {
+            panic!(
+                "the weak pair is a recorded fact and must be listed: {:?}",
+                facts.edges
+            );
+        };
+        assert_eq!((*count, *strength), (3, 0.12));
+        assert_eq!(source, "app/anchor.py");
+        assert_eq!(*direction, CoChangeDirection::SourceToTarget);
+        assert_eq!(
+            edge_id,
+            &cochange_edge_id(engine.snapshot_id(), "app/anchor.py", "app/other.py")
+        );
+        // Every partner is listed, so the cap disclosure is honest: nothing cut.
+        let partners = facts
+            .edges
+            .iter()
+            .filter(|e| matches!(e, GraphEdge::Cochange { .. }))
+            .count();
+        assert_eq!(partners, 8);
+        assert!(!facts.limits.truncated);
+        assert_eq!(facts.limits.omitted_edges, 0);
+    }
+
+    #[test]
+    fn graph_facts_reject_unknown_anchors_and_bad_arguments() {
+        let (_repo, store, engine) = connection_fixture("graph-errors");
+        let call = |anchors: &[&str], hops: usize, kinds: GraphKinds, caps: GraphCaps| {
+            let anchors: Vec<String> = anchors.iter().map(|a| (*a).to_owned()).collect();
+            engine.graph_facts(&store, &anchors, hops, kinds, caps)
+        };
+        let both = GraphKinds::default();
+        let caps = GraphCaps::default();
+        let err = call(&["app/alpha.py", "app/nope.py"], 1, both, caps)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("app/nope.py") && err.contains("not an indexed text file"),
+            "{err}"
+        );
+        assert!(call(&[], 1, both, caps).is_err());
+        assert!(call(&["app/alpha.py"], 0, both, caps).is_err());
+        assert!(call(&["app/alpha.py"], 3, both, caps).is_err());
+        let none = GraphKinds {
+            import: false,
+            cochange: false,
+        };
+        assert!(call(&["app/alpha.py"], 1, none, caps).is_err());
+        let tiny = GraphCaps {
+            max_nodes: 1,
+            ..caps
+        };
+        let err = call(&["app/alpha.py", "app/beta.py"], 1, both, tiny)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("node cap"), "{err}");
+    }
+
+    #[test]
+    fn graph_facts_are_byte_identical_on_repeat_and_ignore_anchor_order() {
+        let (_repo, mut store, engine) = connection_fixture("graph-bytes");
+        store
+            .replace_cochange(&[
+                cochange("app/alpha.py", "app/delta.py", 4, 0.5),
+                cochange("app/delta.py", "app/alpha.py", 4, 0.8),
+                cochange("app/beta.py", "app/delta.py", 2, 0.3),
+            ])
+            .unwrap();
+        let bytes = |anchors: &[&str]| {
+            serde_json::to_string(&all_graph(&engine, &store, anchors, 2)).unwrap()
+        };
+        let first = bytes(&["app/alpha.py", "app/beta.py"]);
+        assert_eq!(first, bytes(&["app/alpha.py", "app/beta.py"]));
+        assert_eq!(
+            first,
+            bytes(&["app/beta.py", "app/alpha.py", "app/beta.py"]),
+            "order and repetition of anchors must not matter"
+        );
+        // Edges come out in (kind, source, target, direction) order.
+        let facts = all_graph(&engine, &store, &["app/alpha.py", "app/beta.py"], 2);
+        let keys: Vec<(String, String, String)> = facts
+            .edges
+            .iter()
+            .map(|e| match e {
+                GraphEdge::Import { source, target, .. } => {
+                    ("import".to_owned(), source.clone(), target.clone())
+                }
+                GraphEdge::Cochange { source, target, .. } => {
+                    ("cochange".to_owned(), source.clone(), target.clone())
+                }
+            })
+            .collect();
+        let mut sorted = keys.clone();
+        sorted.sort();
+        assert_eq!(keys, sorted);
+        let node_paths: Vec<&String> = facts.nodes.iter().map(|n| &n.path).collect();
+        let mut sorted_nodes = node_paths.clone();
+        sorted_nodes.sort();
+        assert_eq!(node_paths, sorted_nodes);
+    }
+
+    #[test]
+    fn graph_facts_serialize_with_the_documented_shape() {
+        let (_repo, mut store, engine) = connection_fixture("graph-json");
+        store
+            .replace_cochange(&[cochange("app/alpha.py", "app/delta.py", 4, 0.5)])
+            .unwrap();
+        let v = serde_json::to_value(all_graph(&engine, &store, &["app/alpha.py"], 1)).unwrap();
+        assert_eq!(v["anchors"], serde_json::json!(["app/alpha.py"]));
+        let node = &v["nodes"][0];
+        assert_eq!(node["path"], "app/alpha.py");
+        assert_eq!(node["role"], "anchor");
+        assert_eq!(node["language"], "python");
+        assert_eq!(node["is_test"], false);
+        let edge = |kind: &str| {
+            v["edges"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["kind"] == kind)
+                .unwrap_or_else(|| panic!("no {kind} edge in {v}"))
+                .clone()
+        };
+        let imp = edge("import");
+        assert_eq!(imp["direction"], "source_imports_target");
+        assert_eq!(imp["hops"], 1);
+        assert_eq!(imp["resolver"], "heuristic_module_segments");
+        assert_eq!(imp["resolution_status"], "candidate");
+        assert!(imp["edge_id"].as_str().unwrap().starts_with("e_"));
+        let co = edge("cochange");
+        assert_eq!(co["direction"], "source_to_target");
+        assert_eq!(co["count"], 4);
+        assert_eq!(co["strength"], 0.5);
+        assert!(co["window"]["max_commits"].is_u64());
+        // Hand-built index: no history totals were recorded, so null, not 0.
+        assert!(co["opportunities_source"].is_null());
+        assert!(co["opportunities_target"].is_null());
+        for key in [
+            "max_nodes",
+            "max_edges",
+            "truncated",
+            "omitted_edges",
+            "omitted_nodes",
+        ] {
+            assert!(v["limits"].get(key).is_some(), "limits.{key}");
+        }
+        assert!(v["limits"]["reason"].is_string());
+        assert_eq!(
+            v["scope"]["kinds"],
+            serde_json::json!(["import", "cochange"])
+        );
+        assert!(v["scope"]["note"].as_str().unwrap().contains("call"));
+    }
+
+    fn caps(max_nodes: usize, max_edges: usize, per_anchor: usize) -> GraphCaps {
+        GraphCaps {
+            max_nodes,
+            max_edges,
+            cochange_per_anchor: per_anchor,
+        }
+    }
+
+    fn capped(engine: &Engine, store: &Store, caps: GraphCaps) -> GraphFacts {
+        engine
+            .graph_facts(
+                store,
+                &["app/anchor.py".to_owned()],
+                1,
+                GraphKinds::default(),
+                caps,
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn caps_truncate_graph_facts_with_exact_omitted_counts() {
+        // A hub: 12 co-change partners and 6 importers, 18 edges, 19 files.
+        let (_repo, store, engine) = fan_fixture("graph-caps", 12, 6);
+        let full = capped(&engine, &store, GraphCaps::default());
+        assert_eq!((full.nodes.len(), full.edges.len()), (19, 18));
+        assert!(!full.limits.truncated);
+        assert_eq!(full.limits.reason, "complete: no cap cut anything");
+        let full_ids = graph_ids(&full);
+
+        // Co-change read limit: 5 of 12 rows read, so 7 are hidden and counted.
+        let facts = capped(&engine, &store, caps(200, 500, 5));
+        assert_eq!((facts.nodes.len(), facts.edges.len()), (12, 11));
+        assert!(facts.limits.truncated);
+        assert_eq!(facts.limits.omitted_edges, 7);
+        assert_eq!(facts.limits.omitted_nodes, 0);
+        assert!(
+            facts.limits.reason.contains("7 co-change row(s)"),
+            "{}",
+            facts.limits.reason
+        );
+        assert_eq!(facts.limits.cochange_per_anchor, 5);
+        // The strongest five by (strength, count, path) are the ones kept.
+        let kept: Vec<&str> = facts
+            .edges
+            .iter()
+            .filter_map(|e| match e {
+                GraphEdge::Cochange { target, .. } => Some(target.as_str()),
+                GraphEdge::Import { .. } => None,
+            })
+            .collect();
+        assert_eq!(
+            kept,
+            [
+                "app/p00.py",
+                "app/p01.py",
+                "app/p02.py",
+                "app/p03.py",
+                "app/p04.py"
+            ]
+        );
+
+        // Node cap: 10 nodes = the anchor + 9 neighbours, nearest then by path
+        // (the 6 importers, then p00..p02). The 9 co-change edges to p03..p11
+        // lose an endpoint and are counted; so are the 9 omitted files.
+        let facts = capped(&engine, &store, caps(10, 500, 50));
+        assert_eq!((facts.nodes.len(), facts.edges.len()), (10, 9));
+        assert_eq!(facts.limits.omitted_nodes, 9);
+        assert_eq!(facts.limits.omitted_edges, 9);
+        assert!(facts.limits.truncated);
+        let node_paths: Vec<&str> = facts.nodes.iter().map(|n| n.path.as_str()).collect();
+        assert!(node_paths.contains(&"app/p02.py") && !node_paths.contains(&"app/p03.py"));
+        assert!(graph_ids(&facts).is_subset(&full_ids));
+
+        // Edge cap: all 18 candidates touch the anchor, so ties fall back to
+        // (kind, source, target) order: the first 7 are co-change p00..p06.
+        let facts = capped(&engine, &store, caps(200, 7, 50));
+        assert_eq!((facts.nodes.len(), facts.edges.len()), (19, 7));
+        assert_eq!(facts.limits.omitted_edges, 11);
+        assert_eq!(facts.limits.omitted_nodes, 0);
+        assert!(
+            facts.limits.reason.contains("11 edge(s)"),
+            "{}",
+            facts.limits.reason
+        );
+        assert!(graph_ids(&facts).is_subset(&full_ids));
+
+        // Whatever the caps, emitted + omitted accounts for every fact.
+        for c in [
+            caps(200, 500, 5),
+            caps(10, 500, 50),
+            caps(200, 7, 50),
+            caps(4, 3, 2),
+        ] {
+            let f = capped(&engine, &store, c);
+            assert_eq!(f.edges.len() + f.limits.omitted_edges, 18, "{c:?}");
+            assert!(
+                f.nodes.len() <= c.max_nodes && f.edges.len() <= c.max_edges,
+                "{c:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_id_a_recommendation_cites_is_a_fact_get_graph_emits() {
+        let (_repo, mut store, mut engine) = fan_fixture("cite-fan", 12, 10);
+        let anchors = vec!["app/anchor.py".to_owned()];
+        let impact = engine.impact_from_files(&mut store, &anchors).unwrap();
+        let cited = cited_ids(&impact);
+        assert!(!cited.is_empty());
+        // 5 co-change rows and 8 of the 10 importers are recommended.
+        assert_eq!(impact.cochange_expansions.len(), 5);
+        assert_eq!(impact.import_expansions.len(), 8);
+        let facts = all_graph(&engine, &store, &["app/anchor.py"], 2);
+        let emitted = graph_ids(&facts);
+        for id in &cited {
+            assert!(emitted.contains(id), "cited {id} is not in get_graph");
+        }
+        // Each recommendation cites exactly the edges its own numbers rest on.
+        let snapshot = engine.snapshot_id().to_owned();
+        for p in &impact.cochange_expansions {
+            assert_eq!(
+                p.evidence_ids,
+                vec![cochange_edge_id(&snapshot, "app/anchor.py", &p.path)]
+            );
+            let Some(ScoreComponents::CochangeStrength {
+                strength,
+                count,
+                anchor,
+            }) = &p.score_components
+            else {
+                panic!("co-change entry without its numbers: {p:?}");
+            };
+            assert_eq!(*strength, p.confidence);
+            assert_eq!(anchor, "app/anchor.py");
+            assert!(*count >= 40, "{count}");
+        }
+        for p in &impact.import_expansions {
+            assert_eq!(
+                p.evidence_ids,
+                vec![import_edge_id(
+                    &snapshot,
+                    &[p.path.as_str(), "app/anchor.py"]
+                )]
+            );
+            assert_eq!(
+                p.score_components,
+                Some(ScoreComponents::ImportHops {
+                    hops: 1,
+                    weight: 0.6
+                })
+            );
+        }
+        // Anchors and search-free entries cite nothing.
+        assert!(impact
+            .likely_files
+            .iter()
+            .all(|p| p.evidence_ids.is_empty()));
+    }
+
+    #[test]
+    fn a_two_hop_dependent_cites_each_hop_of_its_route() {
+        let (_repo, mut store, mut engine) = connection_fixture("cite-two-hop");
+        let impact = engine
+            .impact_from_files(&mut store, &["app/gamma.py".to_owned()])
+            .unwrap();
+        let snapshot = engine.snapshot_id().to_owned();
+        let alpha = impact
+            .import_expansions
+            .iter()
+            .find(|p| p.path == "app/alpha.py")
+            .expect("alpha is a two-hop dependent of gamma");
+        assert_eq!(
+            alpha.evidence_ids,
+            vec![
+                import_edge_id(&snapshot, &["app/alpha.py", "app/beta.py"]),
+                import_edge_id(&snapshot, &["app/beta.py", "app/gamma.py"]),
+            ]
+        );
+        assert_eq!(
+            alpha.score_components,
+            Some(ScoreComponents::ImportHops {
+                hops: 2,
+                weight: 0.35
+            })
+        );
+        let emitted = graph_ids(&all_graph(&engine, &store, &["app/gamma.py"], 2));
+        for id in cited_ids(&impact) {
+            assert!(emitted.contains(&id), "{id}");
+        }
+        // With one hop only the direct importer is recommended or cited, and
+        // the one-hop graph still holds everything cited.
+        let one = engine
+            .impact_from_files_with(&mut store, &["app/gamma.py".to_owned()], 1)
+            .unwrap();
+        assert_eq!(one.import_expansions.len(), 1);
+        let emitted = graph_ids(&all_graph(&engine, &store, &["app/gamma.py"], 1));
+        for id in cited_ids(&one) {
+            assert!(emitted.contains(&id), "{id}");
+        }
+    }
+
+    #[test]
+    fn multi_anchor_cochange_cites_every_kept_row_and_the_strongest_sets_the_numbers() {
+        let (_repo, mut store, mut engine) = connection_fixture("cite-multi");
+        store
+            .replace_cochange(&[
+                cochange("app/alpha.py", "app/delta.py", 3, 0.3),
+                cochange("app/beta.py", "app/delta.py", 9, 0.9),
+            ])
+            .unwrap();
+        let anchors = vec!["app/alpha.py".to_owned(), "app/beta.py".to_owned()];
+        let impact = engine.impact_from_files(&mut store, &anchors).unwrap();
+        let delta = impact
+            .cochange_expansions
+            .iter()
+            .find(|p| p.path == "app/delta.py")
+            .unwrap();
+        let snapshot = engine.snapshot_id().to_owned();
+        let mut expected = vec![
+            cochange_edge_id(&snapshot, "app/alpha.py", "app/delta.py"),
+            cochange_edge_id(&snapshot, "app/beta.py", "app/delta.py"),
+        ];
+        expected.sort();
+        assert_eq!(delta.evidence_ids, expected);
+        assert_eq!(
+            delta.score_components,
+            Some(ScoreComponents::CochangeStrength {
+                strength: 0.9,
+                count: 9,
+                anchor: "app/beta.py".to_owned()
+            })
+        );
+        let emitted = graph_ids(&all_graph(
+            &engine,
+            &store,
+            &["app/alpha.py", "app/beta.py"],
+            2,
+        ));
+        for id in cited_ids(&impact) {
+            assert!(emitted.contains(&id), "{id}");
         }
     }
 }

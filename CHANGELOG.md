@@ -7,6 +7,26 @@ release tags.
 ## [Unreleased]
 
 ### Added
+- **Citable graph facts.** Every import and co-change edge has a content-derived
+  `edge_id` (`e_` plus 16 hex digits: a 64-bit FNV-1a over the snapshot id, the
+  edge kind, its endpoints, and the full import chain or the co-change
+  direction). Ids are stable across runs and machines for one snapshot and
+  change with it; being 64-bit they are not globally unique.
+  `explain_connection` reports an `edge_id` on every reason and on each hop of
+  an import route (`edges[].edge_id`, the id of that single edge).
+- **`get_graph(paths, max_hops?, kinds?, snapshot?)`**, a supporting tool that
+  returns the raw recorded facts around anchor files: single-hop heuristic
+  import edges (importer to imported) and stored co-change rows, independent of
+  the recommendation caps. Deterministic order; hard caps (200 nodes, 500 edges,
+  50 co-change rows per anchor) with truncation always disclosed in `limits`
+  (`omitted_edges`, `omitted_nodes`, `reason`). It is not a call graph:
+  symbol-level call edges are not implemented.
+- **Recommendations cite their evidence.** `expand_connections` entries gain
+  `evidence_ids` (the co-change row ids, or the id of every import hop back to
+  an anchor) and `score_components` (the numbers behind `confidence`). Every
+  cited id is an id `get_graph` emits for the same anchors in the same snapshot.
+  Search evidence is unchanged: its per-signal scores are not kept, so it has no
+  `score_components`.
 - **Product contract** (`docs/CONTRACT.md`): frozen positioning, canonical tool
   names and arguments, deprecation path, the pack object, snapshot ids, index
   states, and a roadmap of what is not implemented.
@@ -60,6 +80,9 @@ release tags.
 - Docs aligned: README and benchmark notes lead with the canonical tools.
 
 ### Behaviour changes
+- Each `edges[]` entry of an `explain_connection` import reason now carries an
+  `edge_id` next to `from`/`to`. Clients that compared an entry for exact
+  equality with `{from, to}` must ignore the extra key.
 - `explain_connection` now returns an error when either path is not an indexed
   file, or when both paths are the same file. Callers must pass repo-relative
   paths returned by `search_context` or `expand_connections`.
