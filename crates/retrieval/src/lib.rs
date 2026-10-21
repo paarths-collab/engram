@@ -86,6 +86,12 @@ pub struct Engine {
     config: WeightsConfig,
     graph: CodeGraph,
     stopwords: std::sync::Arc<HashSet<String>>,
+    /// Set when lazy Tier-1 extraction wrote symbols or imports that this
+    /// engine's chunks and code graph, built before the write, do not reflect.
+    stale: std::sync::atomic::AtomicBool,
+    /// Identity of the indexed content this engine was built from; see
+    /// `Store::snapshot_id`. Constant for the engine's life.
+    snapshot: String,
 }
 
 /// Longest import chain the import graph is searched for, shared by the
@@ -265,6 +271,7 @@ impl Engine {
             chunks.len(),
             docs.len()
         );
+        let snapshot = engram_repo_map::snapshot_id(store, repo_root)?;
         let graph = CodeGraph::build(store, repo_root)?;
         eprintln!(
             "[engram] code graph: {} nodes, {} edges",
@@ -286,7 +293,23 @@ impl Engine {
             config: WeightsConfig::load(repo_root),
             graph,
             stopwords,
+            stale: std::sync::atomic::AtomicBool::new(false),
+            snapshot,
         })
+    }
+
+    /// Identity of the indexed content (commit, parser version, and every
+    /// file's path and content hash) this engine was built from.
+    pub fn snapshot_id(&self) -> &str {
+        &self.snapshot
+    }
+
+    /// Whether the store now holds symbols or imports this engine never saw:
+    /// lazy extraction on a search hit writes them after the chunks and the
+    /// code graph were built. The owner should discard the engine and
+    /// rebuild it before the next query.
+    pub fn is_stale(&self) -> bool {
+        self.stale.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Rank file paths for a query under a given strategy (top `k`). Used by the
@@ -480,7 +503,9 @@ impl Engine {
         let mut packets = Vec::new();
         for (rank, (i, score, signals)) in ranked.iter().enumerate() {
             let d = &self.docs[*i];
-            engram_repo_map::ensure_tier1(store, &self.repo_root, &d.path)?;
+            if engram_repo_map::ensure_tier1(store, &self.repo_root, &d.path)? {
+                self.stale.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
             // Prefer the span the vector side actually matched: its text is the
             // definition itself, where the symbol table only holds a signature
             // line and the file preview is just the first few hundred bytes.
@@ -691,8 +716,8 @@ impl Engine {
         for path in [source, target] {
             if !self.by_path.contains_key(path) {
                 anyhow::bail!(
-                    "{path} is not in the Engram index; use a repo-relative path \
-                     returned by search_context/expand_connections"
+                    "{path} is not an indexed text file in the Engram index; use a \
+                     repo-relative path returned by search_context/expand_connections"
                 );
             }
         }
@@ -909,6 +934,98 @@ fn best_symbols_for(store: &Store, path: &str, q_tokens: &[String]) -> Vec<Symbo
         }
     }
     hits
+}
+
+#[cfg(test)]
+mod lazy_extraction_tests {
+    use super::*;
+
+    /// Throwaway repo root, removed on drop. Not `tempfile`: CI builds
+    /// `--locked`, so a dev-dependency would need a Cargo.lock regeneration.
+    struct TempRepo(PathBuf);
+
+    impl TempRepo {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "engram-retrieval-lazy-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("create temp repo");
+            TempRepo(path)
+        }
+
+        fn write(&self, rel: &str, contents: &str) {
+            std::fs::write(self.0.join(rel), contents).expect("write");
+        }
+    }
+
+    impl Drop for TempRepo {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn importers_of(engine: &Engine, path: &str) -> Vec<String> {
+        engine
+            .graph
+            .dependents(&[path.to_owned()], &[EdgeKind::Imports], 1)
+            .into_iter()
+            .map(|hit| hit.path)
+            .collect()
+    }
+
+    #[test]
+    fn lazy_extraction_marks_the_engine_stale_until_it_is_rebuilt() {
+        let repo = TempRepo::new();
+        repo.write(
+            "app.py",
+            "import helpers\n\ndef frobnicate_widgets():\n    return helpers.work()\n",
+        );
+        repo.write("helpers.py", "def work():\n    return 1\n");
+
+        // Inventory only: no file has been Tier-1 extracted yet, which is the
+        // state lazy extraction exists for (a repo past the eager limit).
+        let mut store = Store::open(&repo.0).expect("open store");
+        store
+            .upsert_fingerprinted(&engram_repo_map::inventory::scan(&repo.0))
+            .expect("upsert files");
+        let mut engine = Engine::build(&repo.0, &mut store).expect("build engine");
+        assert!(!engine.is_stale(), "a fresh engine reflects the store");
+        assert!(importers_of(&engine, "helpers.py").is_empty());
+
+        let packets = engine
+            .search(&mut store, "frobnicate_widgets", 8)
+            .expect("search");
+        assert!(packets.iter().any(|p| p.path == "app.py"), "{packets:?}");
+        // The search extracted app.py's imports into the store, after the
+        // graph was built, so this engine can no longer see the whole truth.
+        assert!(engine.is_stale());
+        assert!(
+            importers_of(&engine, "helpers.py").is_empty(),
+            "the old graph cannot know about the new edge"
+        );
+
+        let rebuilt = Engine::build(&repo.0, &mut store).expect("rebuild engine");
+        assert!(!rebuilt.is_stale());
+        assert_eq!(importers_of(&rebuilt, "helpers.py"), vec!["app.py"]);
+    }
+
+    #[test]
+    fn a_search_that_extracts_nothing_new_leaves_the_engine_fresh() {
+        let repo = TempRepo::new();
+        repo.write("app.py", "def frobnicate_widgets():\n    return 1\n");
+        let mut store = Store::open(&repo.0).expect("open store");
+        engram_repo_map::index_repo(&repo.0, 100).expect("index");
+        let mut engine = Engine::build(&repo.0, &mut store).expect("build engine");
+
+        engine
+            .search(&mut store, "frobnicate_widgets", 8)
+            .expect("search");
+        assert!(!engine.is_stale(), "everything was already extracted");
+    }
 }
 
 #[cfg(test)]
@@ -1521,7 +1638,8 @@ fn second() {
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("app/missing.py") && err.contains("not in the Engram index"),
+            err.contains("app/missing.py")
+                && err.contains("not an indexed text file in the Engram index"),
             "{err}"
         );
         let err = engine
