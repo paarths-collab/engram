@@ -209,7 +209,7 @@ fn run_benchmark2_connection_recovery(
     // history_commits older ones. Overwrite the store's cochange table with
     // this restricted history before building the graph.
     let history = cochange::build_from(repo, eval_commits, history_commits);
-    store.replace_cochange_with_facts(&history.edges, &history.facts)?;
+    history.record_into(store)?;
     eprintln!(
         "[evals] leakage-free co-change graph: {} edges (from commits {}..{})",
         history.edges.len(),

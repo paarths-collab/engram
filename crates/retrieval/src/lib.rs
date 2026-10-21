@@ -161,6 +161,20 @@ impl Default for GraphKinds {
     }
 }
 
+/// Whole-number percentage of a co-change row, for prose. With the
+/// denominator known it is computed in integers from the two counts, rounded to
+/// nearest, so it can never disagree with "N of M" through float truncation;
+/// otherwise it is the stored strength, rounded.
+fn cochange_percent(count: u32, opportunities: Option<u32>, strength: f32) -> u32 {
+    match opportunities {
+        Some(m) if m > 0 => {
+            let (count, m) = (u64::from(count), u64::from(m));
+            ((count * 100 + m / 2) / m) as u32
+        }
+        _ => (strength * 100.0).round() as u32,
+    }
+}
+
 /// The co-change table's build limits, as every co-change fact reports them.
 fn cochange_window() -> CoChangeWindow {
     CoChangeWindow {
@@ -892,20 +906,23 @@ impl Engine {
                     CoChangeDirection::SourceToTarget => opportunities_source,
                     CoChangeDirection::TargetToSource => opportunities_target,
                 };
+                let percent = cochange_percent(row.count, from_opportunities, row.strength);
+                // The denominator counts only non-bulk commits (those touching
+                // at most `max_files_per_commit` files); bulk ones are excluded
+                // from it, so the wording says so rather than "all commits".
                 let detail = match from_opportunities {
                     Some(m) => format!(
-                        "{from} and {to} changed together in {} of {m} commit{} that \
-                         touched {from} ({}%)",
+                        "{from} and {to} changed together in {} of the {m} non-bulk commit{} \
+                         that touched {from} ({percent}%)",
                         row.count,
                         if m == 1 { "" } else { "s" },
-                        (row.strength * 100.0) as u32
                     ),
                     None => format!(
-                        "{from} and {to} changed together in {} commit{}, \
-                         {}% of the commits that touched {from}",
+                        "{from} and {to} changed together in {} commit{}, {percent}% of the \
+                         non-bulk commits that touched {from} (that commit count is not \
+                         recorded in this index)",
                         row.count,
                         if row.count == 1 { "" } else { "s" },
-                        (row.strength * 100.0) as u32
                     ),
                 };
                 reasons.push(ConnectionReason::CoChange {
@@ -1368,7 +1385,7 @@ impl Engine {
                         e.anchor = seed.clone();
                         e.reason = format!(
                             "changes with {seed} in {}% of its commits",
-                            (edge.strength * 100.0) as u32
+                            (edge.strength * 100.0).round() as u32
                         );
                     }
                 }
@@ -1853,7 +1870,8 @@ fn second() {
             .env("GIT_AUTHOR_EMAIL", "anonymous@example.invalid")
             .env("GIT_COMMITTER_NAME", "Anonymous")
             .env("GIT_COMMITTER_EMAIL", "anonymous@example.invalid")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
             .output()
             .expect("run git");
         assert!(
@@ -1912,6 +1930,21 @@ fn second() {
     }
 
     #[test]
+    fn the_cochange_percent_comes_from_the_counts_when_the_denominator_is_known() {
+        // The counts decide, not the f32 strength (here deliberately off).
+        assert_eq!(cochange_percent(29, Some(100), 0.2899), 29);
+        // Rounded to nearest, in integers.
+        assert_eq!(cochange_percent(1, Some(3), 1.0 / 3.0), 33);
+        assert_eq!(cochange_percent(2, Some(3), 2.0 / 3.0), 67);
+        assert_eq!(cochange_percent(3, Some(4), 0.75), 75);
+        assert_eq!(cochange_percent(1, Some(8), 0.125), 13);
+        assert_eq!(cochange_percent(4, Some(4), 1.0), 100);
+        // Unknown denominator (or a degenerate zero): the stored strength, rounded.
+        assert_eq!(cochange_percent(29, None, 0.29), 29);
+        assert_eq!(cochange_percent(2, Some(0), 0.666), 67);
+    }
+
+    #[test]
     fn explain_cochange_reports_opportunities_and_bulk_exclusions_from_real_history() {
         let Some(repo) = history_fixture("cochange-facts") else {
             return;
@@ -1945,7 +1978,9 @@ fn second() {
         assert_eq!(forward["strength"], 0.75);
         let detail = forward["detail"].as_str().unwrap();
         assert!(
-            detail.contains("changed together in 3 of 4 commits that touched app/a.py"),
+            detail.contains(
+                "changed together in 3 of the 4 non-bulk commits that touched app/a.py (75%)"
+            ),
             "{detail}"
         );
         let reverse = co
@@ -1955,10 +1990,9 @@ fn second() {
         assert_eq!(reverse["opportunities_source"], 4);
         assert_eq!(reverse["opportunities_target"], 3);
         assert_eq!(reverse["strength"], 1.0);
-        assert!(reverse["detail"]
-            .as_str()
-            .unwrap()
-            .contains("changed together in 3 of 3 commits that touched app/b.py"));
+        assert!(reverse["detail"].as_str().unwrap().contains(
+            "changed together in 3 of the 3 non-bulk commits that touched app/b.py (100%)"
+        ));
         // The wording is a statement of fact, not of cause.
         for r in &co {
             let d = r["detail"].as_str().unwrap();
@@ -2000,10 +2034,12 @@ fn second() {
         assert!(first["opportunities_target"].is_null(), "{first}");
         assert_eq!(first["count"], 3);
         // The wording falls back to the one that claims nothing it cannot back.
-        assert!(first["detail"]
-            .as_str()
-            .unwrap()
-            .contains("of the commits that touched"));
+        let fallback = first["detail"].as_str().unwrap();
+        assert!(
+            fallback.contains("of the non-bulk commits that touched")
+                && fallback.contains("not recorded in this index"),
+            "{fallback}"
+        );
 
         // Reopening migrates the schema; the next history refresh repopulates.
         drop(store);

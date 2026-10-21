@@ -206,9 +206,11 @@ shortened; the transcript has the full text):
   "reasons": [
     {
       "count": 8,
-      "detail": "app/api.py and app/service.py changed together in 8 commits, 100% of the commits that touched app/api.py",
+      "detail": "app/api.py and app/service.py changed together in 8 of the 8 non-bulk commits that touched app/api.py (100%)",
       "direction": "source_to_target",
       "edge_kind": "cochange",
+      "opportunities_source": 8,
+      "opportunities_target": 10,
       "strength": 1.0,
       "type": "historical_cochange",
       "weight": 1.0,
@@ -229,14 +231,16 @@ shortened; the transcript has the full text):
     }
   ],
   "scope": {
+    "bulk_commits_excluded": 0,
     "cochange_directions_searched": ["source_to_target", "target_to_source"],
     "cochange_lookup": "exact_pair",
     "cochange_window": { "max_commits": 2000, "max_files_per_commit": 30, "min_count": 2 },
+    "commits_scanned": 11,
     "import_directions_searched": ["source_imports_target", "target_imports_source"],
     "import_max_hops": 2,
     "import_search_source_imports_target": "found",
     "import_search_target_imports_source": "none_within_bound",
-    "note": "Import chains up to 2 hops were searched in both directions over heuristically resolved import edges. Co-change covers only the last 2000 commits, pairs sharing at least 2 commits, ignoring commits touching more than 30 files. Absence of a fact means none was recorded within this scope, not that the files are unrelated."
+    "note": "Import chains up to 2 hops were searched in both directions over heuristically resolved import edges. Co-change covers only the last 2000 commits, pairs sharing at least 2 commits, ignoring commits touching more than 30 files (counted in bulk_commits_excluded). Absence of a fact means none was recorded within this scope, not that the files are unrelated."
   },
   "snapshot": "2c4a4e25961017ed"
 }
@@ -244,7 +248,9 @@ shortened; the transcript has the full text):
 
 (The capture predates edge ids: current responses also carry `edge_id` on each
 reason and inside each `edges[]` entry, see [Reasons](#reasons) and
-[Edge ids](#edge-ids).)
+[Edge ids](#edge-ids). The co-change `detail`, `opportunities_*`,
+`commits_scanned`, `bulk_commits_excluded` and `note` shown here follow the
+current wording and fields; they are not part of the recorded capture.)
 
 ### Top-level fields
 
@@ -260,7 +266,17 @@ reason and inside each `edges[]` entry, see [Reasons](#reasons) and
   - `import_search_source_imports_target`, `import_search_target_imports_source`: per-direction outcome, `found`, `none_within_bound` or `beyond_bound`.
   - `cochange_lookup`: `exact_pair`.
   - `cochange_window`: `max_commits`, `min_count`, `max_files_per_commit`. A pair outside these limits is absent from the table.
-  - `note`: a plain-language statement of the scope.
+  - `commits_scanned`: commits the co-change walk covered (merges and empty
+    commits included). `null` on an index that has not recorded it, and also
+    when the history walk failed (not a repository, no commits yet, `git`
+    unavailable). Unknown is `null`, never `0`.
+  - `bulk_commits_excluded`: commits in that walk that touched more than
+    `cochange_window.max_files_per_commit` files. They feed neither a pair's
+    `count` nor any file's `opportunities_*`. `null` under the same conditions.
+  - `note`: a plain-language statement of the scope. It states the co-change
+    window, that bulk commits are ignored (and counted in
+    `bulk_commits_excluded`), and that absence of a fact is not proof that the
+    files are unrelated.
 
 ### Reasons
 
@@ -282,11 +298,27 @@ or `historical_cochange` has:
 | `resolver` | `heuristic_module_segments` | not present |
 | `resolution_status` | `candidate`: a plausible edge, not compiler-verified | not present |
 | `count` | not present | commits in which both files changed |
-| `strength` | not present | `count` divided by the commits that touched the row's first file |
+| `strength` | not present | `count` divided by the non-bulk commits that touched the row's first file |
+| `opportunities_source` | not present | non-bulk commits in the window that touched `source` (the denominator of the `source_to_target` strength); `null` when not recorded, never a silent `0` |
+| `opportunities_target` | not present | the same for `target` |
 | `window` | not present | the co-change window (see `scope.cochange_window`) |
 
 Co-change means the two files changed in the same commits. It does not mean
 one must change with the other.
+
+The co-change `detail` reads, for a row `from -> to`, `"<from> and <to> changed
+together in 3 of the 4 non-bulk commits that touched <from> (75%)"`. The
+denominator counts only non-bulk commits, the ones touching at most
+`max_files_per_commit` files: bulk commits are excluded from it, so it is not
+"all commits that touched `<from>`". The percentage is computed as an integer
+from the two counts and rounded to nearest, so it always agrees with them. On
+an index that did not record the denominator the text is `"... changed together
+in 3 commits, 75% of the non-bulk commits that touched <from> (that commit
+count is not recorded in this index)"`, with the percentage taken from
+`strength`, rounded. (Before this wording the text said "N of M commits that
+touched X", which overstated the denominator; clients that matched on that
+sentence must read the structured fields `count` and `opportunities_*`
+instead.)
 
 Edge ids ([Edge ids](#edge-ids)) are additive on this tool: `edge_id` on each
 reason, and `edge_id` inside each `edges[]` entry. A hop's id equals the id
@@ -451,9 +483,9 @@ on the standard fixture; trimmed to two nodes and two of the edges):
     `resolver` is `heuristic_module_segments`, `resolution_status` is `candidate`.
   - `cochange`: the stored row `source -> target`: `count`, `strength` (relative
     to commits touching `source`), the build `window`, and
-    `opportunities_source` / `opportunities_target` (commits in the window that
-    touched each file, `null` on an index that predates them, never a silent
-    zero). For each partner of an anchor both rows are listed when both exist;
+    `opportunities_source` / `opportunities_target` (non-bulk commits in the
+    window that touched each file; `null` on an index that predates them or
+    whose history walk failed, never a silent zero). For each partner of an anchor both rows are listed when both exist;
     `direction` is always `source_to_target`.
   - Import and co-change facts about one pair are separate edges.
 - `limits`: `max_nodes` 200, `max_edges` 500, `cochange_per_anchor` 50 (rows
@@ -554,16 +586,27 @@ hexadecimal hash (64-bit FNV). It is computed from:
 1. The fixed domain tag `engram-snapshot-v1`.
 2. The checked-out commit: the `HEAD` SHA, or the literal `no-git` when the repository is not
    a git repository or has no commits.
-3. The parser/config version (`PARSER_CONFIG_VERSION`, currently `1`). A store
-   written under a different version discards its symbols, imports and vectors
-   and re-extracts them.
+3. The inventory rules fingerprint: a hash of the ignored directory names, the
+   extension-to-language table, the extra document suffixes (`.md`, `.toml`,
+   `.json`), the file size cap, and the hand-maintained parser/config version
+   (`PARSER_CONFIG_VERSION`, currently `1`). Editing any of these rules changes
+   the fingerprint with no manual bump. A store written under a different
+   fingerprint discards its symbols, imports and vectors and re-extracts them,
+   so the snapshot id changes with it. The check and the reset run under one
+   write lock and re-read the stored value inside it, so two processes opening
+   the store at the same moment cannot wipe each other's fresh data.
 4. A manifest of every indexed file, sorted by path: the path and its content hash
    (FNV-1a of the file bytes).
 
 Consequences:
 
 - The same content at the same commit gives the same id, whatever the mtimes or the checkout location.
-- Any content, path, or parser-version change gives a different id.
+- Any content, path, inventory-rule, or parser-version change gives a different id.
+- **Upgrade note:** the id is now derived from the rules fingerprint rather than
+  the bare parser version, so every existing snapshot id changes exactly once
+  on upgrade (a database holding the old value is re-extracted on first open).
+  Ids recorded before the upgrade, including edge ids, will report
+  `snapshot_mismatch`.
 - File mtimes are excluded from the id. Internally a file counts as changed when
   its size, mtime, or content hash differs from the stored fingerprint, and a
   changed file's derived rows are discarded and re-extracted.
@@ -574,6 +617,23 @@ Consequences:
 Use the id to check whether a remembered answer is still current: pass it back as
 `snapshot` and look for `snapshot_mismatch`. The answer is always from the current
 snapshot.
+
+## Local cache and concurrency
+
+The index lives in `<repo>/.engram/engram.db` (SQLite, write-ahead logging, so
+`engram.db-wal` and `engram.db-shm` appear beside it while it is open; the whole
+`.engram` directory is excluded from indexing and from the snapshot id). The
+background indexer, the file watcher and request handlers each hold their own
+connection to that file. Every connection waits up to 10 seconds for another
+writer's lock before failing, and write transactions take the lock up front, so
+startup indexing racing a watcher event or a first query does not surface
+`database is locked`. Only a lock held for longer than that fails, as an
+ordinary tool error or index warning.
+
+A failed history walk (the directory is not a git repository, it has no commits
+yet, or `git` cannot be run) stores no co-change rows and leaves the
+completeness facts unknown (`null` in `commits_scanned`, `bulk_commits_excluded`
+and `opportunities_*`), not zero.
 
 ## Index state
 

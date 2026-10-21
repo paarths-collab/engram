@@ -27,6 +27,13 @@ release tags.
   cited id is an id `get_graph` emits for the same anchors in the same snapshot.
   Search evidence is unchanged: its per-signal scores are not kept, so it has no
   `score_components`.
+- **Co-change completeness facts.** Each co-change reason in
+  `explain_connection` (and each co-change edge in `get_graph`) carries
+  `opportunities_source` / `opportunities_target` (non-bulk commits in the
+  window that touched each file, the exact denominator of `strength`), and the
+  `explain_connection` / `get_graph` scope carries `commits_scanned` and
+  `bulk_commits_excluded`. Unknown is `null`, never `0`: an index that predates
+  them, or whose history walk failed, reports `null`.
 - **Product contract** (`docs/CONTRACT.md`): frozen positioning, canonical tool
   names and arguments, deprecation path, the pack object, snapshot ids, index
   states, and a roadmap of what is not implemented.
@@ -80,6 +87,24 @@ release tags.
 - Docs aligned: README and benchmark notes lead with the canonical tools.
 
 ### Behaviour changes
+- **Every snapshot id changes once on upgrade.** The id now folds in the
+  inventory rules fingerprint (ignored directories, extension table, extra
+  suffixes, size cap, parser version) instead of the bare parser version, and a
+  database holding the old value is re-extracted on first open. Edits to those
+  rules likewise change the id from then on, with no manual bump.
+- **Wording of the co-change `detail` in `explain_connection`.** It used to say
+  "changed together in 3 of 4 commits that touched X", but the denominator
+  counts only non-bulk commits (those touching at most 30 files). It now reads
+  "changed together in 3 of the 4 non-bulk commits that touched X (75%)". The
+  percentage is computed as an integer from the two counts (rounded to nearest)
+  instead of truncating the stored float. When the denominator is not recorded
+  the text says so. Clients that matched the old sentence should read `count` and
+  `opportunities_*`.
+- A failed history walk (not a git repository, no commits, `git` missing) no
+  longer records "0 commits scanned": it stores no co-change rows and leaves the
+  completeness facts unknown (`null`). The walk also pins `log.showSignature` and
+  `core.quotePath` so a user's git configuration cannot change what is parsed;
+  non-ASCII paths now come back unescaped and match the inventory.
 - Each `edges[]` entry of an `explain_connection` import reason now carries an
   `edge_id` next to `from`/`to`. Clients that compared an entry for exact
   equality with `{from, to}` must ignore the extra key.
@@ -89,6 +114,15 @@ release tags.
 - For equal confidence, `likely_files` in `expand_connections` is ordered by path.
 
 ### Fixed
+- **`database is locked` during startup.** The busy timeout is now set before
+  any other statement (it used to follow the journal-mode switch and schema
+  creation) and raised to 10 seconds, and write transactions take the write lock
+  immediately instead of upgrading from a read, which fails at once without
+  waiting. Startup indexing, the watcher and request handlers no longer fail
+  against each other on the shared SQLite file.
+- Two connections opening the store at the same moment can no longer both wipe
+  derived data on a rules-fingerprint mismatch: the reset runs under
+  `BEGIN IMMEDIATE` and re-reads the stored fingerprint inside the transaction.
 - A clippy lint in the cached-vector decoder (`chunks_exact`) is fixed, so the
   code passes newer clippy with `-D warnings`.
 

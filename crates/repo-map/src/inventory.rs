@@ -329,4 +329,35 @@ mod tests {
         }
         assert!(!is_ignored_component("src"));
     }
+
+    #[test]
+    fn every_listed_extension_suffix_and_ignored_dir_agrees_with_is_indexable() {
+        // The lists below are what the rules fingerprint hashes; if one gains an
+        // entry `is_indexable` does not honor, the fingerprint would claim a
+        // coverage the scan does not have.
+        assert!(!engram_domain::LANGUAGE_EXTENSIONS.is_empty());
+        for (ext, lang) in engram_domain::LANGUAGE_EXTENSIONS {
+            assert_ne!(*lang, Language::Other, "{ext}");
+            for rel in [format!("x.{ext}"), format!("src/deep/x.{ext}")] {
+                assert!(is_indexable(&rel, 10), "{rel}");
+            }
+        }
+        assert!(!EXTRA_SUFFIXES.is_empty());
+        for suffix in EXTRA_SUFFIXES {
+            for rel in [format!("x{suffix}"), format!("docs/x{suffix}")] {
+                assert!(is_indexable(&rel, 10), "{rel}");
+            }
+        }
+        assert!(!IGNORED_DIRS.is_empty());
+        for dir in IGNORED_DIRS {
+            assert!(is_ignored_component(dir), "{dir}");
+            for rel in [
+                format!("{dir}/x.rs"),
+                format!("src/{dir}/x.rs"),
+                format!("{dir}/nested/x.md"),
+            ] {
+                assert!(!is_indexable(&rel, 10), "{rel}");
+            }
+        }
+    }
 }

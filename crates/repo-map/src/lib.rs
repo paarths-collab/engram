@@ -30,7 +30,7 @@ pub fn index_repo(repo_root: &Path, eager_tier1_limit: usize) -> Result<IndexSta
     let pruned_files = store.prune_missing_files(&present)?;
 
     let history = cochange::build(repo_root);
-    store.replace_cochange_with_facts(&history.edges, &history.facts)?;
+    history.record_into(&mut store)?;
     store.update_recency(&history.last_commit)?;
 
     // Eagerly extract symbols for up to N source files (small repos = instant full coverage).
@@ -208,7 +208,7 @@ pub fn snapshot_id(store: &Store, repo_root: &Path) -> Result<String> {
 /// HEAD moves — a new commit landed).
 pub fn refresh_history(store: &mut Store, repo_root: &Path) -> Result<()> {
     let history = cochange::build(repo_root);
-    store.replace_cochange_with_facts(&history.edges, &history.facts)?;
+    history.record_into(store)?;
     store.update_recency(&history.last_commit)?;
     Ok(())
 }
@@ -305,6 +305,29 @@ mod tests {
 
     const OLD: &str = "use helpers::thing;\nfn old_name() {}\n";
     const NEW: &str = "use other_mod::stuff;\nfn new_name_here() {}\n";
+
+    #[test]
+    fn a_failed_history_walk_leaves_the_cochange_facts_unknown_not_zero() {
+        // Not a repository: the log command exits nonzero.
+        let repo = TempRepo::new();
+        repo.write_at("a.rs", OLD, 1_000_000);
+        let stats = index_repo(&repo.0, 100).unwrap();
+        assert_eq!(stats.cochange_edges, 0);
+        let store = repo.store();
+        assert_eq!(store.cochange_totals().unwrap(), None);
+        assert_eq!(store.cochange_commits_touching("a.rs").unwrap(), None);
+        // Again, over rows that did carry facts: a failed refresh clears them
+        // to unknown instead of recording a walk of zero commits.
+        let mut store = repo.store();
+        let facts = cochange::CoChangeFacts {
+            commits_scanned: 9,
+            ..Default::default()
+        };
+        store.replace_cochange_with_facts(&[], &facts).unwrap();
+        assert_eq!(store.cochange_totals().unwrap(), Some((9, 0)));
+        refresh_history(&mut store, &repo.0).unwrap();
+        assert_eq!(store.cochange_totals().unwrap(), None);
+    }
 
     #[test]
     fn an_offline_edit_replaces_both_symbols_and_imports() {

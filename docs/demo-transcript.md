@@ -6,6 +6,12 @@ Recorded fixture output: this is not mocked. It is the captured JSON-RPC session
 - Fixture: a Python repository with 11 commits (fixed identities and dates)
 - Regenerate: run the test with `ENGRAM_E2E_TRANSCRIPT=<path>` and `ENGRAM_E2E_COMMIT=<short sha>` set. Timings are from one run on a shared machine (a Docker container), not a benchmark.
 
+Note: the co-change `detail` sentences below are quoted from that recording and
+predate the current wording. Today they read, for example, "app/service.py and
+app/api.py changed together in 8 of the 10 non-bulk commits that touched
+app/service.py (80%)", and carry `opportunities_source` / `opportunities_target`
+(see [`docs/CONTRACT.md`](CONTRACT.md)). Regenerate to refresh the capture.
+
 ## Fixture history
 
 | # | Commit | Files |
