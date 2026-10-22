@@ -86,15 +86,30 @@ impl Store {
         // SQLITE_BUSY at once, without consulting the busy timeout, when two of
         // them race to switch the journal mode or when a lock upgrade could
         // deadlock, so both steps below are retried until this deadline.
-        let deadline = Instant::now() + BUSY_TIMEOUT;
-        retry_while_busy(deadline, || {
+        let journal_mode: String = retry_while_busy(Instant::now() + BUSY_TIMEOUT, || {
             conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get::<_, String>(0))
                 .map_err(anyhow::Error::from)
         })?;
+        // Every commit syncs the disk. In WAL mode the default (FULL) syncs the
+        // log on each one, and the write lock is held through that sync: on a
+        // slow disk (a Windows CI runner's temp dir) a burst of small commits
+        // from several connections queues behind it for seconds, and the
+        // busy handler's polling is not fair, so one waiter can be starved
+        // past its timeout. NORMAL syncs at checkpoints instead. In WAL mode
+        // that cannot corrupt the file; the most a power cut costs is the last
+        // few commits of a cache that is rebuilt from the repository anyway.
+        // It is a per-connection setting that takes no lock. Only under WAL:
+        // with a rollback journal NORMAL could corrupt on a power cut.
+        if journal_mode.eq_ignore_ascii_case("wal") {
+            conn.pragma_update(None, "synchronous", "NORMAL")?;
+        }
         // Schema, migrations and the version check are one write transaction:
         // an opener that loses the race waits on the busy handler for the
-        // winner's commit and then finds everything already in place.
-        retry_while_busy(deadline, || Self::initialise(&conn, parser_version))?;
+        // winner's commit and then finds everything already in place. Its own
+        // deadline, so a slow journal-mode switch does not eat its patience.
+        retry_while_busy(Instant::now() + BUSY_TIMEOUT, || {
+            Self::initialise(&conn, parser_version)
+        })?;
         Ok(Store { conn })
     }
 
@@ -290,7 +305,19 @@ impl Store {
     /// that reads first and writes later fails at the upgrade with an immediate
     /// "database is locked" (the busy timeout does not apply) whenever another
     /// connection committed in between; taking the lock first waits instead.
+    ///
+    /// Even so, taking the lock can be refused at once with no wait (SQLite
+    /// does not consult the busy handler for every lock state, and Windows file
+    /// locking reaches those states more readily than POSIX does). So the lock
+    /// is first probed under [`retry_while_busy`], which sleeps and tries again
+    /// until a deadline; the real `BEGIN IMMEDIATE` follows it, still covered
+    /// by the busy handler.
     fn write_tx(&mut self) -> Result<rusqlite::Transaction<'_>> {
+        retry_while_busy(Instant::now() + BUSY_TIMEOUT, || {
+            self.conn.execute_batch("BEGIN IMMEDIATE")?;
+            self.conn.execute_batch("ROLLBACK")?;
+            Ok(())
+        })?;
         Ok(self
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?)
@@ -416,10 +443,10 @@ impl Store {
     /// build. Clears the chunk vectors too: the file's symbols have moved, so
     /// every span keyed to an old line number is stale.
     pub fn invalidate_vector(&mut self, path: &str) -> Result<()> {
-        self.conn
-            .execute("DELETE FROM vectors WHERE path = ?1", params![path])?;
-        self.conn
-            .execute("DELETE FROM chunk_vectors WHERE path = ?1", params![path])?;
+        let tx = self.write_tx()?;
+        tx.execute("DELETE FROM vectors WHERE path = ?1", params![path])?;
+        tx.execute("DELETE FROM chunk_vectors WHERE path = ?1", params![path])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -460,16 +487,14 @@ impl Store {
         &mut self,
         keep: &std::collections::HashSet<ChunkKey>,
     ) -> Result<()> {
+        let tx = self.write_tx()?;
         let existing: Vec<ChunkKey> = {
-            let mut stmt = self
-                .conn
-                .prepare("SELECT path, start_line FROM chunk_vectors")?;
+            let mut stmt = tx.prepare("SELECT path, start_line FROM chunk_vectors")?;
             let rows = stmt.query_map([], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as usize))
             })?;
             rows.filter_map(Result::ok).collect()
         };
-        let tx = self.write_tx()?;
         for key in existing {
             if !keep.contains(&key) {
                 tx.execute(
@@ -484,12 +509,12 @@ impl Store {
 
     /// Drop cached embeddings for files no longer present in the repo.
     pub fn prune_vectors(&mut self, keep: &std::collections::HashSet<String>) -> Result<()> {
+        let tx = self.write_tx()?;
         let existing: Vec<String> = {
-            let mut stmt = self.conn.prepare("SELECT path FROM vectors")?;
+            let mut stmt = tx.prepare("SELECT path FROM vectors")?;
             let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
             rows.filter_map(Result::ok).collect()
         };
-        let tx = self.write_tx()?;
         for path in existing {
             if !keep.contains(&path) {
                 tx.execute("DELETE FROM vectors WHERE path = ?1", params![path])?;
@@ -512,8 +537,11 @@ impl Store {
         &mut self,
         keep: &std::collections::HashSet<String>,
     ) -> Result<usize> {
+        // Listed under the write lock, so a file another connection adds
+        // meanwhile cannot be judged against a stale list and removed.
+        let tx = self.write_tx()?;
         let stale: Vec<String> = {
-            let mut stmt = self.conn.prepare("SELECT path FROM files")?;
+            let mut stmt = tx.prepare("SELECT path FROM files")?;
             let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
             rows.filter_map(Result::ok)
                 .filter(|path| !keep.contains(path))
@@ -522,7 +550,6 @@ impl Store {
         if stale.is_empty() {
             return Ok(0);
         }
-        let tx = self.write_tx()?;
         for path in &stale {
             Self::delete_file_rows(&tx, path)?;
         }
@@ -598,7 +625,8 @@ impl Store {
         created_at: &str,
         merged_at: &str,
     ) -> Result<()> {
-        self.conn.execute(
+        let tx = self.write_tx()?;
+        tx.execute(
             "INSERT INTO pull_requests
                  (number, title, body, merged, author, base_sha, head_sha, created_at, merged_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
@@ -616,6 +644,7 @@ impl Store {
                 merged_at
             ],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1900,6 +1929,174 @@ mod tests {
         }
         let store = repo.store();
         assert_eq!(store.all_files().unwrap().len(), THREADS * 40);
+    }
+
+    #[test]
+    fn an_opened_cache_runs_wal_with_normal_synchronous() {
+        // Under WAL, FULL syncs the log on every commit while holding the write
+        // lock. On a slow disk (a Windows CI runner) six threads committing in
+        // bursts then queue long enough for one to starve past its busy
+        // timeout. NORMAL (1) is safe under WAL and keeps the lock short.
+        let repo = TempRepo::new();
+        let store = repo.store();
+        let mode: String = store
+            .conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        let synchronous: i64 = store
+            .conn
+            .query_row("PRAGMA synchronous", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal");
+        assert_eq!(synchronous, 1, "NORMAL");
+    }
+
+    /// Hold the write lock on a second connection for `hold`, then commit,
+    /// while `write` runs on `store` with its busy handler switched OFF. That
+    /// is what SQLite does when it reports BUSY without consulting the handler
+    /// (and how Windows file locking tends to surface contention), so a write
+    /// that does not retry itself fails at once.
+    fn write_while_lock_is_held_and_busy_handler_is_off(
+        repo: &TempRepo,
+        hold: Duration,
+        write: impl FnOnce(&mut Store) -> Result<()>,
+    ) -> Duration {
+        let mut store = repo.store();
+        let holder = Connection::open(repo.0.join(".engram").join("engram.db")).unwrap();
+        holder.busy_timeout(BUSY_TIMEOUT).unwrap();
+        holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+        store.conn.busy_timeout(Duration::ZERO).unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(hold);
+            holder.execute_batch("COMMIT").unwrap();
+        });
+        let started = Instant::now();
+        write(&mut store).expect("a write waits for the lock instead of failing at once");
+        let waited = started.elapsed();
+        release.join().unwrap();
+        waited
+    }
+
+    #[test]
+    fn every_write_retries_when_sqlite_refuses_the_lock_without_waiting() {
+        const HOLD: Duration = Duration::from_millis(300);
+        let repo = TempRepo::new();
+        let mut waits = Vec::new();
+        {
+            let mut w = |name: &str, write: &dyn Fn(&mut Store) -> Result<()>| {
+                let waited =
+                    write_while_lock_is_held_and_busy_handler_is_off(&repo, HOLD, |s| write(s));
+                waits.push((name.to_owned(), waited));
+            };
+            w("upsert_files", &|s| s.upsert_files(&[file("a.rs")]));
+            w("replace_symbols_for_file", &|s| {
+                s.replace_symbols_for_file("a.rs", &[symbol("a.rs", "thing")])
+            });
+            w("clear_extracted", &|s| s.clear_extracted("a.rs"));
+            w("replace_imports_for_file", &|s| {
+                s.replace_imports_for_file("a.rs", &["b".to_owned()])
+            });
+            w("replace_cochange", &|s| s.replace_cochange(&[]));
+            w("update_recency", &|s| s.update_recency(&HashMap::new()));
+            w("upsert_vectors", &|s| {
+                s.upsert_vectors(&[("a.rs".into(), "h".into(), vec![0])])
+            });
+            w("invalidate_vector", &|s| s.invalidate_vector("a.rs"));
+            w("prune_vectors", &|s| s.prune_vectors(&HashSet::new()));
+            w("prune_chunk_vectors", &|s| {
+                s.prune_chunk_vectors(&HashSet::new())
+            });
+            w("prune_missing_files", &|s| {
+                s.prune_missing_files(&HashSet::new()).map(|_| ())
+            });
+            w("remove_path", &|s| s.remove_path("a.rs").map(|_| ()));
+            w("replace_pr_files", &|s| s.replace_pr_files(1, &[]));
+            w("replace_pr_commits", &|s| s.replace_pr_commits(1, &[]));
+            w("upsert_pull_request", &|s| {
+                s.upsert_pull_request(1, "t", "b", false, "a", "", "", "", "")
+            });
+        }
+        // The lock was held for HOLD each time, so a write that returned sooner
+        // cannot have waited for it (and would have had to fail instead).
+        for (name, waited) in waits {
+            assert!(
+                waited >= HOLD / 2,
+                "{name} returned after {waited:?} without waiting for the lock"
+            );
+        }
+    }
+
+    #[test]
+    fn no_write_starts_a_deferred_transaction() {
+        // A deferred transaction that reads and then writes is refused at once
+        // (SQLITE_BUSY_SNAPSHOT, never retried by the busy handler) when
+        // another connection commits in between. Every write goes through
+        // `write_tx` (BEGIN IMMEDIATE) or the open-time `in_immediate_tx`.
+        let source = include_str!("store.rs");
+        let production = source
+            .split("#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("production code precedes the tests");
+        for forbidden in [
+            ".unchecked_transaction(",
+            ".transaction()",
+            "TransactionBehavior::Deferred",
+            "TransactionBehavior::Exclusive",
+            "execute_batch(\"BEGIN\")",
+            "execute_batch(\"BEGIN TRANSACTION\")",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "store.rs must not use {forbidden}"
+            );
+        }
+        assert_eq!(
+            production.matches(".transaction_with_behavior(").count(),
+            1,
+            "`write_tx` is the one place a transaction object is created"
+        );
+    }
+
+    #[test]
+    fn writes_keep_succeeding_while_another_connection_commits_continuously() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        let repo = TempRepo::new();
+        let mut store = repo.store();
+        let stop = Arc::new(AtomicBool::new(false));
+        let committer = {
+            let stop = Arc::clone(&stop);
+            let path = repo.0.join(".engram").join("engram.db");
+            std::thread::spawn(move || {
+                let conn = Connection::open(path).unwrap();
+                conn.busy_timeout(BUSY_TIMEOUT).unwrap();
+                let mut n = 0u64;
+                while !stop.load(Ordering::SeqCst) {
+                    n += 1;
+                    conn.execute(
+                        "INSERT INTO meta (key, value) VALUES ('noise', ?1)
+                         ON CONFLICT(key) DO UPDATE SET value = ?1",
+                        params![n.to_string()],
+                    )
+                    .unwrap();
+                }
+            })
+        };
+        // Each of these reads before it writes; a deferred transaction would be
+        // refused as soon as the committer lands a commit between the two.
+        let result = (|| -> Result<()> {
+            for i in 0..150 {
+                let path = format!("f{i}.rs");
+                store.upsert_files(&[file(&path)])?;
+                store.replace_symbols_for_file(&path, &[symbol(&path, "thing")])?;
+                store.prune_missing_files(&HashSet::from([path.clone()]))?;
+                store.remove_path("nonexistent.rs")?;
+            }
+            Ok(())
+        })();
+        stop.store(true, Ordering::SeqCst);
+        committer.join().unwrap();
+        result.expect("no `database is locked`");
     }
 
     #[test]
