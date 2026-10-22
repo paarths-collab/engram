@@ -2026,41 +2026,82 @@ mod tests {
         }
     }
 
+    /// The production half of a source file: the text before the test module.
+    ///
+    /// CRLF is normalised first, so a Windows checkout (CRLF line endings)
+    /// splits at the same boundary as an LF one. Panics if the boundary is
+    /// missing, rather than silently scanning the test module too.
+    fn production_source(text: &str) -> String {
+        let normalised = text.replace("\r\n", "\n");
+        // Assembled from pieces so this module's own text never matches it.
+        let boundary = concat!("#[cfg(test)]\n", "mod tests {");
+        let at = normalised
+            .find(boundary)
+            .unwrap_or_else(|| panic!("source has no `{boundary}` test module boundary"));
+        normalised[..at].to_string()
+    }
+
+    /// Needles are assembled from pieces so this file's own literals never
+    /// match them, even if the scan ever reached the test module.
+    fn forbidden_needles() -> Vec<String> {
+        vec![
+            concat!(".unchecked_", "transaction(").to_string(),
+            concat!(".transaction", "()").to_string(),
+            concat!("TransactionBehavior::", "Deferred").to_string(),
+            concat!("TransactionBehavior::", "Exclusive").to_string(),
+            concat!("execute_batch(\"", "BEGIN", "\")").to_string(),
+            concat!("execute_batch(\"", "BEGIN TRANSACTION", "\")").to_string(),
+        ]
+    }
+
     #[test]
     fn no_write_starts_a_deferred_transaction() {
         // A deferred transaction that reads and then writes is refused at once
         // (SQLITE_BUSY_SNAPSHOT, never retried by the busy handler) when
         // another connection commits in between. Every write goes through
         // `write_tx` (BEGIN IMMEDIATE) or the open-time `in_immediate_tx`.
-        let source = include_str!("store.rs");
-        let production = source
-            .split("#[cfg(test)]\nmod tests {")
-            .next()
-            .expect("production code precedes the tests");
-        for forbidden in [
-            ".unchecked_transaction(",
-            ".transaction()",
-            "TransactionBehavior::Deferred",
-            "TransactionBehavior::Exclusive",
-            "execute_batch(\"BEGIN\")",
-            "execute_batch(\"BEGIN TRANSACTION\")",
-        ] {
+        let production = production_source(include_str!("store.rs"));
+        for forbidden in forbidden_needles() {
             assert!(
-                !production.contains(forbidden),
+                !production.contains(&forbidden),
                 "store.rs must not use {forbidden}"
             );
         }
+        let create = concat!(".transaction_with_behavior", "(");
         assert_eq!(
-            production.matches(".transaction_with_behavior(").count(),
+            production.matches(create).count(),
             1,
             "`write_tx` is the one place a transaction object is created"
         );
     }
 
     #[test]
+    fn production_source_splits_the_same_for_lf_and_crlf() {
+        let lf = include_str!("store.rs").replace("\r\n", "\n");
+        let crlf = lf.replace('\n', "\r\n");
+        assert!(crlf.contains("\r\n") && !crlf.replace("\r\n", "").contains('\r'));
+        assert_eq!(production_source(&crlf), production_source(&lf));
+        assert!(production_source(&lf).len() < lf.len());
+
+        // A fixture whose only forbidden text sits in its test module.
+        let fixture = concat!(
+            "fn a() {}\r\n",
+            "#[cfg(test)]\r\n",
+            "mod tests {\r\n",
+            "    const X: &str = \".unchecked_transaction(\";\r\n",
+            "}\r\n"
+        );
+        assert_eq!(production_source(fixture), "fn a() {}\n");
+    }
+
+    #[test]
     fn writes_keep_succeeding_while_another_connection_commits_continuously() {
         use std::sync::atomic::AtomicBool;
         use std::sync::Arc;
+        // The competitor is bounded in commits and the wait for it is bounded
+        // in time: contention is what matters here, not volume.
+        const MAX_COMMITS: u64 = 400;
+        const COMMITTER_DEADLINE: Duration = Duration::from_secs(60);
         let repo = TempRepo::new();
         let mut store = repo.store();
         let stop = Arc::new(AtomicBool::new(false));
@@ -2070,15 +2111,24 @@ mod tests {
             std::thread::spawn(move || {
                 let conn = Connection::open(path).unwrap();
                 conn.busy_timeout(BUSY_TIMEOUT).unwrap();
-                let mut n = 0u64;
-                while !stop.load(Ordering::SeqCst) {
-                    n += 1;
+                // SQLite gives no lock fairness: a waiter polls inside its busy
+                // handler, so a connection that re-takes the write lock straight
+                // after every commit can starve it past BUSY_TIMEOUT. Real
+                // writers do not commit back to back, so this one yields after
+                // each commit (a short sleep plus yield_now) and stops after
+                // a bounded number of commits.
+                for n in 1..=MAX_COMMITS {
+                    if stop.load(Ordering::SeqCst) {
+                        break;
+                    }
                     conn.execute(
                         "INSERT INTO meta (key, value) VALUES ('noise', ?1)
                          ON CONFLICT(key) DO UPDATE SET value = ?1",
                         params![n.to_string()],
                     )
                     .unwrap();
+                    std::thread::sleep(Duration::from_millis(2));
+                    std::thread::yield_now();
                 }
             })
         };
@@ -2095,8 +2145,18 @@ mod tests {
             Ok(())
         })();
         stop.store(true, Ordering::SeqCst);
-        committer.join().unwrap();
+        // Bounded wait: the committer is finite, but never let a stuck thread
+        // hang the whole test binary.
+        let started = std::time::Instant::now();
+        while !committer.is_finished() {
+            assert!(
+                started.elapsed() < COMMITTER_DEADLINE,
+                "competing committer did not finish within {COMMITTER_DEADLINE:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         result.expect("no `database is locked`");
+        committer.join().expect("competing committer panicked");
     }
 
     #[test]
