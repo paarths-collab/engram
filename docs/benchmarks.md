@@ -19,20 +19,22 @@ and only used when the agent has no concrete anchor file yet.
 Engram's deterministic graph — the co-change table (a fact recorded from git
 history) and the import graph (a fact derived from static analysis) — recover
 the *other* files that actually changed with it? There is no language model,
-no ranking heuristic, and no guessing involved: `find_connected_files` returns
+no ranking heuristic, and no guessing involved: `expand_connections` returns
 only files linked to the anchor by a concrete, already-recorded edge. This is
 fact-finding, not prediction — directly testing the concern that a
 prediction-based approach could be the weak link.
 
-**Leakage-free by construction:** for each evaluation, the co-change graph is
-built *only* from the `--history-commits` commits strictly older than the
-`--eval-commits` evaluation window. It is architecturally incapable of seeing
-the future commit it's being asked to recover.
+**Temporal split for the co-change graph:** for each evaluation, the co-change
+graph is built *only* from the `--history-commits` commits strictly older than
+the `--eval-commits` evaluation window, so it cannot see the commit it is asked
+to recover. This leakage-free guarantee applies to the historical co-change
+split only. The import graph (and the file inventory) is built at the current
+HEAD of the evaluated repo, so it is not temporally split.
 
 **Method:** for each of the newest `--eval-commits` commits (non-merge, 2–8
 still-indexed changed files), take the alphabetically-first changed file as
-the anchor and the rest as held-out targets. Call `find_connected_files` with
-only the anchor. Score whether the returned candidates recover the targets.
+the anchor and the rest as held-out targets. Call `expand_connections` with
+only the anchor in `paths`. Score whether the returned candidates recover the targets.
 
 ### Result — langchain-ai/langchain
 
@@ -54,18 +56,25 @@ actually changed alongside it**, from git-history and import-graph facts
 alone — no text, no LLM, no guessing. Co-change and import graph are
 complementary (roughly additive when combined), the same fusion principle as
 Benchmark 1, but here it's fusing *facts* rather than fuzzy signals. This is
-the number that matters most for the product: it's what `find_connected_files`
+the number that matters most for the product: it's what `expand_connections`
 does whenever the agent already knows which file it's touching (the common
-case — most tasks start from an existing file or diff, per the CLI's
-`engram impact --diff current`).
+case — most tasks start from an existing file or diff). To run the same
+expansion for a diff, call `expand_connections` with the diff's changed files as
+`paths`.
 
 ### Reproducing
 
 ```bash
 git clone --depth 500 https://github.com/langchain-ai/langchain.git /tmp/langchain
+# Optional: pin the upstream state by checking out a fixed SHA, since the clone
+# follows the moving default branch and results will drift over time.
+# git -C /tmp/langchain checkout <SHA>
 cargo run --release -p engram-evals -- --repo /tmp/langchain \
   --eval-commits 200 --history-commits 300
 ```
+
+The clone tracks langchain's default branch, which moves. Without a pinned SHA,
+the reproduced numbers will not match the ones above.
 
 ---
 
@@ -110,7 +119,8 @@ product number. Benchmark 2 is the more trustworthy evidence.
   commits whose changed file (a lockfile) the title never mentions — no
   content-based method can predict those, and averaging them in drags every
   method toward the floor.
-- The vector backend is still the placeholder hashed-ngram embedder; real
+- The vector backend is still the default hashed-ngram embedder (lexical/subword,
+  not a learned semantic model); real
   embeddings (fastembed-rs, behind the existing `Embedder` trait) should lift
   vector and hybrid further.
 

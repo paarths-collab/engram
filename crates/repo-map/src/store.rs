@@ -1,14 +1,51 @@
 //! SQLite persistence for the repo map. Single-file DB in .engram/engram.db.
 //! Tracks which files are extracted to Tier-1 so retrieval can lazily extract on miss.
 
+use crate::inventory::ScannedFile;
 use anyhow::Result;
 use engram_domain::{
     CoChange, FileRecord, IngestedComment, Language, PrCommit, PrFileChange, ReviewComment,
     SymbolKind, SymbolRecord,
 };
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
 use std::path::Path;
+use std::time::{Duration, Instant};
+
+/// How long a connection waits for another writer's lock before giving up with
+/// "database is locked". Indexing, the file watcher and request handlers each
+/// open their own connection to the same file, so brief contention is normal.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Whether `e` is SQLite saying another connection holds a lock it needs
+/// (`SQLITE_BUSY` / `SQLITE_LOCKED`).
+fn is_lock_contention(e: &anyhow::Error) -> bool {
+    matches!(
+        e.downcast_ref::<rusqlite::Error>(),
+        Some(rusqlite::Error::SqliteFailure(f, _))
+            if matches!(
+                f.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+    )
+}
+
+/// Run `attempt` until it succeeds, fails for a reason other than lock
+/// contention, or `deadline` passes. The busy timeout does not cover every
+/// case (a journal-mode switch, or a lock upgrade that would deadlock, is
+/// refused at once), so those are retried here with a short, growing sleep.
+fn retry_while_busy<T>(deadline: Instant, mut attempt: impl FnMut() -> Result<T>) -> Result<T> {
+    let mut pause = Duration::from_millis(1);
+    loop {
+        match attempt() {
+            Err(e) if is_lock_contention(&e) && Instant::now() < deadline => {
+                std::thread::sleep(pause);
+                pause = (pause * 2).min(Duration::from_millis(50));
+            }
+            other => return other,
+        }
+    }
+}
 
 /// Identity of one embedded chunk: the file, and the one-based line its span
 /// starts at. `0` is reserved for the whole-file fallback used when a file has
@@ -19,22 +56,85 @@ pub struct Store {
     pub conn: Connection,
 }
 
+/// Version of everything that decides what extraction produces from a file:
+/// the parsers and their queries, which files the inventory includes (ignore
+/// rules, extension list, size cap). Bump it by hand whenever any of those
+/// change. On open, a database written under a different version has all its
+/// derived data (symbols, imports, vectors) discarded and every file marked
+/// for re-extraction, and the snapshot id changes with it.
+pub const PARSER_CONFIG_VERSION: u32 = 1;
+
+const PARSER_VERSION_KEY: &str = "parser_config_version";
+
 impl Store {
     pub fn open(repo_root: &Path) -> Result<Self> {
+        Self::open_with_parser_version(repo_root, PARSER_CONFIG_VERSION)
+    }
+
+    /// [`Store::open`] under an explicit parser/config version. Exists so the
+    /// invalidation on a version change can be tested without editing the
+    /// constant.
+    pub fn open_with_parser_version(repo_root: &Path, parser_version: u32) -> Result<Self> {
         let dir = repo_root.join(".engram");
         std::fs::create_dir_all(&dir)?;
         let conn = Connection::open(dir.join("engram.db"))?;
-        conn.execute_batch(
-            r#"
-            PRAGMA journal_mode = WAL;
-            PRAGMA busy_timeout = 5000;
+        // First, before any statement: switching to WAL and creating the schema
+        // both need a lock another connection may hold at this very moment.
+        conn.busy_timeout(BUSY_TIMEOUT)?;
+        // Several connections open a brand-new cache at the same moment (the
+        // index thread, the watcher, the request handler). SQLite reports
+        // SQLITE_BUSY at once, without consulting the busy timeout, when two of
+        // them race to switch the journal mode or when a lock upgrade could
+        // deadlock, so both steps below are retried until this deadline.
+        let journal_mode: String = retry_while_busy(Instant::now() + BUSY_TIMEOUT, || {
+            conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get::<_, String>(0))
+                .map_err(anyhow::Error::from)
+        })?;
+        // Every commit syncs the disk. In WAL mode the default (FULL) syncs the
+        // log on each one, and the write lock is held through that sync: on a
+        // slow disk (a Windows CI runner's temp dir) a burst of small commits
+        // from several connections queues behind it for seconds, and the
+        // busy handler's polling is not fair, so one waiter can be starved
+        // past its timeout. NORMAL syncs at checkpoints instead. In WAL mode
+        // that cannot corrupt the file; the most a power cut costs is the last
+        // few commits of a cache that is rebuilt from the repository anyway.
+        // It is a per-connection setting that takes no lock. Only under WAL:
+        // with a rollback journal NORMAL could corrupt on a power cut.
+        if journal_mode.eq_ignore_ascii_case("wal") {
+            conn.pragma_update(None, "synchronous", "NORMAL")?;
+        }
+        // Schema, migrations and the version check are one write transaction:
+        // an opener that loses the race waits on the busy handler for the
+        // winner's commit and then finds everything already in place. Its own
+        // deadline, so a slow journal-mode switch does not eat its patience.
+        retry_while_busy(Instant::now() + BUSY_TIMEOUT, || {
+            Self::initialise(&conn, parser_version)
+        })?;
+        Ok(Store { conn })
+    }
+
+    /// Create the schema, migrate an older database, and reconcile the parser
+    /// version, all inside one `BEGIN IMMEDIATE` transaction. Everything here
+    /// is idempotent, and the stored version is re-read inside the
+    /// transaction, so concurrent first-opens initialise exactly once and none
+    /// of them repeats or undoes another's work.
+    fn initialise(conn: &Connection, parser_version: u32) -> Result<()> {
+        Self::in_immediate_tx(conn, |conn| {
+            conn.execute_batch(
+                r#"
             CREATE TABLE IF NOT EXISTS files (
                 path TEXT PRIMARY KEY,
                 language TEXT NOT NULL,
                 size_bytes INTEGER NOT NULL,
                 is_test INTEGER NOT NULL,
                 tier1_done INTEGER NOT NULL DEFAULT 0,
-                last_commit_ts INTEGER
+                last_commit_ts INTEGER,
+                mtime_ns INTEGER,
+                content_hash TEXT
+            );
+            CREATE TABLE IF NOT EXISTS meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS symbols (
                 id INTEGER PRIMARY KEY,
@@ -128,9 +228,99 @@ impl Store {
             CREATE INDEX IF NOT EXISTS idx_review_comments_path ON review_comments(path);
             CREATE INDEX IF NOT EXISTS idx_review_comments_pr ON review_comments(pr_number);
             "#,
+            )?;
+            Self::migrate(conn);
+            Self::reset_derived_data_on_mismatch(conn, parser_version)
+        })
+    }
+
+    /// Run `body` inside `BEGIN IMMEDIATE ... COMMIT`, rolling back when it (or
+    /// the commit) fails. Taking the write lock up front makes a contended
+    /// opener wait on the busy handler instead of failing at a lock upgrade.
+    fn in_immediate_tx(
+        conn: &Connection,
+        body: impl FnOnce(&Connection) -> Result<()>,
+    ) -> Result<()> {
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        match body(conn).and_then(|()| conn.execute_batch("COMMIT").map_err(Into::into)) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
+    /// Discard derived data if the database was written under a different
+    /// parser/config version (see [`PARSER_CONFIG_VERSION`]). A brand-new
+    /// database has nothing to discard and just records the version.
+    ///
+    /// Runs inside the open-time `BEGIN IMMEDIATE` transaction (see
+    /// [`Store::initialise`]), and the stored value is read inside it: of
+    /// several connections that opened at the same moment and all saw the
+    /// mismatch, only the first to take the write lock wipes; the rest find the
+    /// version already updated and must not discard what the first has since
+    /// written. The wipe and the version bump commit together, so a crash
+    /// midway cannot leave the derived data wiped but the old version recorded,
+    /// which would trust the empty tables.
+    fn reset_derived_data_on_mismatch(conn: &Connection, version: u32) -> Result<()> {
+        if Self::stored_parser_version(conn)?.as_deref() == Some(version.to_string().as_str()) {
+            return Ok(());
+        }
+        conn.execute_batch(
+            "DELETE FROM symbols;
+             DELETE FROM file_imports;
+             DELETE FROM vectors;
+             DELETE FROM chunk_vectors;
+             UPDATE files SET tier1_done = 0;",
         )?;
-        Self::migrate(&conn);
-        Ok(Store { conn })
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = ?2",
+            params![PARSER_VERSION_KEY, version.to_string()],
+        )?;
+        Ok(())
+    }
+
+    fn stored_parser_version(conn: &Connection) -> Result<Option<String>> {
+        Ok(conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                params![PARSER_VERSION_KEY],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// [`Store::reset_derived_data_on_mismatch`] in a transaction of its own,
+    /// for tests that drive it on a connection that is not being opened.
+    #[cfg(test)]
+    fn reset_if_still_mismatched(conn: &Connection, version: u32) -> Result<()> {
+        Self::in_immediate_tx(conn, |conn| {
+            Self::reset_derived_data_on_mismatch(conn, version)
+        })
+    }
+
+    /// A write transaction that takes the write lock up front. A deferred one
+    /// that reads first and writes later fails at the upgrade with an immediate
+    /// "database is locked" (the busy timeout does not apply) whenever another
+    /// connection committed in between; taking the lock first waits instead.
+    ///
+    /// Even so, taking the lock can be refused at once with no wait (SQLite
+    /// does not consult the busy handler for every lock state, and Windows file
+    /// locking reaches those states more readily than POSIX does). So the lock
+    /// is first probed under [`retry_while_busy`], which sleeps and tries again
+    /// until a deadline; the real `BEGIN IMMEDIATE` follows it, still covered
+    /// by the busy handler.
+    fn write_tx(&mut self) -> Result<rusqlite::Transaction<'_>> {
+        retry_while_busy(Instant::now() + BUSY_TIMEOUT, || {
+            self.conn.execute_batch("BEGIN IMMEDIATE")?;
+            self.conn.execute_batch("ROLLBACK")?;
+            Ok(())
+        })?;
+        Ok(self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?)
     }
 
     /// Bring a database created by an older Engram up to the current schema.
@@ -142,6 +332,26 @@ impl Store {
     fn migrate(conn: &Connection) {
         // Predates recency tracking.
         let _ = conn.execute("ALTER TABLE files ADD COLUMN last_commit_ts INTEGER", []);
+
+        // Predates the per-file fingerprint. The ALTER succeeds exactly once, on
+        // a DB whose cached symbols and imports were never checked against the
+        // file on disk; distrust them all so each file re-extracts once rather
+        // than serving whatever an old run (or an offline edit) left behind.
+        if conn
+            .execute("ALTER TABLE files ADD COLUMN mtime_ns INTEGER", [])
+            .is_ok()
+        {
+            let _ = conn.execute("UPDATE files SET tier1_done = 0", []);
+        }
+
+        // Predates content hashing. Same reasoning as above: with no stored
+        // hash there is nothing to compare an on-disk file against.
+        if conn
+            .execute("ALTER TABLE files ADD COLUMN content_hash TEXT", [])
+            .is_ok()
+        {
+            let _ = conn.execute("UPDATE files SET tier1_done = 0", []);
+        }
 
         // Symbols predating span tracking have no end_line, and a stored zero
         // is indistinguishable from a real span. The ALTER succeeds exactly
@@ -182,7 +392,7 @@ impl Store {
     /// Store the last-commit unix timestamp for files touched in git history.
     /// Paths not present in the files table are silently skipped.
     pub fn update_recency(&mut self, recency: &HashMap<String, i64>) -> Result<()> {
-        let tx = self.conn.transaction()?;
+        let tx = self.write_tx()?;
         for (path, ts) in recency {
             tx.execute(
                 "UPDATE files SET last_commit_ts = ?2 WHERE path = ?1",
@@ -217,7 +427,7 @@ impl Store {
 
     /// Upsert embeddings: `(path, content_hash, raw_bytes)`.
     pub fn upsert_vectors(&mut self, rows: &[(String, String, Vec<u8>)]) -> Result<()> {
-        let tx = self.conn.transaction()?;
+        let tx = self.write_tx()?;
         for (path, hash, data) in rows {
             tx.execute(
                 "INSERT INTO vectors (path, hash, data) VALUES (?1, ?2, ?3)
@@ -233,10 +443,10 @@ impl Store {
     /// build. Clears the chunk vectors too: the file's symbols have moved, so
     /// every span keyed to an old line number is stale.
     pub fn invalidate_vector(&mut self, path: &str) -> Result<()> {
-        self.conn
-            .execute("DELETE FROM vectors WHERE path = ?1", params![path])?;
-        self.conn
-            .execute("DELETE FROM chunk_vectors WHERE path = ?1", params![path])?;
+        let tx = self.write_tx()?;
+        tx.execute("DELETE FROM vectors WHERE path = ?1", params![path])?;
+        tx.execute("DELETE FROM chunk_vectors WHERE path = ?1", params![path])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -259,7 +469,7 @@ impl Store {
         &mut self,
         rows: &[(String, usize, String, Vec<u8>)],
     ) -> Result<()> {
-        let tx = self.conn.transaction()?;
+        let tx = self.write_tx()?;
         for (path, start_line, hash, data) in rows {
             tx.execute(
                 "INSERT INTO chunk_vectors (path, start_line, hash, data) VALUES (?1, ?2, ?3, ?4)
@@ -277,16 +487,14 @@ impl Store {
         &mut self,
         keep: &std::collections::HashSet<ChunkKey>,
     ) -> Result<()> {
+        let tx = self.write_tx()?;
         let existing: Vec<ChunkKey> = {
-            let mut stmt = self
-                .conn
-                .prepare("SELECT path, start_line FROM chunk_vectors")?;
+            let mut stmt = tx.prepare("SELECT path, start_line FROM chunk_vectors")?;
             let rows = stmt.query_map([], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as usize))
             })?;
             rows.filter_map(Result::ok).collect()
         };
-        let tx = self.conn.transaction()?;
         for key in existing {
             if !keep.contains(&key) {
                 tx.execute(
@@ -301,12 +509,12 @@ impl Store {
 
     /// Drop cached embeddings for files no longer present in the repo.
     pub fn prune_vectors(&mut self, keep: &std::collections::HashSet<String>) -> Result<()> {
+        let tx = self.write_tx()?;
         let existing: Vec<String> = {
-            let mut stmt = self.conn.prepare("SELECT path FROM vectors")?;
+            let mut stmt = tx.prepare("SELECT path FROM vectors")?;
             let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
             rows.filter_map(Result::ok).collect()
         };
-        let tx = self.conn.transaction()?;
         for path in existing {
             if !keep.contains(&path) {
                 tx.execute("DELETE FROM vectors WHERE path = ?1", params![path])?;
@@ -329,8 +537,11 @@ impl Store {
         &mut self,
         keep: &std::collections::HashSet<String>,
     ) -> Result<usize> {
+        // Listed under the write lock, so a file another connection adds
+        // meanwhile cannot be judged against a stale list and removed.
+        let tx = self.write_tx()?;
         let stale: Vec<String> = {
-            let mut stmt = self.conn.prepare("SELECT path FROM files")?;
+            let mut stmt = tx.prepare("SELECT path FROM files")?;
             let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
             rows.filter_map(Result::ok)
                 .filter(|path| !keep.contains(path))
@@ -339,15 +550,61 @@ impl Store {
         if stale.is_empty() {
             return Ok(0);
         }
-        let tx = self.conn.transaction()?;
         for path in &stale {
-            tx.execute("DELETE FROM files WHERE path = ?1", params![path])?;
-            tx.execute("DELETE FROM symbols WHERE path = ?1", params![path])?;
-            tx.execute("DELETE FROM file_imports WHERE path = ?1", params![path])?;
-            tx.execute("DELETE FROM chunk_vectors WHERE path = ?1", params![path])?;
+            Self::delete_file_rows(&tx, path)?;
         }
         tx.commit()?;
         Ok(stale.len())
+    }
+
+    /// Delete everything derived from a file's contents, keeping its `files`
+    /// row: symbols, import edges, and embeddings.
+    fn delete_derived_rows(tx: &rusqlite::Transaction<'_>, path: &str) -> Result<()> {
+        tx.execute("DELETE FROM symbols WHERE path = ?1", params![path])?;
+        tx.execute("DELETE FROM file_imports WHERE path = ?1", params![path])?;
+        tx.execute("DELETE FROM vectors WHERE path = ?1", params![path])?;
+        tx.execute("DELETE FROM chunk_vectors WHERE path = ?1", params![path])?;
+        Ok(())
+    }
+
+    /// Delete every row that belongs to one file.
+    fn delete_file_rows(tx: &rusqlite::Transaction<'_>, path: &str) -> Result<()> {
+        tx.execute("DELETE FROM files WHERE path = ?1", params![path])?;
+        Self::delete_derived_rows(tx, path)
+    }
+
+    /// Remove every trace of one file, and of anything beneath it should
+    /// `path` have been a directory (a renamed or deleted directory reaches the
+    /// watcher as one event for the directory, not one per file).
+    ///
+    /// Everything beneath a directory is matched with an index range
+    /// (`dir/` <= path < `dir0`, since `0` is the character after `/`), so a
+    /// removal costs a seek rather than a scan of every indexed file. Rows for
+    /// the exact path are cleaned even when its `files` row is already gone, so
+    /// rows orphaned by an older Engram do not survive a removal.
+    ///
+    /// Returns the number of rows deleted across all tables; zero means the
+    /// index did not change.
+    pub fn remove_path(&mut self, path: &str) -> Result<usize> {
+        let dir = path.trim_end_matches('/');
+        let range_start = format!("{dir}/");
+        let range_end = format!("{dir}0");
+        let tx = self.write_tx()?;
+        let mut removed = 0;
+        for table in [
+            "files",
+            "symbols",
+            "file_imports",
+            "vectors",
+            "chunk_vectors",
+        ] {
+            removed += tx.execute(
+                &format!("DELETE FROM {table} WHERE path = ?1 OR (path >= ?2 AND path < ?3)"),
+                params![dir, range_start, range_end],
+            )?;
+        }
+        tx.commit()?;
+        Ok(removed)
     }
 
     /// Upsert a pull request row.
@@ -368,7 +625,8 @@ impl Store {
         created_at: &str,
         merged_at: &str,
     ) -> Result<()> {
-        self.conn.execute(
+        let tx = self.write_tx()?;
+        tx.execute(
             "INSERT INTO pull_requests
                  (number, title, body, merged, author, base_sha, head_sha, created_at, merged_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
@@ -386,12 +644,13 @@ impl Store {
                 merged_at
             ],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
     /// Replace the changed files recorded for a PR, including their diffs.
     pub fn replace_pr_files(&mut self, pr_number: i64, files: &[PrFileChange]) -> Result<()> {
-        let tx = self.conn.transaction()?;
+        let tx = self.write_tx()?;
         tx.execute(
             "DELETE FROM pr_files WHERE pr_number = ?1",
             params![pr_number],
@@ -417,7 +676,7 @@ impl Store {
 
     /// Replace the commit list recorded for a PR.
     pub fn replace_pr_commits(&mut self, pr_number: i64, commits: &[PrCommit]) -> Result<()> {
-        let tx = self.conn.transaction()?;
+        let tx = self.write_tx()?;
         tx.execute(
             "DELETE FROM pr_commits WHERE pr_number = ?1",
             params![pr_number],
@@ -447,7 +706,7 @@ impl Store {
         pr_number: i64,
         comments: &[IngestedComment],
     ) -> Result<()> {
-        let tx = self.conn.transaction()?;
+        let tx = self.write_tx()?;
         tx.execute(
             "DELETE FROM review_comments WHERE pr_number = ?1",
             params![pr_number],
@@ -524,6 +783,8 @@ impl Store {
     }
 
     /// All ingested review comments, joined with their PR's title/merged status.
+    /// Ordered by `pr_number, path, line, created_at` (then body, author, id as
+    /// final tie-breaks), never by insertion order.
     pub fn all_review_comments(&self) -> Result<Vec<ReviewComment>> {
         self.query_review_comments("1=1", params![])
     }
@@ -542,7 +803,8 @@ impl Store {
             "SELECT rc.pr_number, pr.title, pr.merged, rc.path, rc.line, rc.body, rc.author,
                     rc.created_at, rc.diff_hunk
              FROM review_comments rc JOIN pull_requests pr ON pr.number = rc.pr_number
-             WHERE {where_clause}"
+             WHERE {where_clause}
+             ORDER BY rc.pr_number, rc.path, rc.line, rc.created_at, rc.body, rc.author, rc.id"
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(p, |r| {
@@ -565,7 +827,7 @@ impl Store {
     /// Replace the import targets recorded for a file. Targets are normalized
     /// (see [`crate::imports::normalize_target`]) before storage; empties dropped.
     pub fn replace_imports_for_file(&mut self, path: &str, targets: &[String]) -> Result<()> {
-        let tx = self.conn.transaction()?;
+        let tx = self.write_tx()?;
         tx.execute("DELETE FROM file_imports WHERE path = ?1", params![path])?;
         for raw in targets {
             let target = crate::imports::normalize_target(raw);
@@ -618,19 +880,76 @@ impl Store {
         Ok(rows.filter_map(Result::ok).collect())
     }
 
+    /// Upsert files whose modification time is unknown. A size change still
+    /// invalidates extraction; see [`Store::upsert_scanned`].
     pub fn upsert_files(&mut self, files: &[FileRecord]) -> Result<()> {
-        let tx = self.conn.transaction()?;
-        for f in files {
+        let scanned: Vec<(FileRecord, Option<i64>)> =
+            files.iter().cloned().map(|f| (f, None)).collect();
+        self.upsert_scanned(&scanned)
+    }
+
+    /// Upsert files with their modification times but no content hash.
+    pub fn upsert_scanned(&mut self, files: &[(FileRecord, Option<i64>)]) -> Result<()> {
+        let scanned: Vec<ScannedFile> = files
+            .iter()
+            .map(|(record, mtime_ns)| ScannedFile {
+                record: record.clone(),
+                mtime_ns: *mtime_ns,
+                content_hash: None,
+            })
+            .collect();
+        self.upsert_fingerprinted(&scanned)
+    }
+
+    /// Upsert inventoried files with their full fingerprint.
+    ///
+    /// A file is *changed* when its size differs from what is stored, or the
+    /// new mtime differs, or the new content hash differs. Unknown values on
+    /// the new side (`None`) never count as a change on their own, but a
+    /// stored NULL against a known value does: a row from before a
+    /// fingerprint existed has never been verified, so it is re-extracted once.
+    ///
+    /// For a changed file every derived row (symbols, imports, vectors, chunk
+    /// vectors) is deleted and `tier1_done` reset, so the old contents can
+    /// neither be served nor mistaken for current.
+    pub fn upsert_fingerprinted(&mut self, files: &[ScannedFile]) -> Result<()> {
+        use rusqlite::OptionalExtension;
+        let tx = self.write_tx()?;
+        for scanned in files {
+            let f = &scanned.record;
+            let old: Option<(i64, Option<i64>, Option<String>)> = tx
+                .query_row(
+                    "SELECT size_bytes, mtime_ns, content_hash FROM files WHERE path = ?1",
+                    params![f.path],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?;
+            let changed = old.is_some_and(|(size, mtime, hash)| {
+                size != f.size_bytes as i64
+                    || (scanned.mtime_ns.is_some() && mtime != scanned.mtime_ns)
+                    || (scanned.content_hash.is_some() && hash != scanned.content_hash)
+            });
+            if changed {
+                Self::delete_derived_rows(&tx, &f.path)?;
+            }
             tx.execute(
-                "INSERT INTO files (path, language, size_bytes, is_test)
-                 VALUES (?1, ?2, ?3, ?4)
+                "INSERT INTO files (path, language, size_bytes, is_test, mtime_ns, content_hash)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT(path) DO UPDATE SET
-                   language=?2, size_bytes=?3, is_test=?4",
+                   language=?2,
+                   is_test=?4,
+                   tier1_done = CASE WHEN ?7 THEN 0 ELSE tier1_done END,
+                   size_bytes=?3,
+                   mtime_ns=COALESCE(?5, mtime_ns),
+                   content_hash=COALESCE(?6, content_hash)",
                 params![
                     f.path,
                     f.language.as_str(),
                     f.size_bytes as i64,
-                    f.is_test as i64
+                    f.is_test as i64,
+                    scanned.mtime_ns,
+                    scanned.content_hash,
+                    changed
                 ],
             )?;
         }
@@ -638,8 +957,61 @@ impl Store {
         Ok(())
     }
 
+    /// A stable id for exactly what is indexed: the checked-out commit (`head`),
+    /// the parser/config version, and every indexed file's path and content
+    /// hash. Identical content at the same commit gives the same id regardless
+    /// of mtimes or checkout location; any content, path, or version
+    /// difference gives a different one.
+    pub fn snapshot_id(&self, head: &str) -> Result<String> {
+        use crate::inventory::Fnv64;
+        let version: String = self
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                params![PARSER_VERSION_KEY],
+                |r| r.get(0),
+            )
+            .unwrap_or_else(|_| PARSER_CONFIG_VERSION.to_string());
+        let mut hasher = Fnv64::default();
+        // 0xff cannot occur in UTF-8, so fields cannot run into each other.
+        let mut field = |s: &str| {
+            hasher.write(s.as_bytes());
+            hasher.write(&[0xff]);
+        };
+        field("engram-snapshot-v1");
+        field(head);
+        field(&version);
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path, content_hash FROM files ORDER BY path")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+        })?;
+        for row in rows {
+            let (path, hash) = row?;
+            field(&path);
+            field(hash.as_deref().unwrap_or(""));
+        }
+        Ok(hasher.finish_hex())
+    }
+
+    /// Drop a file's stored symbols and imports without marking it extracted,
+    /// for when its contents can no longer be read: the old rows describe text
+    /// that is gone, and the file should be retried rather than trusted empty.
+    pub fn clear_extracted(&mut self, path: &str) -> Result<()> {
+        let tx = self.write_tx()?;
+        tx.execute("DELETE FROM symbols WHERE path = ?1", params![path])?;
+        tx.execute("DELETE FROM file_imports WHERE path = ?1", params![path])?;
+        tx.execute(
+            "UPDATE files SET tier1_done = 0 WHERE path = ?1",
+            params![path],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn replace_symbols_for_file(&mut self, path: &str, symbols: &[SymbolRecord]) -> Result<()> {
-        let tx = self.conn.transaction()?;
+        let tx = self.write_tx()?;
         tx.execute("DELETE FROM symbols WHERE path = ?1", params![path])?;
         for s in symbols {
             tx.execute(
@@ -664,7 +1036,7 @@ impl Store {
     }
 
     pub fn replace_cochange(&mut self, edges: &[CoChange]) -> Result<()> {
-        let tx = self.conn.transaction()?;
+        let tx = self.write_tx()?;
         tx.execute("DELETE FROM cochange", [])?;
         for e in edges {
             tx.execute(
@@ -688,10 +1060,11 @@ impl Store {
             .unwrap_or(false)
     }
 
+    /// Every indexed file, ordered by path so callers never depend on insertion order.
     pub fn all_files(&self) -> Result<Vec<FileRecord>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT path, language, size_bytes, is_test FROM files")?;
+            .prepare("SELECT path, language, size_bytes, is_test FROM files ORDER BY path")?;
         let rows = stmt.query_map([], |r| {
             Ok(FileRecord {
                 path: r.get(0)?,
@@ -754,6 +1127,28 @@ impl Store {
             })
         })?;
         Ok(rows.filter_map(Result::ok).collect())
+    }
+
+    /// The single directed co-change row `a -> b`, looked up by primary key.
+    /// Unlike [`Store::cochange_for`] this is not ranked or capped, so a weak
+    /// pair is found as reliably as a strong one. `b -> a` is a separate row.
+    pub fn cochange_pair(&self, a: &str, b: &str) -> Result<Option<CoChange>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT path_a, path_b, count, strength FROM cochange
+                 WHERE path_a = ?1 AND path_b = ?2",
+                params![a, b],
+                |r| {
+                    Ok(CoChange {
+                        path_a: r.get(0)?,
+                        path_b: r.get(1)?,
+                        count: r.get::<_, i64>(2)? as u32,
+                        strength: r.get(3)?,
+                    })
+                },
+            )
+            .optional()?)
     }
 }
 
@@ -1050,6 +1445,77 @@ mod tests {
     }
 
     #[test]
+    fn all_files_and_review_comments_ignore_insertion_order() {
+        let comment = |path: &str, line: Option<i64>, created_at: &str| IngestedComment {
+            path: path.to_owned(),
+            line,
+            body: format!("{path}:{line:?}:{created_at}"),
+            author: "bob".to_owned(),
+            created_at: created_at.to_owned(),
+            ..Default::default()
+        };
+        let build = |files: &[&str], prs: &[i64]| {
+            let repo = TempRepo::new();
+            let mut store = repo.store();
+            let records: Vec<_> = files.iter().map(|f| file(f)).collect();
+            store.upsert_files(&records).unwrap();
+            for &pr in prs {
+                store
+                    .upsert_pull_request(pr, "t", "", true, "alice", "", "", "", "")
+                    .unwrap();
+                store
+                    .replace_review_comments_for_pr(
+                        pr,
+                        &[
+                            comment("b.rs", Some(9), "2026-01-02"),
+                            comment("a.rs", Some(30), "2026-01-01"),
+                            comment("a.rs", Some(4), "2026-01-03"),
+                            comment("a.rs", Some(4), "2026-01-01"),
+                        ],
+                    )
+                    .unwrap();
+            }
+            let paths: Vec<String> = store
+                .all_files()
+                .unwrap()
+                .into_iter()
+                .map(|f| f.path)
+                .collect();
+            let comments: Vec<(i64, String, Option<i64>, String)> = store
+                .all_review_comments()
+                .unwrap()
+                .into_iter()
+                .map(|c| (c.pr_number, c.path, c.line, c.created_at))
+                .collect();
+            let for_path: Vec<String> = store
+                .review_comments_for_path("a.rs")
+                .unwrap()
+                .into_iter()
+                .map(|c| c.body)
+                .collect();
+            (paths, comments, for_path)
+        };
+        let forward = build(&["a.rs", "b.rs", "c.rs"], &[1, 2, 3]);
+        let reverse = build(&["c.rs", "b.rs", "a.rs"], &[3, 2, 1]);
+        assert_eq!(forward, reverse);
+        assert_eq!(forward.0, ["a.rs", "b.rs", "c.rs"]);
+        // pr_number, then path, then line, then created_at.
+        let first_pr: Vec<_> = forward.1.iter().take(4).collect();
+        assert!(first_pr.iter().all(|c| c.0 == 1));
+        assert_eq!(first_pr[0].1, "a.rs");
+        assert_eq!(
+            (first_pr[0].2, first_pr[0].3.as_str()),
+            (Some(4), "2026-01-01")
+        );
+        assert_eq!(
+            (first_pr[1].2, first_pr[1].3.as_str()),
+            (Some(4), "2026-01-03")
+        );
+        assert_eq!(first_pr[2].2, Some(30));
+        assert_eq!(first_pr[3].1, "b.rs");
+    }
+
+    #[test]
     fn round_trips_pr_diffs_commits_and_comment_timestamps() {
         // The correction triple needs all three to survive storage: the diff
         // (what changed), the commit order (when), and the comment timestamp
@@ -1187,5 +1653,714 @@ mod tests {
             )
             .unwrap();
         assert_eq!(store.pr_commits(1).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn cochange_pair_reads_one_directed_row_regardless_of_rank() {
+        let repo = TempRepo::new();
+        let mut store = repo.store();
+        let mut edges: Vec<CoChange> = (0..10)
+            .map(|i| CoChange {
+                path_a: "a.rs".to_owned(),
+                path_b: format!("strong{i}.rs"),
+                count: 50,
+                strength: 0.9,
+            })
+            .collect();
+        edges.push(CoChange {
+            path_a: "a.rs".to_owned(),
+            path_b: "weak.rs".to_owned(),
+            count: 2,
+            strength: 0.05,
+        });
+        store.replace_cochange(&edges).unwrap();
+
+        // Ranked far outside any top-N, still found, with its own count.
+        let pair = store.cochange_pair("a.rs", "weak.rs").unwrap().unwrap();
+        assert_eq!((pair.count, pair.path_b.as_str()), (2, "weak.rs"));
+        // The reverse row was never recorded; direction matters.
+        assert!(store.cochange_pair("weak.rs", "a.rs").unwrap().is_none());
+        assert!(store.cochange_pair("a.rs", "nope.rs").unwrap().is_none());
+    }
+
+    fn sized(path: &str, size_bytes: u64) -> FileRecord {
+        FileRecord {
+            size_bytes,
+            ..file(path)
+        }
+    }
+
+    /// A store with `a.rs` upserted at (size 10, mtime 1000) and extracted.
+    fn extracted_store(repo: &TempRepo) -> Store {
+        let mut store = repo.store();
+        store.upsert_scanned(&[(file("a.rs"), Some(1000))]).unwrap();
+        store
+            .replace_symbols_for_file("a.rs", &[symbol("a.rs", "old_name")])
+            .unwrap();
+        assert!(store.is_tier1_done("a.rs"));
+        store
+    }
+
+    #[test]
+    fn upsert_resets_tier1_when_the_size_changes() {
+        let repo = TempRepo::new();
+        let mut store = extracted_store(&repo);
+        store
+            .upsert_scanned(&[(sized("a.rs", 11), Some(1000))])
+            .unwrap();
+        assert!(!store.is_tier1_done("a.rs"));
+    }
+
+    #[test]
+    fn upsert_resets_tier1_when_only_the_mtime_changes() {
+        // A same-size edit (rename a function to a name of equal length) keeps
+        // the size identical; only the mtime gives it away.
+        let repo = TempRepo::new();
+        let mut store = extracted_store(&repo);
+        store.upsert_scanned(&[(file("a.rs"), Some(2000))]).unwrap();
+        assert!(!store.is_tier1_done("a.rs"));
+    }
+
+    #[test]
+    fn upsert_keeps_tier1_when_the_fingerprint_is_unchanged() {
+        let repo = TempRepo::new();
+        let mut store = extracted_store(&repo);
+        store.upsert_scanned(&[(file("a.rs"), Some(1000))]).unwrap();
+        assert!(store.is_tier1_done("a.rs"));
+        // Unknown mtime and unchanged size is not evidence of a change either.
+        store.upsert_files(&[file("a.rs")]).unwrap();
+        assert!(store.is_tier1_done("a.rs"));
+        assert_eq!(store.symbols_matching("old_name", 5).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_pre_fingerprint_database_re_extracts_once() {
+        let repo = TempRepo::new();
+        drop(extracted_store(&repo));
+        {
+            // Rewrite the files table the way an older Engram left it: no
+            // mtime_ns column, symbols already extracted.
+            let conn = Connection::open(repo.0.join(".engram").join("engram.db")).unwrap();
+            conn.execute_batch("ALTER TABLE files DROP COLUMN mtime_ns;")
+                .unwrap();
+        }
+        let mut store = repo.store();
+        assert!(
+            !store.is_tier1_done("a.rs"),
+            "rows from before fingerprints existed must not be trusted"
+        );
+        // After it re-extracts, the migration does not fire again.
+        store.upsert_scanned(&[(file("a.rs"), Some(1000))]).unwrap();
+        store.replace_symbols_for_file("a.rs", &[]).unwrap();
+        drop(store);
+        let mut store = repo.store();
+        store.upsert_scanned(&[(file("a.rs"), Some(1000))]).unwrap();
+        assert!(store.is_tier1_done("a.rs"));
+    }
+
+    #[test]
+    fn remove_path_deletes_every_trace_including_vectors() {
+        let repo = TempRepo::new();
+        let mut store = repo.store();
+        store
+            .upsert_files(&[file("gone.rs"), file("kept.rs")])
+            .unwrap();
+        for p in ["gone.rs", "kept.rs"] {
+            store
+                .replace_symbols_for_file(p, &[symbol(p, "thing")])
+                .unwrap();
+            store
+                .replace_imports_for_file(p, &["utils/retry".to_owned()])
+                .unwrap();
+            store
+                .upsert_vectors(&[(p.to_owned(), "h".to_owned(), vec![1, 2])])
+                .unwrap();
+            store
+                .upsert_chunk_vectors(&[(p.to_owned(), 1, "h".to_owned(), vec![1, 2])])
+                .unwrap();
+        }
+        // One row in each of the five tables.
+        assert_eq!(store.remove_path("gone.rs").unwrap(), 5);
+
+        let count = |table: &str, path: &str| -> i64 {
+            store
+                .conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE path = ?1"),
+                    params![path],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        for table in [
+            "files",
+            "symbols",
+            "file_imports",
+            "vectors",
+            "chunk_vectors",
+        ] {
+            assert_eq!(count(table, "gone.rs"), 0, "{table} kept a row");
+            assert_eq!(count(table, "kept.rs"), 1, "{table} lost the other file");
+        }
+    }
+
+    #[test]
+    fn remove_path_on_a_directory_takes_the_files_beneath_it() {
+        let repo = TempRepo::new();
+        let mut store = repo.store();
+        store
+            .upsert_files(&[file("pkg/a.rs"), file("pkg/sub/b.rs"), file("pkgx/c.rs")])
+            .unwrap();
+        assert_eq!(store.remove_path("pkg").unwrap(), 2);
+        let left: Vec<String> = store
+            .all_files()
+            .unwrap()
+            .into_iter()
+            .map(|f| f.path)
+            .collect();
+        assert_eq!(left, vec!["pkgx/c.rs".to_owned()]);
+    }
+
+    #[test]
+    fn remove_path_changes_nothing_for_an_unknown_path_and_spares_lookalikes() {
+        let repo = TempRepo::new();
+        let mut store = repo.store();
+        // Neighbours of "pkg" in sort order: the range bounds must not catch them.
+        let lookalikes = ["pkg.rs", "pkg-x/a.rs", "pkg0/a.rs", "pkga/b.rs", "pkg"];
+        let files: Vec<FileRecord> = lookalikes.iter().map(|p| file(p)).collect();
+        store.upsert_files(&files).unwrap();
+        assert_eq!(
+            store.remove_path("pkg/").unwrap(),
+            1,
+            "only the exact `pkg`"
+        );
+        assert_eq!(store.all_files().unwrap().len(), lookalikes.len() - 1);
+        // Nothing left to remove: reports that the index did not change.
+        assert_eq!(store.remove_path("pkg").unwrap(), 0);
+        assert_eq!(store.remove_path("nope/at/all.rs").unwrap(), 0);
+    }
+
+    #[test]
+    fn a_failed_parser_version_reset_leaves_the_old_version_recorded() {
+        // The wipe and the version bump are one transaction: if the wipe
+        // cannot complete, the database must not claim the new version.
+        let repo = TempRepo::new();
+        {
+            let mut store = repo.store();
+            store.upsert_files(&[file("a.rs")]).unwrap();
+            store
+                .replace_symbols_for_file("a.rs", &[symbol("a.rs", "thing")])
+                .unwrap();
+        }
+        let conn = Connection::open(repo.0.join(".engram").join("engram.db")).unwrap();
+        // The symbols wipe runs before the statement that fails.
+        conn.execute_batch("DROP TABLE vectors;").unwrap();
+        assert!(Store::reset_if_still_mismatched(&conn, PARSER_CONFIG_VERSION + 1).is_err());
+        let symbols: i64 = conn
+            .query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(symbols, 1, "the partial wipe must roll back");
+        let stored: String = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                params![PARSER_VERSION_KEY],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, PARSER_CONFIG_VERSION.to_string());
+    }
+
+    #[test]
+    fn a_second_handle_that_saw_a_stale_mismatch_does_not_wipe_what_the_first_wrote() {
+        let repo = TempRepo::new();
+        drop(repo.store());
+        let changed = PARSER_CONFIG_VERSION + 1;
+        // Handle B opened first and is about to act on a mismatch it already saw...
+        let b = Connection::open(repo.0.join(".engram").join("engram.db")).unwrap();
+        assert_ne!(
+            Store::stored_parser_version(&b).unwrap().as_deref(),
+            Some(changed.to_string().as_str())
+        );
+        // ...but handle A got there first: it wiped, recorded the new version,
+        // and re-extracted a file under it.
+        {
+            let mut a = Store::open_with_parser_version(&repo.0, changed).unwrap();
+            a.upsert_files(&[file("a.rs")]).unwrap();
+            a.replace_symbols_for_file("a.rs", &[symbol("a.rs", "thing")])
+                .unwrap();
+        }
+        // B takes the lock, re-reads, sees the updated key and leaves the data.
+        Store::reset_if_still_mismatched(&b, changed).unwrap();
+        drop(b);
+        let store = Store::open_with_parser_version(&repo.0, changed).unwrap();
+        assert_eq!(store.symbols_for_path("a.rs").unwrap().len(), 1);
+        assert!(store.is_tier1_done("a.rs"));
+    }
+
+    #[test]
+    fn concurrent_opens_and_writes_from_several_threads_all_succeed() {
+        use std::sync::{Arc, Barrier};
+        const THREADS: usize = 6;
+        let repo = TempRepo::new();
+        let root = Arc::new(repo.0.clone());
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let root = Arc::clone(&root);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || -> Result<()> {
+                    // All threads race to create and configure the same new
+                    // database file, then to write to it.
+                    barrier.wait();
+                    let mut store = Store::open(&root)?;
+                    for i in 0..40 {
+                        let path = format!("t{t}/f{i}.rs");
+                        store.upsert_files(&[file(&path)])?;
+                        store.replace_symbols_for_file(&path, &[symbol(&path, "thing")])?;
+                    }
+                    Ok(())
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join()
+                .expect("thread panicked")
+                .expect("no `database is locked`");
+        }
+        let store = repo.store();
+        assert_eq!(store.all_files().unwrap().len(), THREADS * 40);
+    }
+
+    #[test]
+    fn an_opened_cache_runs_wal_with_normal_synchronous() {
+        // Under WAL, FULL syncs the log on every commit while holding the write
+        // lock. On a slow disk (a Windows CI runner) six threads committing in
+        // bursts then queue long enough for one to starve past its busy
+        // timeout. NORMAL (1) is safe under WAL and keeps the lock short.
+        let repo = TempRepo::new();
+        let store = repo.store();
+        let mode: String = store
+            .conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        let synchronous: i64 = store
+            .conn
+            .query_row("PRAGMA synchronous", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal");
+        assert_eq!(synchronous, 1, "NORMAL");
+    }
+
+    /// Hold the write lock on a second connection for `hold`, then commit,
+    /// while `write` runs on `store` with its busy handler switched OFF. That
+    /// is what SQLite does when it reports BUSY without consulting the handler
+    /// (and how Windows file locking tends to surface contention), so a write
+    /// that does not retry itself fails at once.
+    fn write_while_lock_is_held_and_busy_handler_is_off(
+        repo: &TempRepo,
+        hold: Duration,
+        write: impl FnOnce(&mut Store) -> Result<()>,
+    ) -> Duration {
+        let mut store = repo.store();
+        let holder = Connection::open(repo.0.join(".engram").join("engram.db")).unwrap();
+        holder.busy_timeout(BUSY_TIMEOUT).unwrap();
+        holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+        store.conn.busy_timeout(Duration::ZERO).unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(hold);
+            holder.execute_batch("COMMIT").unwrap();
+        });
+        let started = Instant::now();
+        write(&mut store).expect("a write waits for the lock instead of failing at once");
+        let waited = started.elapsed();
+        release.join().unwrap();
+        waited
+    }
+
+    #[test]
+    fn every_write_retries_when_sqlite_refuses_the_lock_without_waiting() {
+        const HOLD: Duration = Duration::from_millis(300);
+        let repo = TempRepo::new();
+        let mut waits = Vec::new();
+        {
+            let mut w = |name: &str, write: &dyn Fn(&mut Store) -> Result<()>| {
+                let waited =
+                    write_while_lock_is_held_and_busy_handler_is_off(&repo, HOLD, |s| write(s));
+                waits.push((name.to_owned(), waited));
+            };
+            w("upsert_files", &|s| s.upsert_files(&[file("a.rs")]));
+            w("replace_symbols_for_file", &|s| {
+                s.replace_symbols_for_file("a.rs", &[symbol("a.rs", "thing")])
+            });
+            w("clear_extracted", &|s| s.clear_extracted("a.rs"));
+            w("replace_imports_for_file", &|s| {
+                s.replace_imports_for_file("a.rs", &["b".to_owned()])
+            });
+            w("replace_cochange", &|s| s.replace_cochange(&[]));
+            w("update_recency", &|s| s.update_recency(&HashMap::new()));
+            w("upsert_vectors", &|s| {
+                s.upsert_vectors(&[("a.rs".into(), "h".into(), vec![0])])
+            });
+            w("invalidate_vector", &|s| s.invalidate_vector("a.rs"));
+            w("prune_vectors", &|s| s.prune_vectors(&HashSet::new()));
+            w("prune_chunk_vectors", &|s| {
+                s.prune_chunk_vectors(&HashSet::new())
+            });
+            w("prune_missing_files", &|s| {
+                s.prune_missing_files(&HashSet::new()).map(|_| ())
+            });
+            w("remove_path", &|s| s.remove_path("a.rs").map(|_| ()));
+            w("replace_pr_files", &|s| s.replace_pr_files(1, &[]));
+            w("replace_pr_commits", &|s| s.replace_pr_commits(1, &[]));
+            w("upsert_pull_request", &|s| {
+                s.upsert_pull_request(1, "t", "b", false, "a", "", "", "", "")
+            });
+        }
+        // The lock was held for HOLD each time, so a write that returned sooner
+        // cannot have waited for it (and would have had to fail instead).
+        for (name, waited) in waits {
+            assert!(
+                waited >= HOLD / 2,
+                "{name} returned after {waited:?} without waiting for the lock"
+            );
+        }
+    }
+
+    /// The production half of a source file: the text before the test module.
+    ///
+    /// CRLF is normalised first, so a Windows checkout (CRLF line endings)
+    /// splits at the same boundary as an LF one. Panics if the boundary is
+    /// missing, rather than silently scanning the test module too.
+    fn production_source(text: &str) -> String {
+        let normalised = text.replace("\r\n", "\n");
+        // Assembled from pieces so this module's own text never matches it.
+        let boundary = concat!("#[cfg(test)]\n", "mod tests {");
+        let at = normalised
+            .find(boundary)
+            .unwrap_or_else(|| panic!("source has no `{boundary}` test module boundary"));
+        normalised[..at].to_string()
+    }
+
+    /// Needles are assembled from pieces so this file's own literals never
+    /// match them, even if the scan ever reached the test module.
+    fn forbidden_needles() -> Vec<String> {
+        vec![
+            concat!(".unchecked_", "transaction(").to_string(),
+            concat!(".transaction", "()").to_string(),
+            concat!("TransactionBehavior::", "Deferred").to_string(),
+            concat!("TransactionBehavior::", "Exclusive").to_string(),
+            concat!("execute_batch(\"", "BEGIN", "\")").to_string(),
+            concat!("execute_batch(\"", "BEGIN TRANSACTION", "\")").to_string(),
+        ]
+    }
+
+    #[test]
+    fn no_write_starts_a_deferred_transaction() {
+        // A deferred transaction that reads and then writes is refused at once
+        // (SQLITE_BUSY_SNAPSHOT, never retried by the busy handler) when
+        // another connection commits in between. Every write goes through
+        // `write_tx` (BEGIN IMMEDIATE) or the open-time `in_immediate_tx`.
+        let production = production_source(include_str!("store.rs"));
+        for forbidden in forbidden_needles() {
+            assert!(
+                !production.contains(&forbidden),
+                "store.rs must not use {forbidden}"
+            );
+        }
+        let create = concat!(".transaction_with_behavior", "(");
+        assert_eq!(
+            production.matches(create).count(),
+            1,
+            "`write_tx` is the one place a transaction object is created"
+        );
+    }
+
+    #[test]
+    fn production_source_splits_the_same_for_lf_and_crlf() {
+        let lf = include_str!("store.rs").replace("\r\n", "\n");
+        let crlf = lf.replace('\n', "\r\n");
+        assert!(crlf.contains("\r\n") && !crlf.replace("\r\n", "").contains('\r'));
+        assert_eq!(production_source(&crlf), production_source(&lf));
+        assert!(production_source(&lf).len() < lf.len());
+
+        // A fixture whose only forbidden text sits in its test module.
+        let fixture = concat!(
+            "fn a() {}\r\n",
+            "#[cfg(test)]\r\n",
+            "mod tests {\r\n",
+            "    const X: &str = \".unchecked_transaction(\";\r\n",
+            "}\r\n"
+        );
+        assert_eq!(production_source(fixture), "fn a() {}\n");
+    }
+
+    #[test]
+    fn writes_keep_succeeding_while_another_connection_commits_continuously() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        // The competitor is bounded in commits and the wait for it is bounded
+        // in time: contention is what matters here, not volume.
+        const MAX_COMMITS: u64 = 400;
+        const COMMITTER_DEADLINE: Duration = Duration::from_secs(60);
+        let repo = TempRepo::new();
+        let mut store = repo.store();
+        let stop = Arc::new(AtomicBool::new(false));
+        let committer = {
+            let stop = Arc::clone(&stop);
+            let path = repo.0.join(".engram").join("engram.db");
+            std::thread::spawn(move || {
+                let conn = Connection::open(path).unwrap();
+                conn.busy_timeout(BUSY_TIMEOUT).unwrap();
+                // SQLite gives no lock fairness: a waiter polls inside its busy
+                // handler, so a connection that re-takes the write lock straight
+                // after every commit can starve it past BUSY_TIMEOUT. Real
+                // writers do not commit back to back, so this one yields after
+                // each commit (a short sleep plus yield_now) and stops after
+                // a bounded number of commits.
+                for n in 1..=MAX_COMMITS {
+                    if stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    conn.execute(
+                        "INSERT INTO meta (key, value) VALUES ('noise', ?1)
+                         ON CONFLICT(key) DO UPDATE SET value = ?1",
+                        params![n.to_string()],
+                    )
+                    .unwrap();
+                    std::thread::sleep(Duration::from_millis(2));
+                    std::thread::yield_now();
+                }
+            })
+        };
+        // Each of these reads before it writes; a deferred transaction would be
+        // refused as soon as the committer lands a commit between the two.
+        let result = (|| -> Result<()> {
+            for i in 0..150 {
+                let path = format!("f{i}.rs");
+                store.upsert_files(&[file(&path)])?;
+                store.replace_symbols_for_file(&path, &[symbol(&path, "thing")])?;
+                store.prune_missing_files(&HashSet::from([path.clone()]))?;
+                store.remove_path("nonexistent.rs")?;
+            }
+            Ok(())
+        })();
+        stop.store(true, Ordering::SeqCst);
+        // Bounded wait: the committer is finite, but never let a stuck thread
+        // hang the whole test binary.
+        let started = std::time::Instant::now();
+        while !committer.is_finished() {
+            assert!(
+                started.elapsed() < COMMITTER_DEADLINE,
+                "competing committer did not finish within {COMMITTER_DEADLINE:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        result.expect("no `database is locked`");
+        committer.join().expect("competing committer panicked");
+    }
+
+    #[test]
+    fn many_threads_opening_one_fresh_cache_all_succeed_and_initialise_it_once() {
+        use std::sync::{Arc, Barrier};
+        const THREADS: usize = 8;
+        const ITERATIONS: usize = 30;
+        for iteration in 0..ITERATIONS {
+            // A new directory each time: the race is over a cache that does not
+            // exist yet (journal-mode switch, schema creation, version record).
+            let repo = TempRepo::new();
+            let root = Arc::new(repo.0.clone());
+            let barrier = Arc::new(Barrier::new(THREADS));
+            let handles: Vec<_> = (0..THREADS)
+                .map(|_| {
+                    let root = Arc::clone(&root);
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || -> Result<(String, String)> {
+                        barrier.wait();
+                        let store = Store::open(&root)?;
+                        let stored = Store::stored_parser_version(&store.conn)?
+                            .expect("an opened cache records its version");
+                        let mode: String =
+                            store
+                                .conn
+                                .query_row("PRAGMA journal_mode", [], |r| r.get(0))?;
+                        Ok((stored, mode))
+                    })
+                })
+                .collect();
+            for h in handles {
+                let (stored, mode) = h
+                    .join()
+                    .expect("thread panicked")
+                    .unwrap_or_else(|e| panic!("iteration {iteration}: open failed: {e:#}"));
+                assert_eq!(
+                    stored,
+                    PARSER_CONFIG_VERSION.to_string(),
+                    "iteration {iteration}"
+                );
+                assert_eq!(mode, "wal", "iteration {iteration}");
+            }
+        }
+    }
+
+    #[test]
+    fn opens_wait_for_a_writer_holding_the_lock_and_then_succeed() {
+        use std::sync::{Arc, Barrier};
+        const THREADS: usize = 4;
+        const HOLD: Duration = Duration::from_millis(400);
+        let repo = TempRepo::new();
+        drop(repo.store());
+        // Another handle takes the write lock and keeps it for a moment.
+        let writer = Connection::open(repo.0.join(".engram").join("engram.db")).unwrap();
+        writer.busy_timeout(BUSY_TIMEOUT).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let root = Arc::new(repo.0.clone());
+        let barrier = Arc::new(Barrier::new(THREADS + 1));
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let root = Arc::clone(&root);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || -> Result<Duration> {
+                    barrier.wait();
+                    let started = Instant::now();
+                    Store::open(&root)?;
+                    Ok(started.elapsed())
+                })
+            })
+            .collect();
+        barrier.wait();
+        std::thread::sleep(HOLD);
+        writer.execute_batch("COMMIT").unwrap();
+        for h in handles {
+            let waited = h
+                .join()
+                .expect("thread panicked")
+                .expect("an open waits for the writer instead of failing");
+            assert!(waited < BUSY_TIMEOUT, "bounded wait, took {waited:?}");
+        }
+    }
+
+    #[test]
+    fn opens_racing_a_writer_on_a_fresh_cache_succeed() {
+        use std::sync::{Arc, Barrier};
+        const THREADS: usize = 4;
+        for _ in 0..10 {
+            let repo = TempRepo::new();
+            let root = Arc::new(repo.0.clone());
+            let barrier = Arc::new(Barrier::new(THREADS + 1));
+            let openers: Vec<_> = (0..THREADS)
+                .map(|_| {
+                    let root = Arc::clone(&root);
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || -> Result<()> {
+                        barrier.wait();
+                        Store::open(&root)?;
+                        Ok(())
+                    })
+                })
+                .collect();
+            // The first handle initialises the cache and writes to it while the
+            // others are still opening.
+            barrier.wait();
+            let mut first = Store::open(&repo.0).expect("first open");
+            for i in 0..20 {
+                first.upsert_files(&[file(&format!("f{i}.rs"))]).unwrap();
+            }
+            for h in openers {
+                h.join().expect("thread panicked").expect("open succeeds");
+            }
+            assert_eq!(repo.store().all_files().unwrap().len(), 20);
+        }
+    }
+
+    fn hashed(path: &str, mtime: i64, hash: &str) -> ScannedFile {
+        ScannedFile {
+            record: file(path),
+            mtime_ns: Some(mtime),
+            content_hash: Some(hash.to_owned()),
+        }
+    }
+
+    #[test]
+    fn a_changed_content_hash_alone_invalidates_the_file() {
+        // Same size, same mtime: only the hash differs.
+        let repo = TempRepo::new();
+        let mut store = repo.store();
+        store
+            .upsert_fingerprinted(&[hashed("a.rs", 5, "h1")])
+            .unwrap();
+        store
+            .replace_symbols_for_file("a.rs", &[symbol("a.rs", "old_name")])
+            .unwrap();
+        store
+            .replace_imports_for_file("a.rs", &["utils/retry".to_owned()])
+            .unwrap();
+        store
+            .upsert_vectors(&[("a.rs".to_owned(), "h".to_owned(), vec![1])])
+            .unwrap();
+        store
+            .upsert_chunk_vectors(&[("a.rs".to_owned(), 1, "h".to_owned(), vec![1])])
+            .unwrap();
+
+        // Unchanged hash: everything is kept.
+        store
+            .upsert_fingerprinted(&[hashed("a.rs", 5, "h1")])
+            .unwrap();
+        assert!(store.is_tier1_done("a.rs"));
+        assert_eq!(store.symbols_for_path("a.rs").unwrap().len(), 1);
+
+        store
+            .upsert_fingerprinted(&[hashed("a.rs", 5, "h2")])
+            .unwrap();
+        assert!(!store.is_tier1_done("a.rs"));
+        assert!(store.symbols_for_path("a.rs").unwrap().is_empty());
+        assert!(store.all_imports().unwrap().is_empty());
+        assert!(store.load_vectors().unwrap().is_empty());
+        assert!(store.load_chunk_vectors().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_row_with_no_stored_hash_is_re_extracted_once_a_hash_is_known() {
+        let repo = TempRepo::new();
+        let mut store = extracted_store(&repo);
+        store
+            .upsert_fingerprinted(&[hashed("a.rs", 1000, "h1")])
+            .unwrap();
+        assert!(
+            !store.is_tier1_done("a.rs"),
+            "NULL stored hash vs a known hash means unverified"
+        );
+    }
+
+    #[test]
+    fn snapshot_ids_follow_content_commit_and_version() {
+        let repo = TempRepo::new();
+        let mut store = repo.store();
+        store
+            .upsert_fingerprinted(&[hashed("a.rs", 1, "h1"), hashed("b.rs", 2, "h2")])
+            .unwrap();
+        let base = store.snapshot_id("c1").unwrap();
+        assert_eq!(base, store.snapshot_id("c1").unwrap());
+        assert_ne!(base, store.snapshot_id("c2").unwrap(), "commit");
+        // mtime is not part of the identity.
+        store
+            .upsert_fingerprinted(&[hashed("a.rs", 99, "h1")])
+            .unwrap();
+        assert_eq!(base, store.snapshot_id("c1").unwrap());
+        store
+            .upsert_fingerprinted(&[hashed("a.rs", 99, "other")])
+            .unwrap();
+        assert_ne!(base, store.snapshot_id("c1").unwrap(), "content");
+    }
+
+    #[test]
+    fn pruning_a_deleted_file_takes_its_legacy_vector_too() {
+        let repo = TempRepo::new();
+        let mut store = repo.store();
+        store.upsert_files(&[file("gone.rs")]).unwrap();
+        store
+            .upsert_vectors(&[("gone.rs".to_owned(), "h".to_owned(), vec![1])])
+            .unwrap();
+        store.prune_missing_files(&HashSet::new()).unwrap();
+        assert!(store.load_vectors().unwrap().is_empty());
     }
 }

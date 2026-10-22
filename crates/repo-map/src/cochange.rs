@@ -9,9 +9,9 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
 
-const MAX_COMMITS: usize = 2000;
-const MAX_FILES_PER_COMMIT: usize = 30; // skip mega-commits (renames, vendoring)
-const MIN_PAIR_COUNT: u32 = 2;
+pub const MAX_COMMITS: usize = 2000;
+pub const MAX_FILES_PER_COMMIT: usize = 30; // skip mega-commits (renames, vendoring)
+pub const MIN_PAIR_COUNT: u32 = 2;
 
 /// Output of the history walk.
 pub struct History {
